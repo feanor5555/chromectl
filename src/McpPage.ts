@@ -431,6 +431,8 @@ export class McpPage implements ContextPage {
     this.pptrPage.off('dialog', this.#dialogHandler);
     this.networkCollector.dispose();
     this.consoleCollector.dispose();
+    this.#devtoolsUniverse?.dispose();
+    this.#devtoolsUniverse = undefined;
   }
 
   async executeThirdPartyDeveloperTool(

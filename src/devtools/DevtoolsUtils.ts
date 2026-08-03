@@ -10,6 +10,7 @@ import type {
   ConsoleMessage,
   Protocol,
 } from '../third_party/index.js';
+import {logger} from '../utils/logger.js';
 
 import {PuppeteerDevToolsConnection} from './DevToolsConnectionAdapter.js';
 import {McpHostBindingAdapter} from './McpHostBindingAdapter.js';
@@ -125,6 +126,7 @@ export function overrideDevToolsGlobals({
 }
 
 export interface TargetUniverse {
+  dispose(): void;
   /** The DevTools target corresponding to the puppeteer Page */
   target: DevTools.Target;
   universe: DevTools.Foundation.Universe.Universe;
@@ -136,6 +138,12 @@ export async function createTargetUniverse(
   session: CDPSession,
 ): Promise<TargetUniverse> {
   const settingStorage = new DevTools.Common.Settings.SettingsStorage({});
+  const globalHost =
+    DevTools.Host.InspectorFrontendHost.InspectorFrontendHostInstance;
+  const inspectorFrontendHost =
+    globalHost instanceof McpHostBindingAdapter
+      ? globalHost.createScoped()
+      : globalHost;
   const universe = new DevTools.Foundation.Universe.Universe({
     settingsCreationOptions: {
       syncedStorage: settingStorage,
@@ -146,8 +154,7 @@ export async function createTargetUniverse(
     },
     overrideAutoStartModels: new Set([DevTools.DebuggerModel]),
     hostConfig: {},
-    inspectorFrontendHost:
-      DevTools.Host.InspectorFrontendHost.InspectorFrontendHostInstance,
+    inspectorFrontendHost,
     supportsEmulation: false,
   });
 
@@ -170,7 +177,35 @@ export async function createTargetUniverse(
     undefined,
     connection,
   );
-  return {target, universe, session};
+  let disposed = false;
+  return {
+    target,
+    universe,
+    session,
+    dispose(): void {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      if (globalHost instanceof McpHostBindingAdapter) {
+        globalHost.removeEventListenersFor(
+          universe.fileSystemWorkspaceBinding.isolatedFileSystemManager,
+        );
+      }
+      target.dispose('Page closed');
+      connection.dispose('Page closed');
+      void session.detach().catch(error => {
+        if (
+          error instanceof Error &&
+          (error.message.includes('Target closed') ||
+            error.message.includes('Session closed'))
+        ) {
+          return;
+        }
+        logger?.('Failed to detach DevTools universe session', error);
+      });
+    },
+  };
 }
 
 // We don't want to pause any DevTools universe session ever on the MCP side.

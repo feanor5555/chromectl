@@ -230,10 +230,33 @@ class BaseMcpHostBindingAdapter
 
 export class McpHostBindingAdapter extends BaseMcpHostBindingAdapter {
   #loadResource: (path: string) => Promise<string>;
+  override events =
+    new DevTools.Common.ObjectWrapper.ObjectWrapper<DevTools.Host.InspectorFrontendHostAPI.EventTypes>();
 
   constructor(loadResource: (path: string) => Promise<string>) {
     super();
     this.#loadResource = loadResource;
+  }
+
+  createScoped(): McpHostBindingAdapter {
+    return new McpHostBindingAdapter(this.#loadResource);
+  }
+
+  removeEventListenersFor(thisObject: object): void {
+    if (!this.events.listeners) {
+      return;
+    }
+    for (const [eventType, listeners] of this.events.listeners) {
+      for (const listener of listeners) {
+        if (listener.thisObject === thisObject) {
+          listener.disposed = true;
+          listeners.delete(listener);
+        }
+      }
+      if (listeners.size === 0) {
+        this.events.listeners.delete(eventType);
+      }
+    }
   }
 
   override isolatedFileSystem(): null {

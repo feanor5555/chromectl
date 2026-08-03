@@ -23,20 +23,23 @@ export class PuppeteerDevToolsConnection
   readonly #observers = new Set<DevTools.CDPConnection.CDPConnectionObserver>();
   readonly #sessionEventHandlers = new Map<
     string,
-    puppeteer.Handler<unknown>
+    {
+      handler: puppeteer.Handler<unknown>;
+      session: puppeteer.CDPSession;
+    }
   >();
+  readonly #rootSession: puppeteer.CDPSession;
+  readonly #sessionAttachedHandler: puppeteer.Handler<puppeteer.CDPSession>;
+  readonly #sessionDetachedHandler: puppeteer.Handler<puppeteer.CDPSession>;
 
   constructor(session: puppeteer.CDPSession) {
     this.#connection = session.connection()!;
+    this.#rootSession = session;
+    this.#sessionAttachedHandler = this.#startForwardingCdpEvents.bind(this);
+    this.#sessionDetachedHandler = this.#stopForwardingCdpEvents.bind(this);
 
-    session.on(
-      CDPSessionEvent.SessionAttached,
-      this.#startForwardingCdpEvents.bind(this),
-    );
-    session.on(
-      CDPSessionEvent.SessionDetached,
-      this.#stopForwardingCdpEvents.bind(this),
-    );
+    session.on(CDPSessionEvent.SessionAttached, this.#sessionAttachedHandler);
+    session.on(CDPSessionEvent.SessionDetached, this.#sessionDetachedHandler);
 
     this.#startForwardingCdpEvents(session);
   }
@@ -80,15 +83,35 @@ export class PuppeteerDevToolsConnection
       this,
       session.id(),
     ) as puppeteer.Handler<unknown>;
-    this.#sessionEventHandlers.set(session.id(), handler);
+    this.#sessionEventHandlers.set(session.id(), {handler, session});
     session.on('*', handler);
   }
 
   #stopForwardingCdpEvents(session: puppeteer.CDPSession): void {
-    const handler = this.#sessionEventHandlers.get(session.id());
-    if (handler) {
+    const entry = this.#sessionEventHandlers.get(session.id());
+    if (entry) {
+      session.off('*', entry.handler);
+      this.#sessionEventHandlers.delete(session.id());
+    }
+  }
+
+  dispose(reason: string): void {
+    this.#rootSession.off(
+      CDPSessionEvent.SessionAttached,
+      this.#sessionAttachedHandler,
+    );
+    this.#rootSession.off(
+      CDPSessionEvent.SessionDetached,
+      this.#sessionDetachedHandler,
+    );
+    for (const {handler, session} of this.#sessionEventHandlers.values()) {
       session.off('*', handler);
     }
+    this.#sessionEventHandlers.clear();
+    for (const observer of this.#observers) {
+      observer.onDisconnect(reason);
+    }
+    this.#observers.clear();
   }
 
   #handleEvent(
