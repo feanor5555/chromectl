@@ -6,6 +6,12 @@
  * without any authentication; the local network and the netbird network are the
  * access boundary.
  *
+ * The front speaks to the daemon over its unix socket in process, through
+ * upstream's own daemon client (`build/src/daemon/client.js`), instead of
+ * spawning the `chrome-devtools` CLI per request; a node process start costs
+ * ~710 ms, the protocol work costs single-digit milliseconds. Importing the
+ * built client keeps the wire format upstream's business.
+ *
  * The target registry is read from `CHROMECTL_TARGETS`, by default from
  * `~/.claude/chromectl/targets.json`; without it the front refuses to start.
  *
@@ -17,11 +23,15 @@
  *   POST /call            {"target": "<name>", "command": "<tool>"}
  */
 
-import {spawn} from 'node:child_process';
 import http from 'node:http';
-import {dirname, join} from 'node:path';
 import process from 'node:process';
-import {fileURLToPath} from 'node:url';
+
+import {
+  handleResponse,
+  sendCommand,
+  startDaemon,
+} from '../build/src/daemon/client.js';
+import {isDaemonRunning} from '../build/src/daemon/utils.js';
 
 import {
   listTargets,
@@ -32,8 +42,10 @@ import {
   TargetError,
 } from './registry.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const CLI = join(HERE, '..', 'build', 'src', 'bin', 'chrome-devtools.js');
+// A daemon is spawned by the imported client and inherits this process's
+// environment, so telemetry and the update check are switched off here.
+process.env['CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS'] = '1';
+process.env['CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS'] = '1';
 
 const HOST = process.env['CHROMECTL_HOST'] ?? '0.0.0.0';
 const PORT = Number(process.env['CHROMECTL_PORT'] ?? 8091);
@@ -47,11 +59,19 @@ const CALL_TIMEOUT_MS = 60_000;
 /** Upper bound for the CDP reachability probe. */
 const PROBE_TIMEOUT_MS = 5_000;
 
-const CLI_ENV = {
-  ...process.env,
-  CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: '1',
-  CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: '1',
-};
+/**
+ * Server flags every daemon is started with. `viaCli` is what makes the daemon
+ * register the full tool set, `experimentalStructuredContent` is what makes a
+ * result come back as a JSON object rather than rendered text, and
+ * `categoryExtensions` is what keeps extension service workers in the page
+ * listing.
+ */
+const DAEMON_ARGS = [
+  '--viaCli',
+  '--experimentalStructuredContent',
+  '--categoryExtensions',
+  '--usageStatistics=false',
+];
 
 /** HTTP status per failure kind, mirroring the client's exit codes. */
 const STATUS_BY_KIND = {usage: 400, config: 500, tool: 422, unreachable: 503};
@@ -62,32 +82,6 @@ class CallError extends Error {
     this.kind = kind;
     this.detail = detail;
   }
-}
-
-function runCli(args) {
-  return new Promise(resolve => {
-    const child = spawn(process.execPath, [CLI, ...args], {
-      env: CLI_ENV,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      stderr += '\nchromectl: CLI call timed out';
-    }, CALL_TIMEOUT_MS);
-
-    child.stdout.on('data', chunk => (stdout += chunk));
-    child.stderr.on('data', chunk => (stderr += chunk));
-    child.on('error', error => {
-      clearTimeout(timer);
-      resolve({code: -1, stdout, stderr: `${stderr}\n${error.message}`});
-    });
-    child.on('close', code => {
-      clearTimeout(timer);
-      resolve({code, stdout, stderr});
-    });
-  });
 }
 
 /**
@@ -117,48 +111,86 @@ async function assertTargetReachable(browserUrl) {
   }
 }
 
-async function isDaemonRunning(sessionId) {
-  const {stdout} = await runCli(['status', '--sessionId', sessionId]);
-  return stdout.includes('daemon is running');
+/**
+ * Daemon starts in flight, keyed by session id. Two requests for the same
+ * target that both find no daemon must not spawn two of them — the second one
+ * exits on the pid file the first one wrote, and the request that started it
+ * would then wait for a daemon that is gone. Requests arriving during a start
+ * wait for that same start; tool calls themselves stay parallel and serialize
+ * inside the daemon on its process-wide tool mutex.
+ */
+const pendingStarts = new Map();
+
+function startDaemonOnce({browserUrl, sessionId}) {
+  const running = pendingStarts.get(sessionId);
+  if (running) {
+    return running;
+  }
+  const start = startDaemon(
+    [`--browserUrl=${browserUrl}`, ...DAEMON_ARGS],
+    sessionId,
+  )
+    .catch(error => {
+      throw new CallError(
+        'unreachable',
+        `cannot attach to ${browserUrl}`,
+        error.message,
+      );
+    })
+    .finally(() => {
+      pendingStarts.delete(sessionId);
+    });
+  pendingStarts.set(sessionId, start);
+  return start;
 }
 
-async function ensureDaemon({browserUrl, sessionId}) {
-  if (await isDaemonRunning(sessionId)) {
+/**
+ * A daemon per target, started on first use and reused afterwards. It may have
+ * died between two calls, so its liveness is checked per call — the check is a
+ * pid file read plus a signal 0, not a process start.
+ */
+async function ensureDaemon(resolved) {
+  const {sessionId} = resolved;
+  // A start in flight has already written the pid file before the daemon
+  // answers, so a running pid alone does not mean it is ready yet.
+  if (isDaemonRunning(sessionId) && !pendingStarts.has(sessionId)) {
     return;
   }
-  const result = await runCli([
-    'start',
-    '--browserUrl',
-    browserUrl,
-    '--sessionId',
-    sessionId,
-    '--usageStatistics',
-    'false',
-  ]);
-  if (result.code !== 0) {
-    throw new CallError(
-      'unreachable',
-      `cannot attach to ${browserUrl}`,
-      (result.stderr || result.stdout).trim(),
-    );
+  await startDaemonOnce(resolved);
+}
+
+/**
+ * Sends one tool invocation. A daemon that died between the liveness check and
+ * this send takes the command with it and cannot have executed it, so exactly
+ * that case is retried once against a freshly started daemon. A daemon that is
+ * still alive gets no retry: its failure is the tool's failure.
+ */
+async function invokeTool(resolved, command) {
+  const message = {method: 'invoke_tool', tool: command, args: {}};
+  try {
+    return await sendCommand(message, resolved.sessionId, CALL_TIMEOUT_MS);
+  } catch (error) {
+    if (isDaemonRunning(resolved.sessionId)) {
+      throw new CallError('tool', `${command} failed`, error.message);
+    }
+    await ensureDaemon(resolved);
+    return await sendCommand(message, resolved.sessionId, CALL_TIMEOUT_MS);
   }
 }
 
 /**
- * The CLI prints the rendered tool result as the last JSON line. A tool-level
- * failure is rendered as the raw content array, a success as the structured
- * object, so the shape tells the two apart.
+ * Renders the daemon's stringified `CallToolResult` the way the CLI does with
+ * `--output-format json`, and parses it back. A tool-level failure renders as
+ * the raw content array, a success as the structured object, so the shape tells
+ * the two apart. Anything unrenderable comes back as `undefined` and is treated
+ * as a failed call.
  */
-function parseCliOutput(stdout) {
-  const lines = stdout.split('\n').filter(line => line.trim() !== '');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      return JSON.parse(lines[i]);
-    } catch {
-      // Not the JSON line; keep looking backwards.
-    }
+async function renderToolResult(result) {
+  try {
+    return JSON.parse(await handleResponse(JSON.parse(result), 'json'));
+  } catch {
+    return undefined;
   }
-  return undefined;
 }
 
 async function invoke(target, command) {
@@ -183,21 +215,17 @@ async function invoke(target, command) {
   await ensureDaemon(resolved);
 
   const started = Date.now();
-  const run = await runCli([
-    command,
-    '--sessionId',
-    resolved.sessionId,
-    '--output-format',
-    'json',
-  ]);
+  const response = await invokeTool(resolved, command);
+  const parsed = response.success
+    ? await renderToolResult(response.result)
+    : undefined;
   const elapsedMs = Date.now() - started;
-  const parsed = parseCliOutput(run.stdout);
 
-  if (run.code !== 0 || parsed === undefined) {
+  if (!response.success || parsed === undefined) {
     throw new CallError(
       'tool',
       `${command} failed`,
-      (run.stderr || run.stdout).trim(),
+      response.success ? response.result : String(response.error),
     );
   }
   if (Array.isArray(parsed)) {
@@ -242,11 +270,18 @@ function readBody(request) {
 const server = http.createServer(async (request, response) => {
   try {
     if (request.method === 'GET' && request.url === '/health') {
-      send(response, 200, {ok: true, service: 'chromectl', targets: listTargets()});
+      send(response, 200, {
+        ok: true,
+        service: 'chromectl',
+        targets: listTargets(),
+      });
       return;
     }
     if (request.method !== 'POST' || request.url !== '/call') {
-      throw new CallError('usage', `no route for ${request.method} ${request.url}`);
+      throw new CallError(
+        'usage',
+        `no route for ${request.method} ${request.url}`,
+      );
     }
 
     const raw = await readBody(request);
