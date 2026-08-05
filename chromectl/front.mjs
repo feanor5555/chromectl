@@ -40,6 +40,7 @@ import {
   startDaemon,
 } from '../build/src/daemon/client.js';
 import {getDaemonPid, isDaemonRunning} from '../build/src/daemon/utils.js';
+import {callBudgetMs} from '../build/src/pacing.js';
 
 import {
   listTargets,
@@ -117,9 +118,6 @@ const CONTENT_TYPE_BY_FORMAT = {
   jpeg: 'image/jpeg',
   webp: 'image/webp',
 };
-
-/** Upper bound for one daemon call. */
-const CALL_TIMEOUT_MS = 60_000;
 
 /** Upper bound for the CDP reachability probe. */
 const PROBE_TIMEOUT_MS = 5_000;
@@ -382,19 +380,23 @@ async function replaceDaemon(resolved, generation) {
  *
  * The retry happens once. If the fresh daemon fails the same way, the failure
  * goes to the caller instead of starting another daemon.
+ *
+ * How long the call may take is derived from the call itself (`src/pacing.ts`):
+ * a command that types character by character lasts as long as its text is
+ * long, so a fixed ceiling would cut an honest input off in the middle of a
+ * field. This is the outermost of the three deadlines one call passes through
+ * and the shortest of them, so a timeout is reported here rather than by a
+ * socket further in.
  */
 async function invokeTool(resolved, command, args) {
   const message = {method: 'invoke_tool', tool: command, args};
+  const budgetMs = callBudgetMs(command, args);
   let generation = await ensureDaemon(resolved);
 
   for (let attempt = 0; ; attempt++) {
     let response;
     try {
-      response = await sendCommand(
-        message,
-        resolved.sessionId,
-        CALL_TIMEOUT_MS,
-      );
+      response = await sendCommand(message, resolved.sessionId, budgetMs);
     } catch (error) {
       const lost =
         !isDaemonRunning(resolved.sessionId) ||

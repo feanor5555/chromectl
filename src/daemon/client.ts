@@ -8,6 +8,7 @@ import {spawn} from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 
+import {callBudgetMs} from '../pacing.js';
 import type {CallToolResult} from '../third_party/index.js';
 import {PipeTransport} from '../third_party/index.js';
 import {getTempFilePath} from '../utils/files.js';
@@ -137,7 +138,17 @@ export async function startDaemon(mcpArgs: string[] = [], sessionId: string) {
   await waitForDaemonReady(sessionId);
 }
 
-const SEND_COMMAND_TIMEOUT = 60_000; // ms
+/**
+ * How long the socket waits for the answer to one command. A tool call that
+ * types character by character lasts as long as its text is long, so the
+ * ceiling is derived from the command instead of being a constant; a control
+ * message carries no such work and gets the floor.
+ */
+function defaultCommandTimeout(command: DaemonMessage): number {
+  return command.method === 'invoke_tool'
+    ? callBudgetMs(command.tool, command.args)
+    : callBudgetMs();
+}
 
 /**
  * `sendCommand` opens a socket connection sends a single command and disconnects.
@@ -145,7 +156,7 @@ const SEND_COMMAND_TIMEOUT = 60_000; // ms
 export async function sendCommand(
   command: DaemonMessage,
   sessionId: string,
-  timeout = SEND_COMMAND_TIMEOUT,
+  timeout = defaultCommandTimeout(command),
 ): Promise<DaemonResponse> {
   // Before connecting and sending, verify the daemon is still alive.
   if (!isDaemonRunning(sessionId)) {
@@ -161,7 +172,11 @@ export async function sendCommand(
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       socket.destroy();
-      reject(new Error('Timeout waiting for daemon response'));
+      reject(
+        new Error(
+          `Timeout waiting for daemon response after ${timeout}ms granted for this command`,
+        ),
+      );
     }, timeout);
 
     const transport = new PipeTransport(socket, socket);

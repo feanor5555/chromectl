@@ -17,6 +17,7 @@ import {
   PipeTransport,
   StdioClientTransport,
 } from '../third_party/index.js';
+import {callBudgetMs, innerBudgetMs} from '../pacing.js';
 import {logger} from '../utils/logger.js';
 import {VERSION} from '../version.js';
 
@@ -166,10 +167,19 @@ async function handleRequest(msg: DaemonMessage) {
       }
       const {tool, args} = msg;
 
-      const result = (await mcpClient.callTool({
-        name: tool,
-        arguments: args || {},
-      })) as McpResult | McpContent[];
+      // Without an explicit timeout the MCP SDK applies its own 60 s default,
+      // which would cut a paced keystroke stream off inside the daemon while
+      // the caller is still waiting. The request gets the budget the call is
+      // worth, widened by the slack that keeps every inner ceiling above the
+      // outer one, so the timer the caller set is the one that fires first.
+      const result = (await mcpClient.callTool(
+        {
+          name: tool,
+          arguments: args || {},
+        },
+        undefined,
+        {timeout: innerBudgetMs(callBudgetMs(tool, args))},
+      )) as McpResult | McpContent[];
 
       return {
         success: true,
