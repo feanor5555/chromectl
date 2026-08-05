@@ -6,6 +6,9 @@
  * without any authentication; the local network and the netbird network are the
  * access boundary.
  *
+ * The target registry is read from `CHROMECTL_TARGETS`, by default from
+ * `~/.claude/chromectl/targets.json`; without it the front refuses to start.
+ *
  * Start by hand:
  *   node /home/wu/chromectl/chromectl/front.mjs
  *
@@ -20,7 +23,14 @@ import {dirname, join} from 'node:path';
 import process from 'node:process';
 import {fileURLToPath} from 'node:url';
 
-import {listTargets, resolveTarget, TargetError} from './registry.mjs';
+import {
+  listTargets,
+  loadRegistry,
+  registryPath,
+  RegistryError,
+  resolveTarget,
+  TargetError,
+} from './registry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, '..', 'build', 'src', 'bin', 'chrome-devtools.js');
@@ -44,7 +54,7 @@ const CLI_ENV = {
 };
 
 /** HTTP status per failure kind, mirroring the client's exit codes. */
-const STATUS_BY_KIND = {usage: 400, tool: 422, unreachable: 503};
+const STATUS_BY_KIND = {usage: 400, config: 500, tool: 422, unreachable: 503};
 
 class CallError extends Error {
   constructor(kind, message, detail) {
@@ -163,6 +173,9 @@ async function invoke(target, command) {
     if (error instanceof TargetError) {
       throw new CallError('usage', error.message);
     }
+    if (error instanceof RegistryError) {
+      throw new CallError('config', error.message);
+    }
     throw error;
   }
 
@@ -245,7 +258,12 @@ const server = http.createServer(async (request, response) => {
     }
     send(response, 200, await invoke(body.target, body.command));
   } catch (error) {
-    const kind = error instanceof CallError ? error.kind : 'tool';
+    const kind =
+      error instanceof CallError
+        ? error.kind
+        : error instanceof RegistryError
+          ? 'config'
+          : 'tool';
     send(response, STATUS_BY_KIND[kind] ?? 500, {
       ok: false,
       kind,
@@ -255,6 +273,17 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
+// The registry is read at every call, but a missing one is a startup fault:
+// the front would otherwise answer requests it can never serve.
+try {
+  loadRegistry();
+} catch (error) {
+  console.error(`chromectl: ${error.message}`);
+  process.exit(1);
+}
+
 server.listen(PORT, HOST, () => {
-  console.log(`chromectl front listening on http://${HOST}:${PORT}`);
+  console.log(
+    `chromectl front listening on http://${HOST}:${PORT}, targets from ${registryPath()}`,
+  );
 });

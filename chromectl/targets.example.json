@@ -1,0 +1,8 @@
+{
+  "targets": {
+    "local": {
+      "browserUrl": "http://127.0.0.1:9333",
+      "description": "Chrome on the same machine, started by hand with a remote debugging port and its own user-data-dir."
+    }
+  }
+}
