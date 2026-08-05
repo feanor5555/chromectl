@@ -231,10 +231,131 @@ async function readTypeableField(
   });
 }
 
+/**
+ * A precondition of the interaction that did not hold in time. It carries the
+ * condition in its own message, so the caller is told which one failed instead
+ * of the timeout every locator failure ends in.
+ */
+class ElementNotReadyError extends Error {
+  constructor(condition: string, cause: unknown) {
+    super(`${condition} within the configured timeout.`, {cause});
+  }
+}
+
+/**
+ * Scrolls the element into the viewport and waits until it is there. The wait
+ * is the locator's own; `scroll` without offsets writes nothing to the element
+ * and is only the action that carries the condition, which is why the other
+ * condition of that action is switched off.
+ */
+async function waitUntilInViewport(
+  handle: ElementHandle<Element>,
+): Promise<void> {
+  try {
+    await handle.asLocator().setWaitForStableBoundingBox(false).scroll();
+  } catch (error) {
+    throw new ElementNotReadyError(
+      'The element did not scroll into the viewport',
+      error,
+    );
+  }
+}
+
+/**
+ * Waits until the element's bounding box is the same across two consecutive
+ * animation frames, so nothing types into a field that is still moving.
+ */
+async function waitUntilBoundingBoxIsStable(
+  handle: ElementHandle<Element>,
+): Promise<void> {
+  try {
+    await handle.asLocator().setEnsureElementIsInTheViewport(false).scroll();
+  } catch (error) {
+    throw new ElementNotReadyError(
+      'The bounding box of the element kept moving',
+      error,
+    );
+  }
+}
+
+/**
+ * Waits until a native form control has lost its `disabled` attribute. The
+ * predicate is the one `Locator.click` and `Locator.fill` wait on, and
+ * `filter` runs it through the same `waitForFunction` retry they use.
+ */
+async function waitUntilEnabled(handle: ElementHandle<Element>): Promise<void> {
+  try {
+    await handle
+      .asLocator()
+      .filter(element => {
+        if (!(element instanceof HTMLElement)) {
+          return true;
+        }
+        const isNativeFormControl = [
+          'BUTTON',
+          'INPUT',
+          'SELECT',
+          'TEXTAREA',
+          'OPTION',
+          'OPTGROUP',
+        ].includes(element.nodeName);
+        return !isNativeFormControl || !element.hasAttribute('disabled');
+      })
+      .waitHandle();
+  } catch (error) {
+    throw new ElementNotReadyError('The element stayed disabled', error);
+  }
+}
+
+/**
+ * Everything that has to hold before the first keystroke reaches a field: it is
+ * in the viewport, it has stopped moving, and it is not disabled. `Locator.fill`
+ * waits for these three and the paced path no longer goes through it, so they
+ * are waited for here — one after the other, each on a locator carrying only its
+ * own condition, so a failure names the condition that did not hold.
+ */
+async function waitUntilReadyForTyping(
+  handle: ElementHandle<Element>,
+): Promise<void> {
+  await waitUntilInViewport(handle);
+  await waitUntilBoundingBoxIsStable(handle);
+  await waitUntilEnabled(handle);
+}
+
+/**
+ * The element the keystrokes of `type_text` will land in. The tool names no
+ * element and types into whatever the page has focused, so there is one only
+ * when the page has focused something other than the document itself.
+ */
+async function focusedElement(
+  page: ContextPage,
+): Promise<ElementHandle<Element> | null> {
+  const handle = await page.pptrPage.evaluateHandle((): Element | null => {
+    const active = document.activeElement;
+    if (
+      !active ||
+      active === document.body ||
+      active === document.documentElement
+    ) {
+      return null;
+    }
+    return active;
+  });
+  const element = handle.asElement() as ElementHandle<Element> | null;
+  if (!element) {
+    await handle.dispose();
+  }
+  return element;
+}
+
 function handleActionError(error: unknown, uid: string): never {
   logger?.('failed to act using a locator', error);
+  const reason =
+    error instanceof ElementNotReadyError
+      ? error.message
+      : 'The element did not become interactive within the configured timeout.';
   throw new Error(
-    `Failed to interact with the element with uid ${uid}. The element did not become interactive within the configured timeout.`,
+    `Failed to interact with the element with uid ${uid}. ${reason}`,
     {
       cause: error,
     },
@@ -308,6 +429,10 @@ export const click = definePageTool({
     let release: (() => Promise<void>) | undefined;
     try {
       const result = await request.page.waitForEventsAfterTrigger(async () => {
+        // `Locator.hover` inside the press waits for the viewport and for a
+        // bounding box that stops moving, but not for the element to be
+        // enabled — the one condition `Locator.click` would add.
+        await waitUntilEnabled(handle);
         if (shouldSelectNativeOption) {
           // Picking an option sets a value and paces nothing, so this branch
           // stays whole inside the window, the click it falls back to
@@ -522,6 +647,7 @@ async function buildFillAction(
   }
 
   const keyboard = page.pptrPage.keyboard;
+  await waitUntilReadyForTyping(handle);
   await handle.focus();
   if (field.hasContent) {
     await selectAllPaced(keyboard);
@@ -614,6 +740,17 @@ export const typeText = definePageTool({
     const keyboard = page.pptrPage.keyboard;
     const {text, submitKey} = request.params;
     const result = await page.waitForEventsAfterTrigger(async () => {
+      using target = await focusedElement(page);
+      if (target) {
+        try {
+          await waitUntilReadyForTyping(target);
+        } catch (error) {
+          throw new Error(
+            `Failed to type into the focused element. ${error instanceof Error ? error.message : String(error)}`,
+            {cause: error},
+          );
+        }
+      }
       if (submitKey) {
         await typePaced(keyboard, text);
         // A person reads back what they typed before submitting it.
