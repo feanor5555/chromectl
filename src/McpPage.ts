@@ -427,6 +427,32 @@ export class McpPage implements ContextPage {
     return helper.waitForEventsAfterAction(action, options);
   }
 
+  /**
+   * The same wait for an action that is built in two steps. `prepare` runs
+   * everything that leads up to the interaction and hands that interaction
+   * back; only what it hands back runs under the navigation expectation.
+   *
+   * The expectation is a window of about 100 ms, armed when the helper is
+   * entered and decided by whether a navigation started inside it. Paced work
+   * — a keystroke stream, the pause before a field, the pointer travelling to
+   * a button and the span it stays pressed — lasts far longer than that, so an
+   * action carrying it in front of its triggering interaction would expire the
+   * window before the page began to navigate, and the call would return a page
+   * that is still on its way. Splitting the action moves that work in front of
+   * the window instead of widening the window to fit it.
+   */
+  async waitForEventsAfterTrigger(
+    prepare: () => Promise<() => Promise<unknown>>,
+    options?: {
+      timeout?: number;
+      handleDialog?:
+        DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
+    },
+  ): Promise<WaitForEventsResult> {
+    const trigger = await prepare();
+    return await this.waitForEventsAfterAction(trigger, options);
+  }
+
   dispose(): void {
     this.pptrPage.off('dialog', this.#dialogHandler);
     this.networkCollector.dispose();

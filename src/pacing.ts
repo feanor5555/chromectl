@@ -17,7 +17,9 @@
  * The figures the brake works to: a key stays down 70–140 ms, the gap to the
  * next press is 15–80 ms, and every paced action is preceded by a 250–700 ms
  * pause. The 400–900 ms settle window after an action waits for the page rather
- * than imitating a person and is part of the fixed overhead.
+ * than imitating a person and is part of the fixed overhead. Every one of those
+ * intervals is drawn afresh through `drawPacingMs`, which is the single place
+ * the brake takes a value from.
  *
  * Every layer one call passes through takes its deadline from here — the front,
  * the daemon socket and the MCP request inside the daemon — so the three cannot
@@ -53,6 +55,14 @@ export const CHARACTER_MAX_MS = KEY_HOLD_MAX_MS + KEY_INTERVAL_MAX_MS;
 export const PRE_ACTION_PAUSE_MIN_MS = 250;
 export const PRE_ACTION_PAUSE_MAX_MS = 700;
 
+/**
+ * Shortest and longest a mouse button stays down on a paced click. It is short
+ * enough beside the pre-action pause that the budget covers it out of its
+ * safety margin rather than counting it.
+ */
+export const MOUSE_HOLD_MIN_MS = 150;
+export const MOUSE_HOLD_MAX_MS = 195;
+
 /** Longest settle window after an action has run. */
 export const SETTLE_MAX_MS = 900;
 
@@ -85,6 +95,129 @@ export const MIN_CALL_BUDGET_MS = 60_000;
  * caller is told about that instead of about the deadline it set.
  */
 export const INNER_BUDGET_SLACK_MS = 10_000;
+
+/**
+ * The timing one call works to. Every value the brake waits out is drawn from
+ * an interval of this table, so the two profiles below are the whole difference
+ * between a call that imitates a person and one that does not.
+ */
+export interface PaceProfile {
+  /** What a result envelope calls this profile. */
+  readonly name: 'human' | 'full';
+  /** How long a single key stays down. */
+  readonly keyHoldMs: readonly [number, number];
+  /** The gap between the release of one key and the press of the next. */
+  readonly keyIntervalMs: readonly [number, number];
+  /** The pause taken before an action reaches the page. */
+  readonly preActionPauseMs: readonly [number, number];
+  /** How long the mouse button stays down on a click. */
+  readonly mouseHoldMs: readonly [number, number];
+  /**
+   * Whether a text field takes its value in one shot instead of keystroke by
+   * keystroke. Nothing about a value set directly can be paced, which is why
+   * this belongs to the profile rather than to the field.
+   */
+  readonly fillsInOneShot: boolean;
+}
+
+/** The default: every interval as a person produces it. */
+export const PACE_HUMAN: PaceProfile = {
+  name: 'human',
+  keyHoldMs: [KEY_HOLD_MIN_MS, KEY_HOLD_MAX_MS],
+  keyIntervalMs: [KEY_INTERVAL_MIN_MS, KEY_INTERVAL_MAX_MS],
+  preActionPauseMs: [PRE_ACTION_PAUSE_MIN_MS, PRE_ACTION_PAUSE_MAX_MS],
+  mouseHoldMs: [MOUSE_HOLD_MIN_MS, MOUSE_HOLD_MAX_MS],
+  fillsInOneShot: false,
+};
+
+/**
+ * The profile the call currently in flight runs at. Calls serialize on the
+ * process-wide tool mutex, so one profile at a time is the whole truth here;
+ * `selectPace` is called by the funnel that holds that mutex.
+ */
+let activePace: PaceProfile = PACE_HUMAN;
+
+/** The profile of the call in flight, which every paced value is drawn from. */
+export function currentPace(): PaceProfile {
+  return activePace;
+}
+
+/**
+ * Shape of every draw. A uniform value raised to this power lands near the
+ * lower bound most of the time and reaches the upper one rarely — the shape a
+ * typist produces, and the one a flat draw with its sharp cut at both ends does
+ * not. The mean sits at `1 / (PACING_SKEW + 1)` of the interval, so a key gap
+ * averages 41 ms of its 15–80 ms range, a hold 98 ms of its 70–140 ms, hence
+ * about 139 ms per character, and a pre-action pause 430 ms.
+ */
+export const PACING_SKEW = 1.5;
+
+/**
+ * One draw from an interval, right-skewed and rounded to whole milliseconds.
+ * Every wait the brake takes comes from here, so all of them share one shape
+ * and none repeats the previous one by construction.
+ */
+export function drawPacingMs(minMs: number, maxMs: number): number {
+  const skewed = Math.random() ** PACING_SKEW;
+  return Math.round(minMs + (maxMs - minMs) * skewed);
+}
+
+/**
+ * Waits a fixed number of milliseconds. A wait of nothing is not scheduled at
+ * all: at full speed every interval is zero, and a timer per keystroke would
+ * put back a part of what the profile exists to remove.
+ */
+export function sleepMs(ms: number): Promise<void> {
+  if (ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/** Draws one interval, waits it out and reports what it waited. */
+export async function pacedSleep(
+  minMs: number,
+  maxMs: number,
+): Promise<number> {
+  const ms = drawPacingMs(minMs, maxMs);
+  await sleepMs(ms);
+  return ms;
+}
+
+/** Draws from one interval of the profile the call in flight runs at. */
+function drawFromPace(range: readonly [number, number]): number {
+  return drawPacingMs(range[0], range[1]);
+}
+
+/** Waits out one interval of that profile and reports what it waited. */
+function sleepAtPace(range: readonly [number, number]): Promise<number> {
+  return pacedSleep(range[0], range[1]);
+}
+
+/** How long the next key stays down. */
+export function drawKeyHoldMs(): number {
+  return drawFromPace(activePace.keyHoldMs);
+}
+
+/** The gap between the release of one key and the press of the next. */
+export function sleepKeyIntervalMs(): Promise<number> {
+  return sleepAtPace(activePace.keyIntervalMs);
+}
+
+/** How long the mouse button stays down on the next paced click. */
+export function drawMouseHoldMs(): number {
+  return drawFromPace(activePace.mouseHoldMs);
+}
+
+/**
+ * The pause a person spends before acting: reaching the next field, looking at
+ * it, moving there. It is taken before the action begins, not after it.
+ */
+export function pauseBeforeAction(): Promise<number> {
+  return sleepAtPace(activePace.preActionPauseMs);
+}
 
 /** The arguments of one tool call, as they arrive over the daemon socket. */
 type ToolArguments = Record<string, unknown>;

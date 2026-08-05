@@ -45,6 +45,7 @@ export {
 export {default as puppeteer} from 'puppeteer-core';
 export type * from 'puppeteer-core';
 export {PipeTransport} from 'puppeteer-core/internal/node/PipeTransport.js';
+export {_keyDefinitions} from 'puppeteer-core/internal/common/USKeyboardLayout.js';
 export type {CdpPage} from 'puppeteer-core/internal/cdp/Page.js';
 export type {CdpWebWorker} from 'puppeteer-core/internal/cdp/WebWorker.js';
 export type {Realm} from 'puppeteer-core/internal/api/Realm.js';

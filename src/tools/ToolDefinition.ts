@@ -318,6 +318,14 @@ export type ContextPage = Readonly<{
         DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
     },
   ): Promise<WaitForEventsResult>;
+  waitForEventsAfterTrigger(
+    prepare: () => Promise<() => Promise<unknown>>,
+    options?: {
+      timeout?: number;
+      handleDialog?:
+        DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
+    },
+  ): Promise<WaitForEventsResult>;
   getThirdPartyDeveloperTools(): ToolGroups;
 
   executeThirdPartyDeveloperTool(
