@@ -1,0 +1,8 @@
+{
+  "targets": {
+    "videoanalyzer-lokal": {
+      "browserUrl": "http://127.0.0.1:9333",
+      "description": "Throwaway headless Chrome for Testing 151, started by hand on port 9333 with its own user-data-dir."
+    }
+  }
+}
