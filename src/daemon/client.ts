@@ -142,11 +142,12 @@ export async function startDaemon(mcpArgs: string[] = [], sessionId: string) {
  * How long the socket waits for the answer to one command. A tool call that
  * types character by character lasts as long as its text is long, so the
  * ceiling is derived from the command instead of being a constant; a control
- * message carries no such work and gets the floor.
+ * message carries no such work and gets the floor, and so does a call at full
+ * speed, which types nothing character by character either.
  */
 function defaultCommandTimeout(command: DaemonMessage): number {
   return command.method === 'invoke_tool'
-    ? callBudgetMs(command.tool, command.args)
+    ? callBudgetMs(command.tool, command.args, command.fullSpeed)
     : callBudgetMs();
 }
 

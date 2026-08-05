@@ -15,6 +15,11 @@ export type DaemonMessage =
       method: 'invoke_tool';
       tool: string;
       args?: Record<string, unknown>;
+      /**
+       * Lifts human pacing for this one call. It is a property of the call, not
+       * an argument of the tool, and travels on as the MCP request's metadata.
+       */
+      fullSpeed?: boolean;
     };
 
 export interface DaemonResponse {

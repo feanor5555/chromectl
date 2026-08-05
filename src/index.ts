@@ -184,8 +184,11 @@ export async function createMcpServer(
         inputSchema: toolHandler.registeredInputSchema,
         annotations: tool.annotations,
       },
-      async (params): Promise<CallToolResult> => {
-        return await toolHandler.handle(params);
+      // The request metadata carries what belongs to the call rather than to
+      // the tool — the full-speed switch — so it is handed on beside the
+      // arguments.
+      async (params, extra): Promise<CallToolResult> => {
+        return await toolHandler.handle(params, extra?._meta);
       },
     );
   }

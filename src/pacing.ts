@@ -25,6 +25,12 @@
  * the daemon socket and the MCP request inside the daemon — so the three cannot
  * drift apart. The inner layers add `INNER_BUDGET_SLACK_MS` on top, so the
  * outermost layer is the one whose timer fires first and reports.
+ *
+ * Human pacing is what every call gets unless it says otherwise. The way out is
+ * `PACE_FULL`, selected per call by the full-speed switch, and it exists for our
+ * own pages: there is nobody there to fool, so every wait is pure cost. The two
+ * profiles are the only ones — there is no third, no scaling factor and no
+ * environment variable that could make full speed a machine's silent default.
  */
 
 /** Shortest and longest a single key stays down. */
@@ -130,6 +136,16 @@ export const PACE_HUMAN: PaceProfile = {
   fillsInOneShot: false,
 };
 
+/** The way out: no interval left, and fields take their value in one shot. */
+export const PACE_FULL: PaceProfile = {
+  name: 'full',
+  keyHoldMs: [0, 0],
+  keyIntervalMs: [0, 0],
+  preActionPauseMs: [0, 0],
+  mouseHoldMs: [0, 0],
+  fillsInOneShot: true,
+};
+
 /**
  * The profile the call currently in flight runs at. Calls serialize on the
  * process-wide tool mutex, so one profile at a time is the whole truth here;
@@ -140,6 +156,31 @@ let activePace: PaceProfile = PACE_HUMAN;
 /** The profile of the call in flight, which every paced value is drawn from. */
 export function currentPace(): PaceProfile {
   return activePace;
+}
+
+/**
+ * Puts one call's profile in place and hands back the restore, so a call cannot
+ * leave its profile behind for the next one.
+ */
+export function selectPace(fullSpeed: boolean): () => void {
+  const previous = activePace;
+  activePace = fullSpeed ? PACE_FULL : PACE_HUMAN;
+  return () => {
+    activePace = previous;
+  };
+}
+
+/**
+ * How the switch travels inside the MCP request: as request metadata, not as a
+ * tool argument. It is ours and upstream's tools know nothing of it, so it
+ * appears in no tool schema, in no generated CLI option and in no argument the
+ * caller has to have declared.
+ */
+export const FULL_SPEED_META_KEY = 'chromectl/fullSpeed';
+
+/** Whether one request's metadata carries the switch. */
+export function isFullSpeedRequest(meta?: Record<string, unknown>): boolean {
+  return meta?.[FULL_SPEED_META_KEY] === true;
 }
 
 /**
@@ -268,8 +309,19 @@ function pacedWork(tool: string | undefined, args: ToolArguments): PacedWork {
 /**
  * How long one call may take. Called without a tool name it yields the budget
  * of a call that types nothing, which is what a daemon control message gets.
+ *
+ * A call at full speed pays for no pacing at all, so it falls back to the floor
+ * whatever it types: what is left of it are the waits for the page, which the
+ * floor has always covered.
  */
-export function callBudgetMs(tool?: string, args?: ToolArguments): number {
+export function callBudgetMs(
+  tool?: string,
+  args?: ToolArguments,
+  fullSpeed = false,
+): number {
+  if (fullSpeed) {
+    return MIN_CALL_BUDGET_MS;
+  }
   const {characters, actions} = pacedWork(tool, args ?? {});
   const work =
     CALL_OVERHEAD_MS +

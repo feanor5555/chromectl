@@ -24,7 +24,8 @@
  * Endpoints:
  *   GET  /health          liveness plus the registered target names and commands
  *   GET  /screenshots/<f> the PNG of an earlier take_screenshot call
- *   POST /call            {"target": "<name>", "command": "<tool>", "args": {…}}
+ *   POST /call            {"target": "<name>", "command": "<tool>", "args": {…},
+ *                          "full_speed": false}
  */
 
 import {randomBytes} from 'node:crypto';
@@ -386,11 +387,12 @@ async function replaceDaemon(resolved, generation) {
  * long, so a fixed ceiling would cut an honest input off in the middle of a
  * field. This is the outermost of the three deadlines one call passes through
  * and the shortest of them, so a timeout is reported here rather than by a
- * socket further in.
+ * socket further in. At full speed nothing is typed character by character and
+ * the ceiling falls back to the floor.
  */
-async function invokeTool(resolved, command, args) {
-  const message = {method: 'invoke_tool', tool: command, args};
-  const budgetMs = callBudgetMs(command, args);
+async function invokeTool(resolved, command, args, fullSpeed) {
+  const message = {method: 'invoke_tool', tool: command, args, fullSpeed};
+  const budgetMs = callBudgetMs(command, args, fullSpeed);
   let generation = await ensureDaemon(resolved);
 
   for (let attempt = 0; ; attempt++) {
@@ -493,6 +495,27 @@ function coerceArgument(command, definition, value) {
     fail(`one of ${definition.enum.join(', ')}`);
   }
   return coerced;
+}
+
+/**
+ * The full-speed switch of one call. It sits beside `args` rather than inside
+ * them: no tool declares it, so it has no entry in `COMMAND_SCHEMAS` and must
+ * never be handed to the daemon as a tool argument — the tool would reject the
+ * call as carrying an unknown one. Its coercion is the one every declared
+ * boolean gets, so a caller who can only send text writes `"true"`.
+ */
+const FULL_SPEED_DEFINITION = {
+  name: 'full_speed',
+  type: 'boolean',
+  description: 'Lifts human pacing for this call.',
+  required: false,
+};
+
+function validateFullSpeed(value) {
+  if (value === undefined || value === null) {
+    return false;
+  }
+  return coerceArgument('call', FULL_SPEED_DEFINITION, value);
 }
 
 /**
@@ -651,9 +674,9 @@ async function describeScreenshot(plan, publicBase) {
 }
 
 /** Sends one tool invocation and renders its result. */
-async function runCommand(resolved, command, toolArgs) {
+async function runCommand(resolved, command, toolArgs, fullSpeed) {
   const started = Date.now();
-  const response = await invokeTool(resolved, command, toolArgs);
+  const response = await invokeTool(resolved, command, toolArgs, fullSpeed);
   const parsed = response.success
     ? await renderToolResult(response.result)
     : undefined;
@@ -672,7 +695,7 @@ async function runCommand(resolved, command, toolArgs) {
   return {parsed, elapsedMs};
 }
 
-async function invoke(target, command, args, publicBase) {
+async function invoke(target, command, args, fullSpeed, publicBase) {
   if (typeof command !== 'string' || !COMMAND_SCHEMAS.has(command)) {
     throw new CallError(
       'usage',
@@ -680,6 +703,7 @@ async function invoke(target, command, args, publicBase) {
     );
   }
   const toolArgs = validateArgs(command, args);
+  const atFullSpeed = validateFullSpeed(fullSpeed);
 
   let resolved;
   try {
@@ -710,7 +734,7 @@ async function invoke(target, command, args, publicBase) {
 
   let outcome;
   try {
-    outcome = await runCommand(resolved, command, toolArgs);
+    outcome = await runCommand(resolved, command, toolArgs, atFullSpeed);
   } catch (error) {
     throw plan ? reclassifyScreenshotFailure(error, plan) : error;
   }
@@ -722,6 +746,9 @@ async function invoke(target, command, args, publicBase) {
     browser_url: resolved.browserUrl,
     command,
     args: toolArgs,
+    // Which profile ran, on every answer, so a log shows plainly whether the
+    // brake was off.
+    pace: atFullSpeed ? 'full' : 'human',
     elapsed_ms: elapsedMs,
     title: parsed.pages?.find(page => page.selected)?.title,
     ...(plan ? {screenshot: await describeScreenshot(plan, publicBase)} : {}),
@@ -821,7 +848,13 @@ const server = http.createServer(async (request, response) => {
     send(
       response,
       200,
-      await invoke(body.target, body.command, body.args, publicBase),
+      await invoke(
+        body.target,
+        body.command,
+        body.args,
+        body.full_speed,
+        publicBase,
+      ),
     );
   } catch (error) {
     const kind =

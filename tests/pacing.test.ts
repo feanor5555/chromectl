@@ -12,20 +12,27 @@ import sinon from 'sinon';
 import {
   callBudgetMs,
   CHARACTER_MAX_MS,
+  currentPace,
   drawKeyHoldMs,
   drawMouseHoldMs,
   drawPacingMs,
+  FULL_SPEED_META_KEY,
+  isFullSpeedRequest,
   KEY_HOLD_MAX_MS,
   KEY_HOLD_MIN_MS,
   KEY_INTERVAL_MAX_MS,
   KEY_INTERVAL_MIN_MS,
+  MIN_CALL_BUDGET_MS,
   MOUSE_HOLD_MAX_MS,
   MOUSE_HOLD_MIN_MS,
+  PACE_FULL,
+  PACE_HUMAN,
   PACING_SKEW,
   pacedSleep,
   pauseBeforeAction,
   PRE_ACTION_PAUSE_MAX_MS,
   PRE_ACTION_PAUSE_MIN_MS,
+  selectPace,
   sleepKeyIntervalMs,
   sleepMs,
 } from '../src/pacing.js';
@@ -186,6 +193,99 @@ describe('pacing', () => {
         KEY_HOLD_MAX_MS;
 
       assert.ok(callBudgetMs('type_text', {text}) > worstCaseMs);
+    });
+
+    it('falls back to the floor at full speed', () => {
+      const value = 'a'.repeat(2_000);
+
+      assert.ok(callBudgetMs('fill', {value}) > MIN_CALL_BUDGET_MS);
+      assert.strictEqual(
+        callBudgetMs('fill', {value}, true),
+        MIN_CALL_BUDGET_MS,
+      );
+      assert.strictEqual(
+        callBudgetMs('type_text', {text: value}, true),
+        MIN_CALL_BUDGET_MS,
+      );
+      assert.strictEqual(
+        callBudgetMs(
+          'fill_form',
+          {elements: [{value}, {value}, {value}]},
+          true,
+        ),
+        MIN_CALL_BUDGET_MS,
+      );
+    });
+  });
+
+  describe('full speed', () => {
+    it('is not what a call runs at unless it is selected', () => {
+      assert.strictEqual(currentPace(), PACE_HUMAN);
+    });
+
+    it('is read off the request metadata and nothing else', () => {
+      assert.strictEqual(isFullSpeedRequest(undefined), false);
+      assert.strictEqual(isFullSpeedRequest({}), false);
+      assert.strictEqual(isFullSpeedRequest({fullSpeed: true}), false);
+      assert.strictEqual(
+        isFullSpeedRequest({[FULL_SPEED_META_KEY]: 'true'}),
+        false,
+      );
+      assert.strictEqual(
+        isFullSpeedRequest({[FULL_SPEED_META_KEY]: true}),
+        true,
+      );
+    });
+
+    it('hands the previous profile back', () => {
+      const restore = selectPace(true);
+      assert.strictEqual(currentPace(), PACE_FULL);
+      restore();
+      assert.strictEqual(currentPace(), PACE_HUMAN);
+    });
+
+    it('fills in one shot where human pacing types', () => {
+      assert.strictEqual(PACE_HUMAN.fillsInOneShot, false);
+      assert.strictEqual(PACE_FULL.fillsInOneShot, true);
+    });
+
+    it('draws no interval at all', () => {
+      const restore = selectPace(true);
+      try {
+        for (let i = 0; i < 1_000; i++) {
+          assert.strictEqual(drawKeyHoldMs(), 0);
+          assert.strictEqual(drawMouseHoldMs(), 0);
+        }
+      } finally {
+        restore();
+      }
+    });
+
+    it('waits out nothing, not even a timer per keystroke', async () => {
+      const restore = selectPace(true);
+      try {
+        const before = Date.now();
+        for (let i = 0; i < 500; i++) {
+          assert.strictEqual(await sleepKeyIntervalMs(), 0);
+          assert.strictEqual(await pauseBeforeAction(), 0);
+        }
+        // A thousand zero-length timers would cost about a second; without a
+        // timer at all the loop is bounded by its own bookkeeping.
+        assert.ok(
+          Date.now() - before < 100,
+          `1000 full-speed waits took ${Date.now() - before}ms`,
+        );
+      } finally {
+        restore();
+      }
+    });
+
+    it('leaves human pacing untouched for the next call', async () => {
+      selectPace(true)();
+      const hold = drawKeyHoldMs();
+      assert.ok(hold >= KEY_HOLD_MIN_MS && hold <= KEY_HOLD_MAX_MS);
+      const gap = await sleepKeyIntervalMs();
+      assert.ok(gap >= KEY_INTERVAL_MIN_MS);
     });
   });
 });

@@ -17,7 +17,7 @@ import {
   PipeTransport,
   StdioClientTransport,
 } from '../third_party/index.js';
-import {callBudgetMs, innerBudgetMs} from '../pacing.js';
+import {callBudgetMs, FULL_SPEED_META_KEY, innerBudgetMs} from '../pacing.js';
 import {logger} from '../utils/logger.js';
 import {VERSION} from '../version.js';
 
@@ -165,20 +165,25 @@ async function handleRequest(msg: DaemonMessage) {
       if (!mcpClient) {
         throw new Error('MCP client not initialized');
       }
-      const {tool, args} = msg;
+      const {tool, args, fullSpeed} = msg;
 
       // Without an explicit timeout the MCP SDK applies its own 60 s default,
       // which would cut a paced keystroke stream off inside the daemon while
       // the caller is still waiting. The request gets the budget the call is
       // worth, widened by the slack that keeps every inner ceiling above the
-      // outer one, so the timer the caller set is the one that fires first.
+      // outer one, so the timer the caller set is the one that fires first. A
+      // call at full speed pays for no pacing and falls back to the floor.
+      //
+      // The switch itself goes on as request metadata rather than as an
+      // argument, because no tool declares it.
       const result = (await mcpClient.callTool(
         {
           name: tool,
           arguments: args || {},
+          ...(fullSpeed ? {_meta: {[FULL_SPEED_META_KEY]: true}} : {}),
         },
         undefined,
-        {timeout: innerBudgetMs(callBudgetMs(tool, args))},
+        {timeout: innerBudgetMs(callBudgetMs(tool, args, fullSpeed))},
       )) as McpResult | McpContent[];
 
       return {

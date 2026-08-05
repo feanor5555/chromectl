@@ -9,13 +9,17 @@ import type {McpContext} from './McpContext.js';
 import type {McpPage} from './McpPage.js';
 import type {DataFormat} from './McpResponse.js';
 import {McpResponse} from './McpResponse.js';
+import {isFullSpeedRequest, selectPace} from './pacing.js';
 import {SlimMcpResponse} from './SlimMcpResponse.js';
 import {ClearcutLogger} from './telemetry/ClearcutLogger.js';
 import {bucketizeLatency, buildContext} from './telemetry/transformation.js';
 import type {CallToolResult} from './third_party/index.js';
 import {zod} from './third_party/index.js';
-import type {ToolCategory} from './tools/categories.js';
-import {labels, OFF_BY_DEFAULT_CATEGORIES} from './tools/categories.js';
+import {
+  labels,
+  OFF_BY_DEFAULT_CATEGORIES,
+  ToolCategory,
+} from './tools/categories.js';
 import type {
   DefinedPageTool,
   DevToolsData,
@@ -180,7 +184,16 @@ export class ToolHandler {
     );
   }
 
-  async handle(params: Record<string, unknown>): Promise<CallToolResult> {
+  /**
+   * Runs one tool call. `meta` is the metadata of the MCP request, which is
+   * where the full-speed switch travels: it is a property of the call, not an
+   * argument of the tool, so it reaches this funnel without appearing in any
+   * tool's schema.
+   */
+  async handle(
+    params: Record<string, unknown>,
+    meta?: Record<string, unknown>,
+  ): Promise<CallToolResult> {
     if (this.disabledReason) {
       return {
         content: [
@@ -211,6 +224,14 @@ export class ToolHandler {
     }
 
     const guard = await this.toolMutex.acquire();
+    // The pace is put in place here because this is the one funnel every call
+    // passes and it holds the process-wide mutex, so the profile of the call in
+    // flight cannot be read by another. Only input tools draw a paced value, so
+    // the switch reaches nothing outside that category.
+    const restorePace = selectPace(
+      this.tool.annotations.category === ToolCategory.INPUT &&
+        isFullSpeedRequest(meta),
+    );
     const startTime = Date.now();
     let success = false;
     let devToolsData: DevToolsData | undefined;
@@ -325,6 +346,7 @@ export class ToolHandler {
         latencyMs: bucketizeLatency(Date.now() - startTime),
         context,
       });
+      restorePace();
       guard[Symbol.dispose]();
     }
   }

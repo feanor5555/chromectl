@@ -12,6 +12,12 @@ import sinon from 'sinon';
 import {parseArguments} from '../src/bin/chrome-devtools-mcp-cli-options.js';
 import {McpContext} from '../src/McpContext.js';
 import {McpPage} from '../src/McpPage.js';
+import {
+  currentPace,
+  FULL_SPEED_META_KEY,
+  PACE_FULL,
+  PACE_HUMAN,
+} from '../src/pacing.js';
 import {ClearcutLogger} from '../src/telemetry/ClearcutLogger.js';
 import {zod} from '../src/third_party/index.js';
 import {ToolHandler} from '../src/ToolHandler.js';
@@ -257,6 +263,63 @@ describe('ToolHandler', () => {
       /Unknown argument for tool "lenient_tool": "description"\. Expected arguments: "url"\./,
     );
     assert.strictEqual(handlerCalled, false);
+  });
+
+  describe('the full-speed switch', () => {
+    function paceReportingTool(category: ToolCategory) {
+      const seen: Array<ReturnType<typeof currentPace>> = [];
+      const tool: ToolDefinition = {
+        name: 'pace_tool',
+        description: 'A tool that reports the pace it ran at',
+        annotations: {
+          category,
+          readOnlyHint: true,
+        },
+        schema: {},
+        blockedByDialog: false,
+        verifyFilesSchema: [],
+        handler: async () => {
+          seen.push(currentPace());
+        },
+      };
+
+      const serverArgs = parseArguments('1.0.0', ['node', 'script.js'], {
+        CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: 'true',
+      });
+      const handler = new ToolHandler(
+        tool,
+        serverArgs,
+        async () => sinon.createStubInstance(McpContext),
+        new Mutex(),
+      );
+      return {handler, seen};
+    }
+
+    it('reaches an input tool through the request metadata', async () => {
+      const {handler, seen} = paceReportingTool(ToolCategory.INPUT);
+
+      await handler.handle({});
+      await handler.handle({}, {});
+      await handler.handle({}, {[FULL_SPEED_META_KEY]: true});
+
+      assert.deepStrictEqual(seen, [PACE_HUMAN, PACE_HUMAN, PACE_FULL]);
+    });
+
+    it('leaves a tool that paces nothing at human pacing', async () => {
+      const {handler, seen} = paceReportingTool(ToolCategory.NAVIGATION);
+
+      await handler.handle({}, {[FULL_SPEED_META_KEY]: true});
+
+      assert.deepStrictEqual(seen, [PACE_HUMAN]);
+    });
+
+    it('does not outlive the call that set it', async () => {
+      const {handler} = paceReportingTool(ToolCategory.INPUT);
+
+      await handler.handle({}, {[FULL_SPEED_META_KEY]: true});
+
+      assert.strictEqual(currentPace(), PACE_HUMAN);
+    });
   });
 
   it('sets shouldRegister to false and returns disabled reason when category is disabled', async () => {
