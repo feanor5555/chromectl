@@ -164,12 +164,7 @@ function pressOptions(clickCount: number): Readonly<MouseOptions> {
  * The approach stays with `Locator.hover`, so the locator's viewport and
  * stability conditions still run; only the press and the release are taken
  * from the mouse directly, because `Locator.click` cannot hand its release
- * back. A double click is two complete clicks: every press of it holds the
- * button for its own drawn span and a drawn gap separates one click from the
- * next, so neither half is a zero-length press and the two are not sent in the
- * same instant. `mouse.click` reaches neither of those — its single `delay` is
- * the dwell of the last press and it leaves the earlier ones and the gap
- * between them at zero.
+ * back.
  */
 async function pressPaced(
   handle: ElementHandle<Element>,
@@ -179,6 +174,37 @@ async function pressPaced(
   await approachInViewport(handle, async () => {
     await handle.asLocator().hover();
   });
+  await pressButtonPaced(mouse, clickCount);
+}
+
+/**
+ * The same for a spot the caller names instead of an element. Nothing about a
+ * pair of coordinates can be scrolled into view or waited for, so the pointer
+ * travels there and the press follows.
+ */
+async function pressPacedAt(
+  mouse: Mouse,
+  x: number,
+  y: number,
+  clickCount: number,
+): Promise<void> {
+  await mouse.move(x, y);
+  await pressButtonPaced(mouse, clickCount);
+}
+
+/**
+ * The press itself, once the pointer stands on the spot, with the button left
+ * down for the caller to release. A double click is two complete clicks: every
+ * press of it holds the button for its own drawn span and a drawn gap separates
+ * one click from the next, so neither half is a zero-length press and the two
+ * are not sent in the same instant. `mouse.click` reaches neither of those —
+ * its single `delay` is the dwell of the last press and it leaves the earlier
+ * ones and the gap between them at zero.
+ */
+async function pressButtonPaced(
+  mouse: Mouse,
+  clickCount: number,
+): Promise<void> {
   for (let count = 1; count < clickCount; count++) {
     await mouse.down(pressOptions(count));
     await sleepMs(drawMouseHoldMs());
@@ -274,6 +300,29 @@ async function readTypeableField(
       keptPrefixLength: 0,
     };
   }, value);
+}
+
+/**
+ * What a checkbox, a radio button or a switch currently reads as. `mixed` is a
+ * state no value matches — an indeterminate checkbox or an `aria-checked`
+ * reading `mixed` — so a control in it is always clicked. The predicate is the
+ * one inside `Locator.fill`, which the paced path no longer goes through.
+ */
+async function readToggleState(
+  handle: ElementHandle<Element>,
+): Promise<boolean | 'mixed'> {
+  return await handle.evaluate(element => {
+    if (
+      (element instanceof HTMLInputElement && element.indeterminate) ||
+      element.getAttribute('aria-checked') === 'mixed'
+    ) {
+      return 'mixed';
+    }
+    return (
+      (element instanceof HTMLInputElement && element.checked) ||
+      element.getAttribute('aria-checked') === 'true'
+    );
+  });
 }
 
 /**
@@ -594,19 +643,44 @@ export const clickAt = definePageTool({
   verifyFilesSchema: [],
   handler: async (request, response) => {
     const page = request.page;
-    const result = await page.waitForEventsAfterAction(async () => {
-      await page.pptrPage.mouse.click(request.params.x, request.params.y, {
-        count: request.params.dblClick ? 2 : 1,
+    const mouse = page.pptrPage.mouse;
+    const clickCount = request.params.dblClick ? 2 : 1;
+    const releaseButton = async () => {
+      await mouse.up(pressOptions(clickCount));
+    };
+    // Set before the first press, not after the last one: a `mouse.up` that
+    // throws between the two clicks of a double click would otherwise leave the
+    // button logically down for every later interaction with the page.
+    let release: (() => Promise<void>) | undefined;
+    try {
+      const result = await page.waitForEventsAfterTrigger(async () => {
+        release = releaseButton;
+        await pressPacedAt(
+          mouse,
+          request.params.x,
+          request.params.y,
+          clickCount,
+        );
+        return async () => {
+          release = undefined;
+          await releaseButton();
+        };
       });
-    });
-    response.appendResponseLine(
-      request.params.dblClick
-        ? `Successfully double clicked at the coordinates`
-        : `Successfully clicked at the coordinates`,
-    );
-    response.attachWaitForResult(result);
-    if (request.params.includeSnapshot) {
-      response.includeSnapshot();
+      response.appendResponseLine(
+        request.params.dblClick
+          ? `Successfully double clicked at the coordinates`
+          : `Successfully clicked at the coordinates`,
+      );
+      response.attachWaitForResult(result);
+      if (request.params.includeSnapshot) {
+        response.includeSnapshot();
+      }
+    } finally {
+      // A press that never reached its release would leave the button down for
+      // every later interaction with the page.
+      if (release) {
+        await mouse.up(pressOptions(clickCount)).catch(() => undefined);
+      }
     }
   },
 });
@@ -632,8 +706,16 @@ export const hover = definePageTool({
     const uid = request.params.uid;
     using handle = await request.page.getElementByUid(uid);
     try {
-      const result = await request.page.waitForEventsAfterAction(async () => {
-        await handle.asLocator().hover();
+      const result = await request.page.waitForEventsAfterTrigger(async () => {
+        // The pointer arrives the way it arrives for a paced click: the jump
+        // that brings the element into view is waited out first, so the hover
+        // itself is all that is left inside the navigation expectation. What a
+        // hover sets off — a menu, a tooltip — is then waited for by the window
+        // behind it rather than raced against the pause in front of it.
+        await waitUntilInViewport(handle);
+        return async () => {
+          await handle.asLocator().hover();
+        };
       });
       response.appendResponseLine(`Successfully hovered over the element`);
       response.attachWaitForResult(result);
@@ -650,11 +732,16 @@ export const hover = definePageTool({
 // If the form is a combobox, we need to find the correct option by its text value.
 // To do that, loop through the children while checking which child's text matches the requested value (requested value is actually the text content).
 // When the correct option is found, use the element handle to get the real value.
-async function selectOption(
-  handle: ElementHandle,
+//
+// Only the value is read here, and the element takes it by the same route as
+// any other: what a combobox is in the DOM decides that route, not what it is
+// in the accessibility tree. A `<select>` takes it in one shot, an
+// `<input role="combobox">` — a search box, an autocomplete field — takes a
+// keystroke stream and is paced like every other text field.
+async function resolveOptionValue(
   aXNode: TextSnapshotNode,
   value: string,
-) {
+): Promise<string | undefined> {
   let optionFound = false;
   for (const child of aXNode.children) {
     if (child.role === 'option' && child.name === value && child.value) {
@@ -664,17 +751,14 @@ async function selectOption(
         using childValueHandle = await childHandle.getProperty('value');
 
         const childValue = await childValueHandle.jsonValue();
-        if (childValue) {
-          await handle.asLocator().fill(childValue.toString());
-        }
-
-        break;
+        return childValue ? childValue.toString() : undefined;
       }
     }
   }
   if (!optionFound) {
     throw new Error(`Could not find option with text "${value}"`);
   }
+  return undefined;
 }
 
 function hasOptionChildren(aXNode: TextSnapshotNode) {
@@ -700,7 +784,7 @@ async function changeNothing(): Promise<void> {
 async function buildFillAction(
   handle: ElementHandle<Element>,
   uid: string,
-  value: string,
+  requestedValue: string,
   page: ContextPage,
 ): Promise<() => Promise<void>> {
   // The pause at the transition to this field — reaching it, looking at it —
@@ -708,12 +792,16 @@ async function buildFillAction(
   // once per element, so every field pays it once, before anything of its own
   // runs.
   const aXNode = page.getAXNodeByUid(uid);
+  let value = requestedValue;
   // We assume that combobox needs to be handled as select if it has
   // role='combobox' and option children.
   if (aXNode && aXNode.role === 'combobox' && hasOptionChildren(aXNode)) {
-    return async () => {
-      await selectOption(handle, aXNode, value);
-    };
+    const optionValue = await resolveOptionValue(aXNode, requestedValue);
+    if (optionValue === undefined) {
+      // The option is there but carries no value of its own. Nothing to set.
+      return changeNothing;
+    }
+    value = optionValue;
   }
 
   const isToggle = await handle.evaluate(el => {
@@ -730,8 +818,23 @@ async function buildFillAction(
         `Checkboxes, radio boxes and toggles require "true" or "false" value, but ${value} was used`,
       );
     }
+    const mouse = page.pptrPage.mouse;
+    // A toggle takes its value from a click, so it takes the paced one.
+    // `Locator.fill` waits for the element to be enabled before it clicks and
+    // the approach inside the press does not, so that condition is waited for
+    // here.
+    await waitUntilEnabled(handle);
+    const state = await readToggleState(handle);
+    if (state === (value === 'true')) {
+      // It already reads as it is meant to read. Clicking it would turn it off
+      // and on again in front of anyone watching, for no change at all.
+      return changeNothing;
+    }
+    // Everything the click needs runs here; the release is what the page sees
+    // as the click and is the only part left for the navigation expectation.
+    await pressPaced(handle, mouse, 1);
     return async () => {
-      await handle.asLocator().fill(value === 'true');
+      await mouse.up(pressOptions(1));
     };
   }
 
@@ -934,10 +1037,25 @@ export const drag = definePageTool({
     );
     using toHandle = await request.page.getElementByUid(request.params.to_uid);
 
-    const result = await request.page.waitForEventsAfterAction(async () => {
+    const result = await request.page.waitForEventsAfterTrigger(async () => {
+      // Both ends can be off screen, and the drag brings each of them into
+      // view in one jump: the source before the button goes down, the target
+      // while it is held.
+      const wasInViewport =
+        (await fromHandle.isIntersectingViewport({threshold: 0})) &&
+        (await toHandle.isIntersectingViewport({threshold: 0}));
       await fromHandle.drag(toHandle);
+      // Drag-and-drop mechanics rather than pace: the browser needs a moment
+      // between the two drag events, at any speed.
       await new Promise(resolve => setTimeout(resolve, 50));
-      await toHandle.drop(fromHandle);
+      // The pointer now stands on the target with the button down. What a
+      // person spends here is taking in the view the drag jumped to and
+      // holding the element a moment before letting go of it.
+      await pauseAfterScroll(!wasInViewport);
+      await sleepMs(drawMouseHoldMs());
+      return async () => {
+        await toHandle.drop(fromHandle);
+      };
     });
     response.appendResponseLine(`Successfully dragged an element`);
     response.attachWaitForResult(result);
@@ -1019,16 +1137,34 @@ export const uploadFile = definePageTool({
       // Some sites use a proxy element to trigger file upload instead of
       // a type=file element. In this case, we want to default to
       // Page.waitForFileChooser() and upload the file this way.
+      const mouse = request.page.pptrPage.mouse;
+      // Set before the press, so a failure anywhere after it still releases
+      // the button instead of leaving it down for every later interaction.
+      let buttonIsDown = false;
       try {
+        // The approach and the press run in front of `Promise.all`, because
+        // the chooser's 3 s budget starts when that is entered: a paced
+        // approach inside it would spend a large part of the budget before the
+        // release that opens the dialog, and the upload would fail as if the
+        // page had never offered a chooser.
+        buttonIsDown = true;
+        await pressPaced(handle, mouse, 1);
         const [fileChooser] = await Promise.all([
           request.page.pptrPage.waitForFileChooser({timeout: 3000}),
-          handle.asLocator().click(),
+          (async () => {
+            await mouse.up(pressOptions(1));
+            buttonIsDown = false;
+          })(),
         ]);
         await fileChooser.accept([filePath]);
       } catch {
         throw new Error(
           `Failed to upload file. The element could not accept the file directly, and clicking it did not trigger a file chooser.`,
         );
+      } finally {
+        if (buttonIsDown) {
+          await mouse.up(pressOptions(1)).catch(() => undefined);
+        }
       }
     }
     if (request.params.includeSnapshot) {

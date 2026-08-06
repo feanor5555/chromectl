@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {pauseBeforeAction, settleAfterAction} from '../pacing.js';
 import type {CdpPage} from '../third_party/index.js';
 import {zod} from '../third_party/index.js';
 import {logger} from '../utils/logger.js';
@@ -62,7 +63,17 @@ export const selectPage = defineTool({
     response.setListThirdPartyDeveloperTools();
     response.setListWebMcpTools();
     if (request.params.bringToFront) {
+      // Activating a tab is the one part of this call the page sees: it becomes
+      // visible, and whatever the caller does next arrives in it. The pause in
+      // front of it is the one every other action takes, and the window behind
+      // it is the moment a person spends taking in the tab they have just
+      // switched to — without it the first interaction lands in the same
+      // instant the tab came up. The helper's own waits stay out of this path:
+      // `select_page` is meant to work while a dialog blocks the page, and a
+      // wait that runs on the page's own JavaScript does not.
+      await pauseBeforeAction();
       await page.pptrPage.bringToFront();
+      await settleAfterAction();
     }
   },
 });
