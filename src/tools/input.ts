@@ -154,9 +154,8 @@ function pressOptions(clickCount: number): Readonly<MouseOptions> {
  * release back. Everything a click needs before the page can act on it — the
  * scroll into view, the pause after a jump, the wait for a bounding box that
  * stops moving, the travel of the pointer and the span the button stays down —
- * happens here, because
- * the page sees a completed click only on the release and the release is what
- * the caller runs under the navigation expectation.
+ * happens here, because the page sees a completed click only on the release
+ * and the release is what the caller runs under the navigation expectation.
  *
  * The approach stays with `Locator.hover`, so the locator's viewport and
  * stability conditions still run; only the press and the release are taken
