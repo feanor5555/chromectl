@@ -69,7 +69,13 @@ import {
   observeInterruptions,
   observeRendererBlock,
 } from './interruption.js';
-import {pauseBeforeAction, settleAfterAction} from './pacing.js';
+import {
+  drawPreActionPauseMs,
+  pauseBeforeAction,
+  settleAfterAction,
+  travelsPointer,
+  type PointerPoint,
+} from './pacing.js';
 import {
   ConsoleCollector,
   NetworkCollector,
@@ -176,6 +182,10 @@ export class McpPage implements ContextPage {
   #dialog?: Dialog;
   #dialogHandler: (dialog: Dialog) => void;
 
+  // Pointer
+  #pointerPosition?: PointerPoint;
+  #leadPauseMs?: number;
+
   thirdPartyDeveloperTools: ToolGroups = [];
 
   networkCollector: NetworkCollector;
@@ -247,6 +257,33 @@ export class McpPage implements ContextPage {
 
   get devtoolsUniverse(): TargetUniverse | undefined {
     return this.#devtoolsUniverse;
+  }
+
+  /**
+   * Where this page's pointer stands, as far as this process knows. It is kept
+   * per page rather than per session, because puppeteer's own mouse state is
+   * per page and a coordinate belongs to the document it was taken in.
+   *
+   * A navigation does not clear it — a physical pointer does not move because a
+   * page loaded — so it is undefined only for a page nothing has moved on yet.
+   */
+  get pointerPosition(): PointerPoint | undefined {
+    return this.#pointerPosition;
+  }
+
+  setPointerPosition(position: PointerPoint): void {
+    this.#pointerPosition = {x: position.x, y: position.y};
+  }
+
+  /**
+   * The pause reserved for an action that travels, handed over and cleared in
+   * one go: what is left of it after the path's own duration is what the
+   * traveller waits out, and an action that never asks for it pays nothing.
+   */
+  takeLeadPause(): number {
+    const reserved = this.#leadPauseMs ?? 0;
+    this.#leadPauseMs = undefined;
+    return reserved;
   }
 
   getDialog(): Dialog | undefined {
@@ -514,6 +551,11 @@ export class McpPage implements ContextPage {
    * after that would fall between the second-to-last and the last keystroke of
    * a stream, or between a press and its release.
    *
+   * `pointerTravel` says that the prepare stage brings the pointer to its
+   * target along a path. Part of that pause is then the travel itself, so it is
+   * reserved rather than slept here and the prepare stage waits out what its
+   * drawn path leaves of it.
+   *
    * Everything the prepare stage does is visible to the page — the first click
    * of a double click, every keystroke of a fill but the last, the selection
    * that clears a field, the drag that picks an element up — so the page can
@@ -539,9 +581,17 @@ export class McpPage implements ContextPage {
       handleDialog?:
         DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
       frame?: Frame;
+      pointerTravel?: boolean;
     },
   ): Promise<WaitForEventsResult> {
-    await pauseBeforeAction();
+    if (options?.pointerTravel && travelsPointer()) {
+      // The pause is what the pointer spends reaching the target, and the
+      // target's coordinates are not known yet: it is reserved here and the
+      // traveller waits out what its own path leaves of it.
+      this.#leadPauseMs = drawPreActionPauseMs();
+    } else {
+      await pauseBeforeAction();
+    }
     const urlBeforeAction = this.pptrPage.url();
     const block = this.#observeRendererBlock();
     try {
@@ -583,6 +633,10 @@ export class McpPage implements ContextPage {
         watch.openedDialog,
       );
     } finally {
+      // A reservation nothing travelled against is dropped rather than waited
+      // out: the action is over, and a pause taken behind it is no pause before
+      // anything.
+      this.#leadPauseMs = undefined;
       block.stop();
     }
   }

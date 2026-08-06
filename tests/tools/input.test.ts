@@ -12,7 +12,9 @@ import {describe, it} from 'node:test';
 import sinon from 'sinon';
 
 import type {ParsedArguments} from '../../src/bin/chrome-devtools-mcp-cli-options.js';
+import type {McpContext} from '../../src/McpContext.js';
 import {McpResponse} from '../../src/McpResponse.js';
+import {selectPace} from '../../src/pacing.js';
 import {TextSnapshot} from '../../src/TextSnapshot.js';
 import {
   click,
@@ -426,6 +428,122 @@ describe('input', () => {
           await page.evaluate(() => document.body.dataset.clicked),
           'custom two',
         );
+      });
+    });
+  });
+
+  describe('the pointer path', () => {
+    /** A page that records every move and where the press fell among them. */
+    const recordingPage = html`<button
+        style="position: fixed; left: 70%; top: 75%;"
+        onclick="this.innerText = 'clicked';"
+        >test</button
+      >
+      <script>
+        moves = [];
+        pressedAfter = -1;
+        document.addEventListener('mousemove', event => {
+          moves.push([event.clientX, event.clientY, performance.now()]);
+        });
+        document.addEventListener('mousedown', () => {
+          pressedAfter = moves.length;
+        });
+      </script>`;
+
+    async function clickTheButton(
+      response: McpResponse,
+      context: McpContext,
+    ): Promise<void> {
+      const mcpPage = context.getSelectedMcpPage();
+      mcpPage.textSnapshot = await TextSnapshot.create(mcpPage);
+      await click.handler(
+        {params: {uid: '1_1'}, page: mcpPage},
+        response,
+        context,
+      );
+    }
+
+    it('reaches the button in many steps, none of them evenly spaced', async () => {
+      await withMcpContext(async (response, context) => {
+        const mcpPage = context.getSelectedMcpPage();
+        await mcpPage.pptrPage.setContent(recordingPage);
+        // The pointer is put in a corner, so the path across the page is long
+        // enough that no two of its points round to the same coordinate.
+        mcpPage.setPointerPosition({x: 4, y: 4});
+
+        await clickTheButton(response, context);
+
+        const moves = (await mcpPage.pptrPage.evaluate('moves')) as Array<
+          [number, number, number]
+        >;
+        const pressedAfter = (await mcpPage.pptrPage.evaluate(
+          'pressedAfter',
+        )) as number;
+
+        assert.ok(
+          pressedAfter >= 8,
+          `only ${pressedAfter} moves arrived before the press`,
+        );
+        const approach = moves.slice(0, pressedAfter);
+        const spots = new Set(approach.map(([x, y]) => `${x},${y}`));
+        assert.ok(
+          spots.size >= 8,
+          `only ${spots.size} of ${approach.length} moves went somewhere new`,
+        );
+        const gaps = approach
+          .slice(1)
+          .map(([, , at], index) => at - approach[index][2]);
+        assert.ok(
+          Math.max(...gaps) - Math.min(...gaps) > 5,
+          `the moves arrived evenly spaced: ${gaps.join(', ')}`,
+        );
+      });
+    });
+
+    it('dispatches nothing beyond the final move at full speed', async () => {
+      await withMcpContext(async (response, context) => {
+        const mcpPage = context.getSelectedMcpPage();
+        await mcpPage.pptrPage.setContent(recordingPage);
+        mcpPage.setPointerPosition({x: 4, y: 4});
+
+        const restore = selectPace(true);
+        try {
+          await clickTheButton(response, context);
+        } finally {
+          restore();
+        }
+
+        assert.strictEqual(
+          await mcpPage.pptrPage.evaluate('pressedAfter'),
+          1,
+          'more than the one authoritative move was dispatched',
+        );
+      });
+    });
+
+    it('remembers where it left the pointer for the next call', async () => {
+      await withMcpContext(async (response, context) => {
+        const mcpPage = context.getSelectedMcpPage();
+        await mcpPage.pptrPage.setContent(recordingPage);
+        const before = mcpPage.pointerPosition;
+        assert.strictEqual(before, undefined);
+
+        await clickTheButton(response, context);
+
+        const kept = mcpPage.pointerPosition;
+        assert.ok(kept, 'the pointer position was not kept');
+        const moves = (await mcpPage.pptrPage.evaluate('moves')) as Array<
+          [number, number, number]
+        >;
+        const pressedAfter = (await mcpPage.pptrPage.evaluate(
+          'pressedAfter',
+        )) as number;
+        // The move in front of the press is the locator's own, which puts the
+        // pointer on the element; the one before it is where the path ended.
+        const lastOfPath = moves[pressedAfter - 2];
+        assert.ok(lastOfPath, 'the path dispatched no move of its own');
+        assert.ok(Math.abs(kept.x - lastOfPath[0]) <= 1);
+        assert.ok(Math.abs(kept.y - lastOfPath[1]) <= 1);
       });
     });
   });

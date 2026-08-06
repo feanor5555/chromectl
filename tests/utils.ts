@@ -358,6 +358,27 @@ export function getMockAggregatedIssue(): sinon.SinonStubbedInstance<DevTools.Ag
   return mockAggregatedIssue;
 }
 
+/**
+ * A generator that produces the same stream for the same seed, so a draw the
+ * production code makes through `Math.random` can be stubbed with something
+ * that still looks like a draw. Mulberry32.
+ */
+export function seededRandom(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = Math.imul(state ^ (state >>> 15), 1 | state);
+    value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** A stub that hands out fixed values in order and starts over at the end. */
+export function fixedRandom(values: number[]): () => number {
+  let index = 0;
+  return () => values[index++ % values.length];
+}
+
 export function mockListener() {
   const listeners: Record<string, Array<(data: unknown) => void>> = {};
   return {

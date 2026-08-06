@@ -23,7 +23,9 @@ import {
   sleepKeyIntervalMs,
   sleepMouseClickGapMs,
   sleepMs,
+  travelsPointer,
 } from '../pacing.js';
+import {travelPaced, travelToElement} from '../pointerTravel.js';
 import {_keyDefinitions, zod} from '../third_party/index.js';
 import type {
   ElementHandle,
@@ -170,6 +172,33 @@ function pressOptions(clickCount: number): Readonly<MouseOptions> {
 }
 
 /**
+ * Brings the pointer onto the element: the page jumps to it, the pointer
+ * travels to the point it now sits at, and the locator's own move puts it
+ * there. That last move is the authoritative one — it re-resolves the point,
+ * scrolls again if the element has left the viewport in the meantime and
+ * carries the stable-bounding-box condition — so nothing has to be built for an
+ * element that moves while the path is being travelled.
+ *
+ * `travel` is false where the pointer may not spend the time: the press then
+ * arrives the way it always did, on the locator's move alone.
+ */
+async function approachPaced(
+  page: ContextPage,
+  handle: ElementHandle<Element>,
+  travel: boolean,
+): Promise<void> {
+  if (!travel || !travelsPointer()) {
+    await approachInViewport(handle, async () => {
+      await handle.asLocator().hover();
+    });
+    return;
+  }
+  await waitUntilInViewport(handle);
+  await travelToElement(page, handle);
+  await handle.asLocator().hover();
+}
+
+/**
  * Brings the pointer onto the element and presses the button, and leaves it
  * down for the caller to release. Everything a click needs before the page can
  * act on it — the scroll into view, the pause after a jump, the wait for a
@@ -178,20 +207,19 @@ function pressOptions(clickCount: number): Readonly<MouseOptions> {
  * only on the release and the release is what the caller runs under the
  * navigation expectation.
  *
- * The approach stays with `Locator.hover`, so the locator's viewport and
+ * The approach ends on `Locator.hover`, so the locator's viewport and
  * stability conditions still run; only the press and the release are taken
  * from the mouse directly, because `Locator.click` cannot hand its release
  * back.
  */
 async function pressPaced(
+  page: ContextPage,
   handle: ElementHandle<Element>,
-  mouse: Mouse,
   clickCount: number,
+  options: {travel?: boolean} = {},
 ): Promise<void> {
-  await approachInViewport(handle, async () => {
-    await handle.asLocator().hover();
-  });
-  await pressButtonPaced(mouse, clickCount);
+  await approachPaced(page, handle, options.travel ?? true);
+  await pressButtonPaced(page.pptrPage.mouse, clickCount);
 }
 
 /**
@@ -200,12 +228,17 @@ async function pressPaced(
  * travels there and the press follows.
  */
 async function pressPacedAt(
-  mouse: Mouse,
+  page: ContextPage,
   x: number,
   y: number,
   clickCount: number,
 ): Promise<void> {
+  const mouse = page.pptrPage.mouse;
+  if (travelsPointer()) {
+    await travelPaced(page, {x, y});
+  }
   await mouse.move(x, y);
+  page.setPointerPosition({x, y});
   await pressButtonPaced(mouse, clickCount);
 }
 
@@ -664,20 +697,24 @@ export const click = definePageTool({
               if (await selectNativeSelectOption(handle)) {
                 return;
               }
+              // A press inside the trigger runs under a navigation expectation
+              // of about 100 ms, which a travelling pointer would expire.
               release = releaseButton;
-              await pressPaced(handle, mouse, clickCount);
+              await pressPaced(request.page, handle, clickCount, {
+                travel: false,
+              });
               release = undefined;
               await releaseButton();
             };
           }
           release = releaseButton;
-          await pressPaced(handle, mouse, clickCount);
+          await pressPaced(request.page, handle, clickCount);
           return async () => {
             release = undefined;
             await releaseButton();
           };
         },
-        {frame: handle.frame},
+        {frame: handle.frame, pointerTravel: !shouldSelectNativeOption},
       );
       response.appendResponseLine(
         request.params.dblClick
@@ -728,19 +765,22 @@ export const clickAt = definePageTool({
     // button logically down for every later interaction with the page.
     let release: (() => Promise<void>) | undefined;
     try {
-      const result = await page.waitForEventsAfterTrigger(async () => {
-        release = releaseButton;
-        await pressPacedAt(
-          mouse,
-          request.params.x,
-          request.params.y,
-          clickCount,
-        );
-        return async () => {
-          release = undefined;
-          await releaseButton();
-        };
-      });
+      const result = await page.waitForEventsAfterTrigger(
+        async () => {
+          release = releaseButton;
+          await pressPacedAt(
+            page,
+            request.params.x,
+            request.params.y,
+            clickCount,
+          );
+          return async () => {
+            release = undefined;
+            await releaseButton();
+          };
+        },
+        {pointerTravel: true},
+      );
       response.appendResponseLine(
         request.params.dblClick
           ? `Successfully double clicked at the coordinates`
@@ -784,16 +824,20 @@ export const hover = definePageTool({
       const result = await request.page.waitForEventsAfterTrigger(
         async () => {
           // The pointer arrives the way it arrives for a paced click: the jump
-          // that brings the element into view is waited out first, so the hover
-          // itself is all that is left inside the navigation expectation. What a
-          // hover sets off — a menu, a tooltip — is then waited for by the
-          // window behind it rather than raced against the pause in front of it.
+          // that brings the element into view and the travel to the element are
+          // waited out first, so the hover itself is all that is left inside the
+          // navigation expectation. What a hover sets off — a menu, a tooltip —
+          // is then waited for by the window behind it rather than raced against
+          // the pause in front of it.
           await waitUntilInViewport(handle);
+          if (travelsPointer()) {
+            await travelToElement(request.page, handle);
+          }
           return async () => {
             await handle.asLocator().hover();
           };
         },
-        {frame: handle.frame},
+        {frame: handle.frame, pointerTravel: true},
       );
       response.appendResponseLine(`Successfully hovered over the element`);
       response.attachWaitForResult(result);
@@ -919,7 +963,7 @@ async function buildFillAction(
     }
     // Everything the click needs runs here; the release is what the page sees
     // as the click and is the only part left for the navigation expectation.
-    await pressPaced(handle, mouse, 1);
+    await pressPaced(page, handle, 1);
     return {
       decision: 'typed',
       action: async () => {
@@ -1162,9 +1206,18 @@ export const drag = definePageTool({
         // Both ends can be off screen, and the drag brings each of them into
         // view in one jump: the source before the button goes down, the target
         // while it is held.
+        const fromInViewport = await fromHandle.isIntersectingViewport({
+          threshold: 0,
+        });
         const wasInViewport =
-          (await fromHandle.isIntersectingViewport({threshold: 0})) &&
+          fromInViewport &&
           (await toHandle.isIntersectingViewport({threshold: 0}));
+        if (fromInViewport && travelsPointer()) {
+          // The pointer reaches the source the way it reaches a click target.
+          // A source the page still has to jump to has no point to travel to
+          // yet, and the drag's own approach is what brings it into view.
+          await travelToElement(request.page, fromHandle);
+        }
         await fromHandle.drag(toHandle);
         // Drag-and-drop mechanics rather than pace: the browser needs a moment
         // between the two drag events, at any speed.
@@ -1302,7 +1355,7 @@ export const uploadFile = definePageTool({
         // release that opens the dialog, and the upload would fail as if the
         // page had never offered a chooser.
         buttonIsDown = true;
-        await pressPaced(handle, mouse, 1);
+        await pressPaced(request.page, handle, 1);
         const [fileChooser] = await Promise.all([
           request.page.pptrPage.waitForFileChooser({timeout: 3000}),
           (async () => {

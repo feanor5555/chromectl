@@ -18,6 +18,10 @@ import {
   drawKeyHoldMs,
   drawMouseHoldMs,
   drawPacingMs,
+  drawPointerPath,
+  drawPreActionPauseMs,
+  drawSkewed,
+  drawViewportEdgePoint,
   FULL_SPEED_META_KEY,
   isFullSpeedRequest,
   KEY_HOLD_MAX_MS,
@@ -34,6 +38,12 @@ import {
   pacedSleep,
   pauseAfterScroll,
   pauseBeforeAction,
+  POINTER_CURVATURE_MAX,
+  POINTER_PATH_MAX_MS,
+  POINTER_POINTS_MAX,
+  POINTER_POINTS_MIN,
+  POINTER_STEP_GAP_MAX_MS,
+  POINTER_STEP_GAP_MIN_MS,
   queuedCallBudgetMs,
   PRE_ACTION_PAUSE_MAX_MS,
   PRE_ACTION_PAUSE_MIN_MS,
@@ -45,8 +55,10 @@ import {
   SETTLE_MIN_MS,
   sleepKeyIntervalMs,
   sleepMs,
+  travelsPointer,
   WAIT_FOR_HELPER_MAX_MS,
 } from '../src/pacing.js';
+import {fixedRandom, seededRandom} from './utils.js';
 
 const SAMPLE_COUNT = 20_000;
 
@@ -133,6 +145,24 @@ describe('pacing', () => {
           Math.abs(actual - expected) < span * 0.03,
           `mean ${actual} of ${minMs}..${maxMs} is not near ${expected}`,
         );
+      }
+    });
+
+    it('is the whole-millisecond form of the shared draw', () => {
+      const random = sinon.stub(Math, 'random');
+      try {
+        for (const u of [0, 0.17, 0.5, 0.83, 1]) {
+          random.returns(u);
+          const raw = drawSkewed(15, 80);
+          assert.ok(raw >= 15 && raw <= 80);
+          assert.strictEqual(drawPacingMs(15, 80), Math.round(raw));
+        }
+        // The same shape carries the magnitudes that are not durations, which
+        // is why it is not rounded there.
+        random.returns(0.5);
+        assert.ok(drawSkewed(0.05, 0.2) > 0.05 && drawSkewed(0.05, 0.2) < 0.2);
+      } finally {
+        random.restore();
       }
     });
 
@@ -246,6 +276,212 @@ describe('pacing', () => {
         SETTLE_MIN_MS,
         SETTLE_MAX_MS,
       ]);
+    });
+  });
+
+  describe('the pointer path', () => {
+    const from = {x: 100, y: 100};
+
+    function pathBetween(
+      random: () => number,
+      to: {x: number; y: number},
+      start = from,
+    ) {
+      const stub = sinon.stub(Math, 'random').callsFake(random);
+      try {
+        return drawPointerPath(start, to);
+      } finally {
+        stub.restore();
+      }
+    }
+
+    function strideAt(
+      points: ReadonlyArray<{x: number; y: number}>,
+      index: number,
+    ): number {
+      return Math.hypot(
+        points[index + 1].x - points[index].x,
+        points[index + 1].y - points[index].y,
+      );
+    }
+
+    it('draws the same path twice for the same seed', () => {
+      const to = {x: 900, y: 640};
+      const first = pathBetween(seededRandom(7), to);
+      const second = pathBetween(seededRandom(7), to);
+      const other = pathBetween(seededRandom(8), to);
+
+      assert.deepStrictEqual(first, second);
+      assert.notDeepStrictEqual(first, other);
+    });
+
+    it('takes more points the further it goes', () => {
+      const counts = [200, 1_000, 4_000].map(
+        distance =>
+          pathBetween(fixedRandom([0.5]), {x: from.x + distance, y: from.y})
+            .points.length,
+      );
+
+      assert.deepStrictEqual(counts, [8, 13, POINTER_POINTS_MAX]);
+      for (const seed of [1, 2, 3, 4, 5]) {
+        for (const distance of [0, 30, 500, 10_000]) {
+          const {points} = pathBetween(seededRandom(seed), {
+            x: from.x + distance,
+            y: from.y + distance,
+          });
+          assert.ok(
+            points.length >= POINTER_POINTS_MIN &&
+              points.length <= POINTER_POINTS_MAX,
+            `${points.length} points for a distance of ${distance}`,
+          );
+        }
+      }
+    });
+
+    it('leaves both endpoints out', () => {
+      const to = {x: 700, y: 500};
+      const {points} = pathBetween(seededRandom(3), to);
+
+      for (const point of points) {
+        assert.notDeepStrictEqual({x: point.x, y: point.y}, from);
+        assert.notDeepStrictEqual({x: point.x, y: point.y}, to);
+      }
+      // Every point lies between the two, and they arrive in that order.
+      const distances = points.map(point =>
+        Math.hypot(point.x - from.x, point.y - from.y),
+      );
+      for (let index = 1; index < distances.length; index++) {
+        assert.ok(distances[index] > distances[index - 1]);
+      }
+    });
+
+    it('stays inside the straight line expanded by the bow', () => {
+      const to = {x: -400, y: 900};
+      const distance = Math.hypot(to.x - from.x, to.y - from.y);
+      const room = distance * POINTER_CURVATURE_MAX;
+
+      for (const seed of [11, 12, 13, 14, 15]) {
+        for (const point of pathBetween(seededRandom(seed), to).points) {
+          assert.ok(
+            point.x >= Math.min(from.x, to.x) - room &&
+              point.x <= Math.max(from.x, to.x) + room &&
+              point.y >= Math.min(from.y, to.y) - room &&
+              point.y <= Math.max(from.y, to.y) + room,
+            `(${point.x}, ${point.y}) left the expanded bounding box`,
+          );
+        }
+      }
+    });
+
+    it('bows to the side the coin flip picks', () => {
+      const to = {x: 900, y: 100};
+      // The draws in order: the stride, the curvature, the side, then a gap
+      // per point.
+      const left = pathBetween(fixedRandom([0.5, 0.5, 0.2, 0.5]), to);
+      const right = pathBetween(fixedRandom([0.5, 0.5, 0.8, 0.5]), to);
+
+      const sideOf = (point: {x: number; y: number}): number =>
+        Math.sign(
+          (to.x - from.x) * (point.y - from.y) -
+            (to.y - from.y) * (point.x - from.x),
+        );
+
+      assert.strictEqual(left.points.length, right.points.length);
+      for (let index = 0; index < left.points.length; index++) {
+        assert.strictEqual(sideOf(left.points[index]), -1);
+        assert.strictEqual(sideOf(right.points[index]), 1);
+      }
+    });
+
+    it('strides furthest in the middle', () => {
+      const {points} = pathBetween(fixedRandom([0.5]), {x: 1_100, y: 100});
+      const middle = Math.floor((points.length - 1) / 2);
+
+      assert.ok(strideAt(points, middle) > strideAt(points, 0));
+      assert.ok(strideAt(points, middle) > strideAt(points, points.length - 2));
+    });
+
+    it('draws every gap from the shared shape', () => {
+      for (const seed of [21, 22, 23]) {
+        const {points, durationMs} = pathBetween(seededRandom(seed), {
+          x: 800,
+          y: 700,
+        });
+        let total = 0;
+        for (const point of points) {
+          assert.ok(
+            point.gapMs >= POINTER_STEP_GAP_MIN_MS &&
+              point.gapMs <= POINTER_STEP_GAP_MAX_MS,
+            `${point.gapMs} outside ${POINTER_STEP_GAP_MIN_MS}..${POINTER_STEP_GAP_MAX_MS}`,
+          );
+          total += point.gapMs;
+        }
+        assert.strictEqual(durationMs, total);
+        assert.ok(durationMs <= POINTER_PATH_MAX_MS);
+      }
+    });
+
+    it('is not travelled at all at full speed', () => {
+      const restore = selectPace(true);
+      try {
+        assert.strictEqual(travelsPointer(), false);
+        const path = drawPointerPath(from, {x: 800, y: 800});
+        assert.strictEqual(path.durationMs, 0);
+        for (const point of path.points) {
+          assert.strictEqual(point.gapMs, 0);
+        }
+      } finally {
+        restore();
+      }
+      assert.strictEqual(travelsPointer(), true);
+      assert.deepStrictEqual(PACE_FULL.pointerStepGapMs, [0, 0]);
+      assert.deepStrictEqual(PACE_HUMAN.pointerStepGapMs, [
+        POINTER_STEP_GAP_MIN_MS,
+        POINTER_STEP_GAP_MAX_MS,
+      ]);
+    });
+  });
+
+  describe('the unknown pointer start', () => {
+    it('lands on the perimeter of the viewport', () => {
+      const width = 1_280;
+      const height = 800;
+      let onEachEdge = 0;
+      const seen = new Set<string>();
+
+      for (let i = 0; i < 4_000; i++) {
+        const {x, y} = drawViewportEdgePoint(width, height);
+        assert.ok(x >= 0 && x <= width && y >= 0 && y <= height);
+        const edges = [x === 0, x === width, y === 0, y === height].filter(
+          Boolean,
+        ).length;
+        assert.ok(edges >= 1, `(${x}, ${y}) is not on an edge`);
+        seen.add(`${x === 0}${x === width}${y === 0}${y === height}`);
+      }
+      onEachEdge = seen.size;
+      assert.ok(onEachEdge >= 4, 'not every edge was drawn from');
+    });
+  });
+
+  describe('the pause before a travelling action', () => {
+    it('is drawn from the same interval as the one it replaces', () => {
+      for (let i = 0; i < 1_000; i++) {
+        const reserved = drawPreActionPauseMs();
+        assert.ok(
+          reserved >= PRE_ACTION_PAUSE_MIN_MS &&
+            reserved <= PRE_ACTION_PAUSE_MAX_MS,
+          `${reserved} outside the pre-action interval`,
+        );
+      }
+    });
+
+    it('is nothing at full speed', () => {
+      const restore = selectPace(true);
+      try {
+        assert.strictEqual(drawPreActionPauseMs(), 0);
+      } finally {
+        restore();
+      }
     });
   });
 

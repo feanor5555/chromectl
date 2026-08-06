@@ -18,10 +18,13 @@
  * The figures the brake works to: a key stays down 70–140 ms, the gap to the
  * next press is 15–80 ms, and every paced action is preceded by a 250–700 ms
  * pause. A target the page had to jump to costs a further 1000–1200 ms before
- * the action follows. A 400–900 ms settle window follows the action, charged per
+ * the action follows. The pointer reaches that target along a drawn path of
+ * 8–20 points with 8–45 ms between them, and the pause in front of the action
+ * pays for it: what is left of it once the path's own duration is known is what
+ * is waited out. A 400–900 ms settle window follows the action, charged per
  * action like the pauses, because the wrapper that waits it out is entered once
  * per action and a form of many short fields is one call of many actions. Every
- * one of those intervals is drawn afresh through `drawPacingMs`, which is the
+ * one of those intervals is drawn afresh through `drawSkewed`, which is the
  * single place the brake takes a value from.
  *
  * A call passes two ceilings, not one, because it can stand in line before it
@@ -120,6 +123,41 @@ export const MOUSE_CLICK_GAP_MAX_MS = 180;
 export const SETTLE_MIN_MS = 400;
 export const SETTLE_MAX_MS = 900;
 
+/**
+ * Fewest and most points one pointer path is sampled at. The floor keeps a
+ * short hop from being a single jump, the ceiling keeps a path across a wide
+ * window from becoming a stream of hundreds of events.
+ */
+export const POINTER_POINTS_MIN = 8;
+export const POINTER_POINTS_MAX = 20;
+
+/**
+ * Shortest and longest stride between two points of a path. The distance
+ * divided by the drawn stride is what decides how many points the path has,
+ * before the two bounds above cut it to size.
+ */
+export const POINTER_STRIDE_MIN_PX = 45;
+export const POINTER_STRIDE_MAX_PX = 130;
+
+/**
+ * How far the path bows off the straight line, as a fraction of its own
+ * length: a hand does not travel on the line between two points, and the side
+ * it bows to is a coin flip.
+ */
+export const POINTER_CURVATURE_MIN = 0.05;
+export const POINTER_CURVATURE_MAX = 0.2;
+
+/**
+ * Shortest and longest gap between two points of a path. The points are spaced
+ * so that a constant gap already produces an accelerating and decelerating
+ * pointer, and the gap is drawn on top of that like every other interval.
+ */
+export const POINTER_STEP_GAP_MIN_MS = 8;
+export const POINTER_STEP_GAP_MAX_MS = 45;
+
+/** Worst case of one pointer path: every point of the longest one at the longest gap. */
+export const POINTER_PATH_MAX_MS = POINTER_POINTS_MAX * POINTER_STEP_GAP_MAX_MS;
+
 /** Longest gap held open before a call is allowed to navigate. */
 export const NAVIGATION_GAP_MAX_MS = 2_000;
 
@@ -140,9 +178,13 @@ export const CALL_OVERHEAD_MS = NAVIGATION_GAP_MAX_MS;
  * Worst case of one paced action, all of it paid per action rather than per
  * call: `fill_form` enters the wrapper once per element, so a form of many
  * short fields pays every one of these as often as it has elements.
+ *
+ * The pause before the action and the path the pointer travels are one term,
+ * not two: the pause is what the path is taken out of, and what is left of it
+ * is waited out, so an action pays the longer of the two and never both.
  */
 export const ACTION_OVERHEAD_MS =
-  PRE_ACTION_PAUSE_MAX_MS +
+  Math.max(PRE_ACTION_PAUSE_MAX_MS, POINTER_PATH_MAX_MS) +
   SCROLL_PAUSE_MAX_MS +
   SETTLE_MAX_MS +
   WAIT_FOR_HELPER_MAX_MS;
@@ -239,6 +281,13 @@ export interface PaceProfile {
    * double click.
    */
   readonly mouseClickGapMs: readonly [number, number];
+  /** The gap between two points of the path the pointer travels. */
+  readonly pointerStepGapMs: readonly [number, number];
+  /**
+   * Whether the pointer reaches its target along a path at all. Where it does
+   * not, the only move dispatched is the one that puts it on the target.
+   */
+  readonly travelsPointer: boolean;
   /** The window waited out after an action has run. */
   readonly settleMs: readonly [number, number];
   /**
@@ -258,6 +307,8 @@ export const PACE_HUMAN: PaceProfile = {
   scrollPauseMs: [SCROLL_PAUSE_MIN_MS, SCROLL_PAUSE_MAX_MS],
   mouseHoldMs: [MOUSE_HOLD_MIN_MS, MOUSE_HOLD_MAX_MS],
   mouseClickGapMs: [MOUSE_CLICK_GAP_MIN_MS, MOUSE_CLICK_GAP_MAX_MS],
+  pointerStepGapMs: [POINTER_STEP_GAP_MIN_MS, POINTER_STEP_GAP_MAX_MS],
+  travelsPointer: true,
   settleMs: [SETTLE_MIN_MS, SETTLE_MAX_MS],
   fillsInOneShot: false,
 };
@@ -271,6 +322,8 @@ export const PACE_FULL: PaceProfile = {
   scrollPauseMs: [0, 0],
   mouseHoldMs: [0, 0],
   mouseClickGapMs: [0, 0],
+  pointerStepGapMs: [0, 0],
+  travelsPointer: false,
   settleMs: [0, 0],
   fillsInOneShot: true,
 };
@@ -323,13 +376,20 @@ export function isFullSpeedRequest(meta?: Record<string, unknown>): boolean {
 export const PACING_SKEW = 1.5;
 
 /**
- * One draw from an interval, right-skewed and rounded to whole milliseconds.
- * Every wait the brake takes comes from here, so all of them share one shape
- * and none repeats the previous one by construction.
+ * One draw from an interval, right-skewed. Every magnitude the brake works to
+ * comes from here — the waits, and the stride and the curvature of the path the
+ * pointer travels — so all of them share one shape and none repeats the
+ * previous one by construction. A uniform choice of one out of n, which edge of
+ * the viewport and which side a path bows to, is a coin flip and takes
+ * `Math.random` directly.
  */
+export function drawSkewed(min: number, max: number): number {
+  return min + (max - min) * Math.random() ** PACING_SKEW;
+}
+
+/** The same draw for an interval of time, rounded to whole milliseconds. */
 export function drawPacingMs(minMs: number, maxMs: number): number {
-  const skewed = Math.random() ** PACING_SKEW;
-  return Math.round(minMs + (maxMs - minMs) * skewed);
+  return Math.round(drawSkewed(minMs, maxMs));
 }
 
 /**
@@ -395,6 +455,122 @@ export function sleepMouseClickGapMs(): Promise<number> {
  */
 export function pauseBeforeAction(): Promise<number> {
   return sleepAtPace(activePace.preActionPauseMs);
+}
+
+/**
+ * The same pause as a figure, for an action that spends part of it moving the
+ * pointer to its target: the target's coordinates are not known when the pause
+ * is drawn, so it is reserved here and waited out once the path is drawn and
+ * what is left of it is known.
+ */
+export function drawPreActionPauseMs(): number {
+  return drawFromPace(activePace.preActionPauseMs);
+}
+
+/** Whether the pointer reaches its target along a path at this pace. */
+export function travelsPointer(): boolean {
+  return activePace.travelsPointer;
+}
+
+/** A spot in the layout viewport, in CSS pixels. */
+export interface PointerPoint {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** One point of a pointer path, with the gap held after it. */
+export interface PointerStep extends PointerPoint {
+  readonly gapMs: number;
+}
+
+/** A whole path, and how long travelling it takes. */
+export interface PointerPath {
+  readonly points: readonly PointerStep[];
+  readonly durationMs: number;
+}
+
+/**
+ * Where a point at `u` of the way along the path sits in the curve's own
+ * parameter. It is short at both ends and long in the middle, so a constant
+ * event rate produces a pointer that accelerates away from the start and slows
+ * into the target instead of one moving at a constant speed. It carries no
+ * randomness and no tuning constant.
+ */
+function smoothstep(u: number): number {
+  return 3 * u ** 2 - 2 * u ** 3;
+}
+
+/**
+ * The path the pointer takes from where it stands to where it is going: a
+ * quadratic Bézier whose control point sits perpendicular to the straight line
+ * at the drawn curvature, sampled at as many points as the distance and the
+ * drawn stride call for.
+ *
+ * Both endpoints are excluded. The first is where the pointer already stands,
+ * and the last is dispatched by the move that carries the interaction's own
+ * conditions, which re-resolves the target rather than trusting the point this
+ * was drawn against.
+ *
+ * Pure, so the geometry is testable without a browser.
+ */
+export function drawPointerPath(
+  from: PointerPoint,
+  to: PointerPoint,
+): PointerPath {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const distance = Math.hypot(dx, dy);
+  const stride = drawSkewed(POINTER_STRIDE_MIN_PX, POINTER_STRIDE_MAX_PX);
+  const count = Math.min(
+    POINTER_POINTS_MAX,
+    Math.max(POINTER_POINTS_MIN, Math.round(distance / stride)),
+  );
+  const curvature = drawSkewed(POINTER_CURVATURE_MIN, POINTER_CURVATURE_MAX);
+  // The offset is the distance times the curvature along the unit
+  // perpendicular of the straight line, which leaves the line's own components
+  // scaled by the curvature alone.
+  const bow = curvature * (Math.random() < 0.5 ? -1 : 1);
+  const control = {
+    x: (from.x + to.x) / 2 - dy * bow,
+    y: (from.y + to.y) / 2 + dx * bow,
+  };
+  const points: PointerStep[] = [];
+  let durationMs = 0;
+  for (let index = 1; index <= count; index++) {
+    const t = smoothstep(index / (count + 1));
+    const inverse = 1 - t;
+    const gapMs = drawFromPace(activePace.pointerStepGapMs);
+    durationMs += gapMs;
+    points.push({
+      x: inverse ** 2 * from.x + 2 * inverse * t * control.x + t ** 2 * to.x,
+      y: inverse ** 2 * from.y + 2 * inverse * t * control.y + t ** 2 * to.y,
+      gapMs,
+    });
+  }
+  return {points, durationMs};
+}
+
+/**
+ * Where the pointer is taken to stand when nothing is known about it yet: a
+ * spot on the perimeter of the layout viewport, drawn uniformly over the whole
+ * perimeter so a wide window's long edges come up correspondingly more often.
+ */
+export function drawViewportEdgePoint(
+  width: number,
+  height: number,
+): PointerPoint {
+  const perimeter = 2 * (width + height);
+  const along = Math.random() * perimeter;
+  if (along < width) {
+    return {x: along, y: 0};
+  }
+  if (along < width + height) {
+    return {x: width, y: along - width};
+  }
+  if (along < 2 * width + height) {
+    return {x: 2 * width + height - along, y: height};
+  }
+  return {x: 0, y: perimeter - along};
 }
 
 /**
