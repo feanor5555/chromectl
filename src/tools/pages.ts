@@ -63,14 +63,16 @@ export const selectPage = defineTool({
     response.setListThirdPartyDeveloperTools();
     response.setListWebMcpTools();
     if (request.params.bringToFront) {
-      // Activating a tab is the one part of this call the page sees: it becomes
-      // visible, and whatever the caller does next arrives in it. The pause in
-      // front of it is the one every other action takes, and the window behind
-      // it is the moment a person spends taking in the tab they have just
-      // switched to — without it the first interaction lands in the same
-      // instant the tab came up. The helper's own waits stay out of this path:
-      // `select_page` is meant to work while a dialog blocks the page, and a
-      // wait that runs on the page's own JavaScript does not.
+      // Activating a tab is nothing the page notices: focus emulation is on for
+      // every page, so the switch raises no `visibilitychange`, no `focus` and
+      // no `blur`, `visibilityState` stays `visible` and the frame rate keeps
+      // running. What the pace serves here is the caller's own rhythm — a
+      // person reaches for a tab a moment after whatever they did before it,
+      // and takes in what stands there before acting in it. The pause in front
+      // is the one every other action takes, and the window behind it is that
+      // moment. The helper's own waits stay out of this path: `select_page` is
+      // meant to work while a dialog blocks the page, and a wait that runs on
+      // the page's own JavaScript does not.
       await pauseBeforeAction();
       await page.pptrPage.bringToFront();
       await settleAfterAction();
