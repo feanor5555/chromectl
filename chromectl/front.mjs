@@ -229,6 +229,7 @@ const STATUS_BY_KIND = {
   usage: 400,
   config: 500,
   storage: 500,
+  busy: 409,
   tool: 422,
   unreachable: 503,
 };
@@ -295,6 +296,100 @@ const daemonGenerations = new Map();
  * stay parallel and serialize inside the daemon on its process-wide tool mutex.
  */
 const daemonOperations = new Map();
+
+/**
+ * The calls running per browser, keyed by session id, each with the command it
+ * carries out, when it started, the budget it was granted and the client it
+ * answers to.
+ *
+ * There is no cancellation: a call that has reached the daemon runs to its end
+ * whether or not anyone is still listening, because stopping it would have to
+ * reach through the daemon socket and the MCP request into the paced loops and
+ * puppeteer, and none of that honours a signal. What can be done is not to
+ * start a second one behind it. A caller whose own timeout fired sends the same
+ * call again, and queueing that retry at the daemon's mutex is how one form
+ * gets filled and submitted twice; it is refused instead, told what still runs
+ * and how much of its budget is left, so it can wait rather than repeat.
+ *
+ * Several live callers on one browser stay legitimate — the daemon's mutex
+ * serializes them — so the entries are a set per browser and only an abandoned
+ * one bars the next call.
+ */
+const callsInFlight = new Map();
+
+/** The abandoned call of one browser, or nothing while every client is there. */
+function abandonedCall(sessionId) {
+  for (const entry of callsInFlight.get(sessionId) ?? []) {
+    if (entry.client.gone) {
+      return entry;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Refuses a call against a browser that is still carrying out one nobody waits
+ * for any more. The message names the command, its age and the rest of its
+ * budget, because the only sound answer to it is to wait that long: the work
+ * cannot be stopped, and what it has already typed stays typed.
+ */
+function assertNoAbandonedCall(resolved) {
+  const entry = abandonedCall(resolved.sessionId);
+  if (!entry) {
+    return;
+  }
+  const runningMs = Date.now() - entry.startedAtMs;
+  const remainingMs = Math.max(0, entry.budgetMs - runningMs);
+  throw new CallError(
+    'busy',
+    `${resolved.target} is still carrying out an abandoned ${entry.command}, ` +
+      `started ${Math.round(runningMs / 1000)} s ago, ` +
+      `up to ${Math.round(remainingMs / 1000)} s of its budget left — ` +
+      'nothing can stop it, so this call is refused instead of queueing behind it',
+    {
+      running_command: entry.command,
+      running_ms: runningMs,
+      budget_ms: entry.budgetMs,
+      remaining_ms: remainingMs,
+    },
+  );
+}
+
+/** Notes one call as running and hands back the note to end it with. */
+function registerCall(resolved, command, budgetMs, client) {
+  const entry = {
+    command,
+    startedAtMs: Date.now(),
+    budgetMs,
+    client,
+  };
+  const entries = callsInFlight.get(resolved.sessionId);
+  if (entries) {
+    entries.add(entry);
+  } else {
+    callsInFlight.set(resolved.sessionId, new Set([entry]));
+  }
+  return entry;
+}
+
+/**
+ * Ends the note of one call. A call whose client left is logged as it ends:
+ * nothing of it can be sent back and nothing of it was stopped, so the log is
+ * the only place the work a caller no longer sees is recorded.
+ */
+function unregisterCall(resolved, entry) {
+  const entries = callsInFlight.get(resolved.sessionId);
+  entries?.delete(entry);
+  if (entries?.size === 0) {
+    callsInFlight.delete(resolved.sessionId);
+  }
+  if (entry.client.gone) {
+    console.warn(
+      `chromectl: ${entry.command} on ${resolved.target} ran on for ` +
+        `${Date.now() - entry.startedAtMs} ms after its client left; its result is dropped`,
+    );
+  }
+}
 
 function daemonGeneration(sessionId) {
   return daemonGenerations.get(sessionId) ?? 0;
@@ -869,7 +964,7 @@ async function runCommand(resolved, command, toolArgs, fullSpeed) {
   return {parsed, elapsedMs};
 }
 
-async function invoke(target, command, args, fullSpeed, publicBase) {
+async function invoke(target, command, args, fullSpeed, publicBase, client) {
   assertKnownCommand(command);
   const toolArgs = validateArgs(command, args);
   const atFullSpeed = validateFullSpeed(fullSpeed);
@@ -887,6 +982,36 @@ async function invoke(target, command, args, fullSpeed, publicBase) {
     throw error;
   }
 
+  // Before anything is planned, written or sent: a browser still carrying out a
+  // call nobody waits for takes no second one.
+  assertNoAbandonedCall(resolved);
+  const entry = registerCall(
+    resolved,
+    command,
+    queuedCallBudgetMs(command, toolArgs, atFullSpeed),
+    client,
+  );
+  try {
+    return await carryOutCall(
+      resolved,
+      command,
+      toolArgs,
+      atFullSpeed,
+      publicBase,
+    );
+  } finally {
+    unregisterCall(resolved, entry);
+  }
+}
+
+/** Carries out one call that has been admitted, from the file plan to the answer. */
+async function carryOutCall(
+  resolved,
+  command,
+  toolArgs,
+  atFullSpeed,
+  publicBase,
+) {
   // The written file takes the place of the payload upstream would attach, so
   // the answer stays small enough for a caller's shell. Where it lands is the
   // front's decision in either case.
@@ -952,6 +1077,11 @@ function budgetFor(body) {
 }
 
 function send(response, status, body) {
+  // A client that left before its answer was ready gets nothing: its socket is
+  // gone, and the call it abandoned is logged where it ran.
+  if (response.writableEnded || response.destroyed) {
+    return;
+  }
   const payload = JSON.stringify(body);
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -1004,6 +1134,15 @@ function readBody(request) {
 }
 
 const server = http.createServer(async (request, response) => {
+  // Whether the caller is still there. A closed response that never finished is
+  // a client that gave up — on its own timeout above all — and the call it left
+  // behind keeps running, so the loss is recorded here, where the socket is,
+  // and read again when the next call for that browser arrives.
+  const client = {gone: false};
+  response.on('close', () => {
+    client.gone = !response.writableFinished;
+  });
+
   try {
     if (request.method === 'GET' && request.url === '/health') {
       send(response, 200, {
@@ -1058,6 +1197,7 @@ const server = http.createServer(async (request, response) => {
         body.args,
         body.full_speed,
         publicBase,
+        client,
       ),
     );
   } catch (error) {
