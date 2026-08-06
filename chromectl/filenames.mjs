@@ -184,7 +184,7 @@ if (!Number.isInteger(SPILL_RETENTION_MS) || SPILL_RETENTION_MS <= 0) {
   // A typo here would read as "keeps them forever", which is the exposure the
   // retention exists to end, so it is a startup fault.
   throw new Error(
-    `CHROMECTL_SPILL_RETENTION_MS must be a positive whole number of milliseconds, got ${JSON.stringify(process.env['CHROMECTL_SPILL_RETENTION_MS'])}`,
+    `chromectl: CHROMECTL_SPILL_RETENTION_MS must be a positive whole number of milliseconds, got ${JSON.stringify(process.env['CHROMECTL_SPILL_RETENTION_MS'])}`,
   );
 }
 

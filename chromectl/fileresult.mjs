@@ -59,7 +59,7 @@ if (!Number.isInteger(SPILL_BYTES) || SPILL_BYTES <= 0) {
   // A typo here would read as "never spills", which is the failure the cap
   // exists to prevent, so it is a startup fault.
   throw new Error(
-    `CHROMECTL_SPILL_BYTES must be a positive whole number of bytes, got ${JSON.stringify(process.env['CHROMECTL_SPILL_BYTES'])}`,
+    `chromectl: CHROMECTL_SPILL_BYTES must be a positive whole number of bytes, got ${JSON.stringify(process.env['CHROMECTL_SPILL_BYTES'])}`,
   );
 }
 

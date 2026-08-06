@@ -320,7 +320,7 @@ export function assertArgumentsAccountedFor(
   }
   if (unaccounted.length > 0) {
     throw new Error(
-      `unknown tool arguments, each has to be entered into FILE_ARGUMENTS, ` +
+      `chromectl: unknown tool arguments, each has to be entered into FILE_ARGUMENTS, ` +
         `into NON_PATH_ARGUMENTS or into NON_PATH_COMMAND_ARGUMENTS before the ` +
         `front can serve them: ${unaccounted.join(', ')}`,
     );
@@ -379,7 +379,7 @@ export function assertExtensionsAccountedFor(
       .map(([extension, source]) => `.${extension} (${source})`)
       .join(', ');
     throw new Error(
-      `unknown file endings, each has to be entered into FILE_EXTENSIONS and ` +
+      `chromectl: unknown file endings, each has to be entered into FILE_EXTENSIONS and ` +
         `into CONTENT_TYPE_BY_EXTENSION before the front can serve them: ${named}`,
     );
   }
