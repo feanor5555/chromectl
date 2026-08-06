@@ -11,6 +11,11 @@
  * envelope. It runs without any authentication; the local network and the
  * private overlay network are the access boundary.
  *
+ * The front is a proxy, not a filter: every tool of the template is callable
+ * through it, with the arguments upstream declares for that tool. Both the
+ * command list and the argument schemas are read out of upstream's generated
+ * command table, so an upstream bump brings its new tools along by itself.
+ *
  * The front speaks to the daemon over its unix socket in process, through
  * upstream's own daemon client (`build/src/daemon/client.js`), instead of
  * spawning the `chrome-devtools` CLI per request; a node process start costs
@@ -23,13 +28,19 @@
  * Start by hand:
  *   node /home/wu/chromectl/chromectl/front.mjs
  *
- * A screenshot is written to the network drive and the answer names its
- * location instead of carrying the image bytes. A snapshot may be written there
- * too, under a file name the caller picks, and a result that outgrows
- * `SPILL_BYTES` is written there as well instead of being answered inline. No
- * file a call writes leaves that one directory, and every one of them is
- * fetchable over `/files/`. A spilled result is the one file nobody asked for,
- * so it is also the one that expires: after `SPILL_RETENTION_MS` it is pruned.
+ * The daemon of a browser holds that browser's page selection: `select_page`
+ * stays in force for every further call reaching the same browser, under
+ * whichever of its names, until another `select_page`, until the selected tab
+ * is closed or until the daemon is replaced.
+ *
+ * Every path a tool takes or hands back is a path on the machine the front runs
+ * on, so the front owns all of them: a caller names at most the file, the
+ * directory is one of the network drive, and the answer names each file's
+ * location together with a URL to fetch it under. A file a call reads is looked
+ * up in that same directory, which is how a caller on another machine hands one
+ * in. A result that outgrows `SPILL_BYTES` is written there as well instead of
+ * being answered inline; a spilled result is the one file nobody asked for, so
+ * it is also the one that expires: after `SPILL_RETENTION_MS` it is pruned.
  *
  * Endpoints:
  *   GET  /health          liveness plus the registered target names and commands
@@ -42,10 +53,12 @@
  */
 
 import {randomBytes} from 'node:crypto';
+import {createWriteStream} from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import process from 'node:process';
+import {pipeline} from 'node:stream/promises';
 
 import {commands as upstreamCommands} from '../build/src/bin/chrome-devtools-cli-options.js';
 import {
@@ -74,68 +87,22 @@ const HOST = process.env['CHROMECTL_HOST'] ?? '0.0.0.0';
 const PORT = Number(process.env['CHROMECTL_PORT'] ?? 8091);
 
 /**
- * Commands a caller may invoke: page selection, page operation and page
- * inspection.
- *
- * A command is on this list only if it grants no capability the list already
- * grants, or clears a state the list cannot leave, and only if it neither
- * executes caller-supplied code nor reads credential material out of a
- * logged-in page. The front is unauthenticated, so everything here is reachable
- * by anyone who reaches the port.
- *
- * `select_page` decides which of the browser's tabs the following commands act
- * on. The selection lives in the daemon of that browser — one MCP server
- * process per session id holds it — so it stays in force for every further call
- * reaching the same browser, under whichever of its names, until another
- * `select_page`, until the selected tab is closed (the daemon then falls back
- * to the first page) or until the daemon is replaced. Without it a caller could
- * list the tabs but never leave the first one.
- *
- * `press_key` types into whatever currently has the focus, which is a strict
- * subset of what `click` and `type_text` already reach, and it is the only way
- * to send an ordinary Escape or Tab: `type_text`'s submit key covers a key
- * pressed straight after typing and nothing else.
- *
- * `wait_for` reads page text that `take_snapshot` returns anyway, so it grants
- * nothing new. Without it the only way to await a condition is a snapshot poll
- * loop — a rapid-fire volley against the page, which the pace rule forbids, at
- * the price of a full snapshot payload per poll.
- *
- * `handle_dialog` is the only way out of an open dialog. Both input and
- * inspection are blocked while one stands, so a single `confirm()` wedges six
- * of these eleven commands, and navigating away throws the page state the
- * caller built up out without answering the prompt the page waits on.
- */
-const ALLOWED_COMMANDS = [
-  'list_pages',
-  'select_page',
-  'navigate_page',
-  'click',
-  'type_text',
-  'fill',
-  'press_key',
-  'take_snapshot',
-  'take_screenshot',
-  'wait_for',
-  'handle_dialog',
-];
-
-/**
- * Argument schema per allowed command, taken from upstream's generated command
- * table (`chrome-devtools-cli-options.js`) rather than kept as an own copy, so
- * an upstream change to a tool's arguments arrives with the merge. A name that
- * upstream no longer knows is a startup fault: the front would otherwise offer
- * a command the daemon rejects.
+ * Every command the front offers and the argument schema of each, taken whole
+ * from upstream's generated command table (`chrome-devtools-cli-options.js`)
+ * rather than kept as an own copy. The table is what the daemon registers its
+ * tools from, so the front's surface is the daemon's surface, and an upstream
+ * change — a new tool, a new argument on an existing one — arrives with the
+ * merge instead of being dropped behind a list kept by hand.
  */
 const COMMAND_SCHEMAS = new Map(
-  ALLOWED_COMMANDS.map(command => {
-    const definition = upstreamCommands[command];
-    if (!definition) {
-      throw new Error(`unknown upstream tool in the allow-list: ${command}`);
-    }
-    return [command, definition.args ?? {}];
-  }),
+  Object.entries(upstreamCommands).map(([command, definition]) => [
+    command,
+    definition.args ?? {},
+  ]),
 );
+
+/** The command names, sorted, as `/health` reports them. */
+const COMMANDS = [...COMMAND_SCHEMAS.keys()].sort();
 
 /**
  * Where every file a call writes lands: `/home/wu/share/screenshots` on the
@@ -163,18 +130,61 @@ const OUTPUT_DIR_MODE = 0o775;
 const OUTPUT_FILE_MODE = 0o644;
 
 /**
- * The only file name a caller may ask for. It carries no directory separator
- * and does not start with a dot, so such a name can neither leave `OUTPUT_DIR`
- * nor address one of its parents, and `..` cannot be written at all. The `.txt`
- * ending is what the daemon saves a snapshot as in any case
- * (`McpContext.saveFile`), so demanding it keeps the path in the answer the
- * path that lands on disk.
+ * Mode of a directory one call works in. Nothing but the front and the daemon it
+ * started ever looks inside one, and both run as the same user, so it is theirs
+ * alone; what comes out of it is moved into `OUTPUT_DIR` and made readable
+ * there.
  */
-const OUTPUT_FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\.txt$/;
+const STAGING_DIR_MODE = 0o700;
 
-/** The file names the front builds itself: screenshots and spilled results. */
-const GENERATED_FILE_NAME_PATTERN =
-  /^chromectl-[A-Za-z0-9-]+-[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}\.(png|jpeg|webp|json)$/;
+/**
+ * The only shape of file name a caller may name, for a file to be written as
+ * well as for one to be read. It carries no directory separator and does not
+ * start with a dot, so such a name can neither leave `OUTPUT_DIR` nor address
+ * one of its parents, and `..` cannot be written at all.
+ */
+const PLAIN_FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * The endings a file of this service carries. Every tool that writes one
+ * enforces its own ending on the path it was handed (`McpContext.saveFile`
+ * replaces whatever extension arrives), so this is that set, plus the one a
+ * spilled result gets. Demanding the ending on a name a caller picks keeps the
+ * path in the answer the path that lands on disk.
+ */
+const FILE_EXTENSIONS = [
+  'png',
+  'jpeg',
+  'webp',
+  'txt',
+  'json',
+  'json.gz',
+  'spill.json',
+  'heapsnapshot',
+  'network-request',
+  'network-response',
+  'mp4',
+  'webm',
+  'html',
+];
+
+const EXTENSION_ALTERNATION = FILE_EXTENSIONS.map(extension =>
+  extension.replaceAll('.', '\\.'),
+).join('|');
+
+/** The stem of every name the front builds itself: target, moment, randomness. */
+const GENERATED_NAME_STEM =
+  'chromectl-[A-Za-z0-9-]+-[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}';
+
+/** A file of this service: a plain name with an ending the front knows. */
+const SERVED_FILE_NAME_PATTERN = new RegExp(
+  `^[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:${EXTENSION_ALTERNATION})$`,
+);
+
+/** The file names the front builds itself. */
+const GENERATED_FILE_NAME_PATTERN = new RegExp(
+  `^${GENERATED_NAME_STEM}\\.(?:${EXTENSION_ALTERNATION})$`,
+);
 
 const CONTENT_TYPE_BY_EXTENSION = {
   png: 'image/png',
@@ -182,7 +192,29 @@ const CONTENT_TYPE_BY_EXTENSION = {
   webp: 'image/webp',
   txt: 'text/plain; charset=utf-8',
   json: 'application/json; charset=utf-8',
+  'json.gz': 'application/gzip',
+  'spill.json': 'application/json; charset=utf-8',
+  heapsnapshot: 'application/json; charset=utf-8',
+  'network-request': 'application/octet-stream',
+  'network-response': 'application/octet-stream',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  html: 'text/html; charset=utf-8',
 };
+
+/**
+ * What a file is served as. The longest known ending a name carries decides, so
+ * `.json.gz` is not read as the `.json` it also ends in.
+ */
+function contentTypeFor(fileName) {
+  const extension = FILE_EXTENSIONS.filter(candidate =>
+    fileName.endsWith(`.${candidate}`),
+  ).sort((left, right) => right.length - left.length)[0];
+  return CONTENT_TYPE_BY_EXTENSION[extension] ?? 'application/octet-stream';
+}
+
+/** The ending a spilled result carries, which is what the pruning goes by. */
+const SPILL_EXTENSION = 'spill.json';
 
 /**
  * From how many bytes of rendered result on the answer names a file instead of
@@ -261,22 +293,39 @@ const DAEMON_STOP_POLL_MS = 25;
 const BROWSER_LINK_GONE = /^(Not connected|MCP client not initialized)$/;
 
 /**
- * Server flags every daemon is started with. `viaCli` is what makes the daemon
- * register the full tool set, `experimentalStructuredContent` is what makes a
- * result come back as a JSON object rather than rendered text, and
- * `categoryExtensions` is what keeps extension service workers in the page
- * listing, and `allowUnrestrictedPaths` is what lets a written file leave the
- * OS temp directory: the daemon's own MCP client negotiates no roots
- * capability, so without the flag every file-writing tool is confined to
- * `/tmp`. The widening is safe here because the front is the layer that
- * confines the path: no path a caller sends is forwarded, the front fills
- * `filePath` in itself and every file it lets a call write stays in
- * `OUTPUT_DIR`.
+ * Server flags every daemon is started with.
+ *
+ * `viaCli` is what makes the daemon register the full tool set, and the flags
+ * beside it are what makes the registered tools answer: a tool whose category
+ * or whose experimental condition is off is registered under `viaCli` but
+ * refuses every call with the flag it wants named. The front offers the whole
+ * table, so it starts the daemon with all of them —
+ * `categoryExtensions`, `categoryExperimentalThirdParty` and
+ * `categoryExperimentalWebmcp` for the three categories that are off by
+ * default, `memoryDebugging` for the heap snapshot readers,
+ * `experimentalVision` for the coordinate-based click and
+ * `experimentalScreencast` for the video recording. `categoryExtensions` is
+ * also what keeps extension service workers in the page listing.
+ *
+ * `experimentalStructuredContent` is what makes a result come back as a JSON
+ * object rather than rendered text.
+ *
+ * `allowUnrestrictedPaths` is what lets a file leave the OS temp directory: the
+ * daemon's own MCP client negotiates no roots capability, so without the flag
+ * every file-writing tool is confined to `/tmp`. The widening is safe here
+ * because the front is the layer that confines the path: no path a caller sends
+ * is forwarded, the front fills every path argument in itself and every file it
+ * lets a call write or read stays in `OUTPUT_DIR`.
  */
 const DAEMON_ARGS = [
   '--viaCli',
   '--experimentalStructuredContent',
   '--categoryExtensions',
+  '--categoryExperimentalThirdParty',
+  '--categoryExperimentalWebmcp',
+  '--memoryDebugging',
+  '--experimentalVision',
+  '--experimentalScreencast',
   '--usageStatistics=false',
   '--allowUnrestrictedPaths',
 ];
@@ -385,13 +434,13 @@ const callsInFlight = new Map();
  * refusing it as well would lock the door on the key and leave the browser
  * wedged for the whole budget of a call nobody waits for any more.
  *
- * The exemption is one named command, never a category, and it opens nothing
- * else: `handle_dialog` is admitted only after the name has been checked against
- * the allow-list and its arguments against upstream's schema, it carries nothing
- * but `accept`/`dismiss` and a prompt text, it reads no page state and it writes
- * no file — `planWrittenFile` knows it not. Nor is it a second way onto the
- * page: while one exempt call is in flight the next is refused, so at most one
- * caller ever clears the dialog and none drives the page beside it.
+ * The exemption is one named command, never a category: `handle_dialog` is
+ * admitted only after the name has been checked against the command table and
+ * its arguments against upstream's schema, it carries nothing but
+ * `accept`/`dismiss` and a prompt text, it reads no page state and it touches no
+ * file — `FILE_ARGUMENTS` knows it not. Nor is it a second way onto the page:
+ * while one exempt call is in flight the next is refused, so at most one caller
+ * ever clears the dialog and none drives the page beside it.
  */
 const ABANDONMENT_EXEMPT_COMMAND = 'handle_dialog';
 
@@ -811,12 +860,13 @@ function validateFullSpeed(value) {
   return coerceArgument('call', FULL_SPEED_DEFINITION, value);
 }
 
-/** A command the front does not offer never reaches the daemon. */
+/** A name upstream does not know never reaches the daemon. */
 function assertKnownCommand(command) {
   if (typeof command !== 'string' || !COMMAND_SCHEMAS.has(command)) {
     throw new CallError(
       'usage',
-      `unknown command: ${JSON.stringify(command)} (allowed: ${ALLOWED_COMMANDS.join(', ')})`,
+      `unknown command: ${JSON.stringify(command)} — GET /health names the ` +
+        `${COMMANDS.length} commands this front offers`,
     );
   }
 }
@@ -867,11 +917,11 @@ function validateArgs(command, args) {
 }
 
 /**
- * Builds the name of one file the front writes: the target the call ran on, the
- * UTC moment down to the millisecond and eight random hex characters. Two calls
- * running at the same time therefore cannot land on the same file even within
- * one millisecond. The name carries no colons, so a Windows client reaching the
- * drive over Samba can open it.
+ * Builds the name of one entry the front creates: the target the call ran on,
+ * the UTC moment down to the millisecond and eight random hex characters. Two
+ * calls running at the same time therefore cannot land on the same name even
+ * within one millisecond. The name carries no colons, so a Windows client
+ * reaching the drive over Samba can open it.
  *
  * A target name without a single letter or digit slugs to nothing, and a name
  * with an empty slug is not one `GENERATED_FILE_NAME_PATTERN` matches: the file
@@ -880,11 +930,16 @@ function validateArgs(command, args) {
  * digit first), so the fixed slug is what keeps the two patterns tied to each
  * other rather than to that rule.
  */
-function generatedFileName(target, extension) {
+function generatedName(target) {
   const slug =
     target.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'target';
   const stamp = new Date().toISOString().replace(/[-:.]/g, '');
-  return `chromectl-${slug}-${stamp}-${randomBytes(4).toString('hex')}.${extension}`;
+  return `chromectl-${slug}-${stamp}-${randomBytes(4).toString('hex')}`;
+}
+
+/** The same name with the ending the file it stands for carries. */
+function generatedFileName(target, extension) {
+  return `${generatedName(target)}.${extension}`;
 }
 
 /**
@@ -901,10 +956,11 @@ function fileUrl(publicBase, fileName) {
  * Removes the spilled results that have outlived `SPILL_RETENTION_MS`.
  *
  * Only spilled files are touched: the name has to be one the front built itself
- * and to carry the `json` extension only a spill gets, so a screenshot, a
- * caller-named snapshot and anything else lying in the directory are left where
- * they are. `unlink` follows nothing, so an entry of that shape planted in the
- * guest-writable share is merely removed, never followed out of the directory.
+ * and to carry the `spill.json` ending only a spill gets, so a screenshot, a
+ * trace, a caller-named file and anything else lying in the directory are left
+ * where they are. `unlink` follows nothing, so an entry of that shape planted in
+ * the guest-writable share is merely removed, never followed out of the
+ * directory.
  *
  * Best effort throughout: this runs beside a caller's call, and neither an
  * unreadable directory nor a file that vanished between the listing and the
@@ -923,7 +979,10 @@ async function pruneSpilledFiles() {
     return;
   }
   for (const name of names) {
-    if (!GENERATED_FILE_NAME_PATTERN.test(name) || !name.endsWith('.json')) {
+    if (
+      !GENERATED_FILE_NAME_PATTERN.test(name) ||
+      !name.endsWith(`.${SPILL_EXTENSION}`)
+    ) {
       continue;
     }
     const filePath = path.join(OUTPUT_DIR, name);
@@ -961,45 +1020,160 @@ async function ensureOutputDir() {
   await pruneSpilledFiles();
 }
 
-/**
- * Plans the screenshot file and takes the caller's own path out of the picture.
- *
- * The whole location is the front's business here, not the caller's: a
- * caller-chosen path would hand back a location the caller may not be able to
- * reach, and the name is what the fetch route recognises. A `filePath` argument
- * is therefore rejected as a usage error instead of being silently overwritten,
- * so nobody believes their path was honoured.
- */
-async function planScreenshot(target, toolArgs) {
-  if (toolArgs.filePath !== undefined) {
-    throw new CallError(
-      'usage',
-      'take_screenshot: filePath is not a caller argument — the front writes ' +
-        `the file to ${OUTPUT_DIR} and returns its location`,
-    );
-  }
+/** The heap snapshot a reader tool is pointed at: written by an earlier call. */
+const HEAP_SNAPSHOT_INPUT = {direction: 'in', extensions: ['heapsnapshot']};
 
-  const format = toolArgs.format ?? 'png';
-  const fileName = generatedFileName(target, format);
-  await ensureOutputDir();
-  const filePath = path.join(OUTPUT_DIR, fileName);
-  // The name is the front's own and carries eight random characters, so there is
-  // nothing to write past: the daemon writes where the answer points, and
-  // `writePath` is that same path rather than a stage it is renamed from.
-  return {kind: 'screenshot', fileName, filePath, writePath: filePath, format};
+/**
+ * The path arguments of every command, and what the front does with each.
+ *
+ * `out` is a file the daemon writes. The directory is the front's decision and a
+ * caller names at most the file, so the answer can hand back a location the
+ * caller actually reaches; the name lands in the answer under `kind`, with a
+ * fetch URL beside it. `always` marks an argument the front fills in whether or
+ * not the caller named one, because the payload would otherwise travel inline or
+ * into a temp directory nobody can reach — the image of a screenshot, the video
+ * of a recording. `optional` marks a file a tool writes only when the page had
+ * the content it would hold, so its absence is a result and not a failure.
+ * `deferred` marks the one whose file is finished by a later call.
+ *
+ * `out-dir` is a directory a tool fills with files of its own naming. The front
+ * hands it one of its own, takes the files named in `reports` out of it
+ * afterwards and removes it.
+ *
+ * `in` is a file the daemon reads, `in-dir` a directory it reads. Both are
+ * looked up in `OUTPUT_DIR`: that directory lies on the network drive every
+ * machine reaches, so a caller on another machine puts the file there — or an
+ * earlier call of its own wrote it — and names it here.
+ *
+ * The heap snapshot readers are derived from the command table instead of being
+ * listed, so an upstream bump brings its new ones along.
+ */
+const FILE_ARGUMENTS = {
+  take_screenshot: {
+    filePath: {
+      direction: 'out',
+      kind: 'screenshot',
+      always: true,
+      extensions: toolArgs => [toolArgs.format ?? 'png'],
+    },
+  },
+  take_snapshot: {
+    filePath: {direction: 'out', kind: 'snapshot', extensions: ['txt']},
+  },
+  evaluate_script: {
+    filePath: {direction: 'out', kind: 'output', extensions: ['json']},
+  },
+  take_heapsnapshot: {
+    filePath: {
+      direction: 'out',
+      kind: 'heapsnapshot',
+      extensions: ['heapsnapshot'],
+    },
+  },
+  performance_start_trace: {
+    filePath: {
+      direction: 'out',
+      kind: 'trace',
+      extensions: ['json', 'json.gz'],
+      optional: true,
+    },
+  },
+  performance_stop_trace: {
+    filePath: {
+      direction: 'out',
+      kind: 'trace',
+      extensions: ['json', 'json.gz'],
+      optional: true,
+    },
+  },
+  get_network_request: {
+    requestFilePath: {
+      direction: 'out',
+      kind: 'request_body',
+      extensions: ['network-request'],
+      optional: true,
+    },
+    responseFilePath: {
+      direction: 'out',
+      kind: 'response_body',
+      extensions: ['network-response'],
+      optional: true,
+    },
+  },
+  screencast_start: {
+    filePath: {
+      direction: 'out',
+      kind: 'recording',
+      always: true,
+      deferred: true,
+      optional: true,
+      extensions: ['mp4', 'webm'],
+    },
+  },
+  lighthouse_audit: {
+    outputDirPath: {
+      direction: 'out-dir',
+      always: true,
+      reports: {'report.json': 'report_json', 'report.html': 'report_html'},
+    },
+  },
+  upload_file: {filePath: {direction: 'in', staged: true}},
+  install_extension: {path: {direction: 'in-dir'}},
+  close_heapsnapshot: {filePath: HEAP_SNAPSHOT_INPUT},
+  compare_heapsnapshots: {
+    baseFilePath: HEAP_SNAPSHOT_INPUT,
+    currentFilePath: HEAP_SNAPSHOT_INPUT,
+  },
+};
+
+for (const command of COMMANDS) {
+  if (command.startsWith('get_heapsnapshot_')) {
+    FILE_ARGUMENTS[command] = {filePath: HEAP_SNAPSHOT_INPUT};
+  }
 }
 
 /**
- * Plans the file a caller asked a snapshot to be written to.
+ * What an argument name has to look like to be one that carries a path on the
+ * machine the front runs on. Every path argument upstream declares is spelled
+ * this way, which is what lets the front recognise one it has no route for.
+ */
+const PATH_ARGUMENT_PATTERN = /path$/i;
+
+/**
+ * Refuses an argument that names a path the front has no route for.
+ *
+ * The daemon runs with `--allowUnrestrictedPaths`, so a path that travelled
+ * through as the caller wrote it would read and write wherever the front's user
+ * can. Every path argument the front knows is filled in by the front itself; a
+ * tool an upstream bump brings with a path argument that is not in
+ * `FILE_ARGUMENTS` therefore lands here as a plain refusal instead of as a way
+ * out of `OUTPUT_DIR`.
+ */
+function assertPathArgumentsKnown(command, toolArgs, specs) {
+  for (const argument of Object.keys(toolArgs)) {
+    if (!PATH_ARGUMENT_PATTERN.test(argument) || specs?.[argument]) {
+      continue;
+    }
+    throw new CallError(
+      'usage',
+      `${command}: ${argument} names a path on the machine the front runs on ` +
+        'and has no route through the front',
+    );
+  }
+}
+
+/**
+ * Plans one file a call writes.
  *
  * The front runs without authentication, so a path taken from the caller would
  * write anywhere the front's user can write, with page-controlled content. The
  * directory is therefore the front's decision and the caller names at most the
- * file: a name that is not a plain `*.txt` file name is refused rather than
- * bent into one, so nobody believes their path was honoured.
+ * file: a name that is not a plain file name with the ending the tool enforces
+ * is refused rather than bent into one, so nobody believes their path was
+ * honoured. A caller that names none gets a name of the front's own.
  *
- * The caller's name never reaches the daemon. The daemon writes to `writePath`,
- * a name the front builds itself with eight random characters, and the written
+ * A caller's name never reaches the daemon. The daemon writes to `writePath`, a
+ * name the front builds itself with eight random characters, and the written
  * file is renamed onto the caller's name afterwards. That is what keeps the
  * write inside the directory: the drive is writable over Samba and NFS, so
  * anyone reaching it can put a symlink or a hardlink under a name a caller
@@ -1007,24 +1181,45 @@ async function planScreenshot(target, toolArgs) {
  * daemon meets a moment later, in another process. Against the random name there
  * is nothing to plant, and `rename` replaces the name rather than writing
  * through what sits under it, so no interleaving reaches an inode outside
- * `OUTPUT_DIR`.
+ * `OUTPUT_DIR`. A file the front names itself is written straight where the
+ * answer points, since there is nothing to plant under that name either.
  *
  * The checks below are pre-flight only: they turn the ordinary mistake — a name
  * that is a directory today, a name someone hardlinked — into a clear 400 before
  * the browser is driven at all. They are no longer the boundary, and an entry
  * planted after them is replaced by the rename rather than refused.
  */
-async function planSnapshotFile(command, target, toolArgs) {
-  const requested = toolArgs.filePath;
-  if (!OUTPUT_FILE_NAME_PATTERN.test(requested)) {
+async function planOutputFile(command, argument, spec, target, toolArgs) {
+  const extensions =
+    typeof spec.extensions === 'function'
+      ? spec.extensions(toolArgs)
+      : spec.extensions;
+  const requested = toolArgs[argument];
+
+  if (requested === undefined) {
+    const fileName = generatedFileName(target, extensions[0]);
+    const filePath = path.join(OUTPUT_DIR, fileName);
+    return {
+      ...spec,
+      argument,
+      fileName,
+      filePath,
+      writePath: filePath,
+    };
+  }
+
+  const extension = extensions.find(candidate =>
+    requested.endsWith(`.${candidate}`),
+  );
+  if (!PLAIN_FILE_NAME_PATTERN.test(requested) || extension === undefined) {
     throw new CallError(
       'usage',
-      `${command}: filePath must be a plain file name ending in .txt — the ` +
+      `${command}: ${argument} must be a plain file name ending in ` +
+        `${extensions.map(candidate => `.${candidate}`).join(' or ')} — the ` +
         `front writes it to ${OUTPUT_DIR} and no path leaves that directory`,
     );
   }
 
-  await ensureOutputDir();
   const filePath = path.join(OUTPUT_DIR, requested);
   let existing;
   try {
@@ -1048,117 +1243,487 @@ async function planSnapshotFile(command, target, toolArgs) {
   }
 
   return {
-    kind: 'snapshot',
+    ...spec,
+    argument,
     fileName: requested,
     filePath,
-    writePath: path.join(OUTPUT_DIR, generatedFileName(target, 'txt')),
+    writePath: path.join(OUTPUT_DIR, generatedFileName(target, extension)),
   };
 }
 
-/** The file one call writes, or nothing when it writes none. */
-async function planWrittenFile(command, target, toolArgs) {
-  if (command === 'take_screenshot') {
-    return await planScreenshot(target, toolArgs);
+/**
+ * Plans the directory a call fills with files it names itself.
+ *
+ * The names inside are the tool's, not the front's, so two calls sharing one
+ * directory would write over each other and neither file would be one the fetch
+ * route recognises. Each call therefore gets a directory of its own, whose name
+ * carries the same eight random characters every generated name does, and the
+ * files are taken out of it afterwards. The whole location is the front's
+ * business here: a caller-named directory would be a location the caller may not
+ * reach, so the argument is refused instead of being silently overwritten.
+ */
+async function planOutputDirectory(command, argument, spec, target, toolArgs) {
+  if (toolArgs[argument] !== undefined) {
+    throw new CallError(
+      'usage',
+      `${command}: ${argument} is not a caller argument — the front collects ` +
+        `the files into ${OUTPUT_DIR} and returns their locations`,
+    );
   }
-  if (command === 'take_snapshot' && toolArgs.filePath !== undefined) {
-    return await planSnapshotFile(command, target, toolArgs);
+  const directoryPath = path.join(OUTPUT_DIR, generatedName(target));
+  try {
+    await fs.mkdir(directoryPath, {mode: STAGING_DIR_MODE});
+  } catch (error) {
+    throw new CallError(
+      'storage',
+      `cannot create ${directoryPath}`,
+      error.message,
+    );
   }
-  return undefined;
+  return {argument, path: directoryPath, reports: spec.reports, target};
 }
 
 /**
- * Turns a failed call into a storage failure when the daemon choked on the file
+ * Plans one file or directory a call reads.
+ *
+ * It has to lie directly in `OUTPUT_DIR`, so the caller names it and nothing
+ * else: the directory is the network drive every machine reaches, which is how a
+ * file gets to the front's machine at all, and a path from the caller would
+ * otherwise read anything the front's user can read.
+ *
+ * A file that is uploaded into a page is copied to a staging name first and the
+ * daemon is handed the copy. That is the same reasoning as for a written file,
+ * in the other direction: an entry someone plants under the announced name
+ * between this check and the daemon's open would otherwise be followed out of
+ * the directory, and what a page then receives is whatever that entry pointed
+ * at. The copy is read through a handle this process opened itself, with
+ * symlinks refused by the open and a hardlink refused by the count on the open
+ * handle, so what is uploaded is the file this check saw.
+ *
+ * A directory and a heap snapshot are read in place: a snapshot is hundreds of
+ * megabytes and is addressed by its path again by every following reader call,
+ * so the check here is pre-flight and stays what it is — it catches the ordinary
+ * mistake, not someone with write access to the share swapping the entry
+ * underneath the call.
+ */
+async function planInputFile(command, argument, spec, target, toolArgs) {
+  const requested = toolArgs[argument];
+  const endings = spec.extensions ?? [];
+  if (
+    !PLAIN_FILE_NAME_PATTERN.test(requested) ||
+    (endings.length > 0 &&
+      !endings.some(candidate => requested.endsWith(`.${candidate}`)))
+  ) {
+    throw new CallError(
+      'usage',
+      `${command}: ${argument} must be a plain name` +
+        (endings.length > 0
+          ? ` ending in ${endings.map(candidate => `.${candidate}`).join(' or ')}`
+          : '') +
+        ` of an entry in ${OUTPUT_DIR} — that directory is the drive every ` +
+        'machine reaches, and no path leaves it',
+    );
+  }
+
+  const filePath = path.join(OUTPUT_DIR, requested);
+  let stats;
+  try {
+    stats = await fs.lstat(filePath);
+  } catch (error) {
+    throw new CallError(
+      'usage',
+      `${command}: there is no ${requested} in ${OUTPUT_DIR}`,
+      error.message,
+    );
+  }
+  if (spec.direction === 'in-dir') {
+    if (!stats.isDirectory()) {
+      throw new CallError(
+        'usage',
+        `${command}: ${requested} in ${OUTPUT_DIR} is not a directory`,
+      );
+    }
+    return {argument, filePath, readPath: filePath};
+  }
+  if (!stats.isFile()) {
+    throw new CallError(
+      'usage',
+      `${command}: ${requested} in ${OUTPUT_DIR} is not a regular file`,
+    );
+  }
+  if (stats.nlink !== 1) {
+    throw new CallError(
+      'usage',
+      `${command}: ${requested} in ${OUTPUT_DIR} exists under more than one name`,
+    );
+  }
+  if (!spec.staged) {
+    return {argument, filePath, readPath: filePath};
+  }
+  return await stageInputFile(command, argument, target, requested, filePath);
+}
+
+/**
+ * Copies the file a call is to read into a directory of its own and hands back
+ * the copy. The name inside the directory stays the caller's, because that is
+ * the name a page receiving an upload is shown.
+ */
+async function stageInputFile(command, argument, target, fileName, filePath) {
+  const directoryPath = path.join(OUTPUT_DIR, generatedName(target));
+  const readPath = path.join(directoryPath, fileName);
+  let handle;
+  try {
+    await fs.mkdir(directoryPath, {mode: STAGING_DIR_MODE});
+    handle = await fs.open(
+      filePath,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+    );
+    const stats = await handle.stat();
+    if (!stats.isFile() || stats.nlink !== 1) {
+      throw new Error('not a single-named regular file of this directory');
+    }
+    await pipeline(
+      handle.createReadStream(),
+      createWriteStream(readPath, {flags: 'wx', mode: OUTPUT_FILE_MODE}),
+    );
+  } catch (error) {
+    await removeStagingDirectory(directoryPath);
+    throw new CallError(
+      'usage',
+      `${command}: ${argument} ${fileName} cannot be read from ${OUTPUT_DIR}`,
+      error.message,
+    );
+  } finally {
+    await handle?.close();
+  }
+  return {argument, filePath, readPath, directoryPath};
+}
+
+/** Removes a staging directory and everything left in it; best effort. */
+async function removeStagingDirectory(directoryPath) {
+  try {
+    await fs.rm(directoryPath, {recursive: true, force: true});
+  } catch {
+    // Not this process's to remove: the call's own outcome is what counts.
+  }
+}
+
+/** What one call writes and reads, from its arguments and the table above. */
+async function planCall(command, target, toolArgs) {
+  const specs = FILE_ARGUMENTS[command];
+  assertPathArgumentsKnown(command, toolArgs, specs);
+  const plan = {command, files: [], inputs: [], directory: undefined};
+  if (!specs) {
+    return plan;
+  }
+
+  await ensureOutputDir();
+  try {
+    for (const [argument, spec] of Object.entries(specs)) {
+      const named = toolArgs[argument] !== undefined;
+      if (spec.direction === 'out-dir') {
+        plan.directory = await planOutputDirectory(
+          command,
+          argument,
+          spec,
+          target,
+          toolArgs,
+        );
+      } else if (spec.direction === 'out') {
+        if (named || spec.always) {
+          plan.files.push(
+            await planOutputFile(command, argument, spec, target, toolArgs),
+          );
+        }
+      } else if (named) {
+        plan.inputs.push(
+          await planInputFile(command, argument, spec, target, toolArgs),
+        );
+      }
+    }
+  } catch (error) {
+    // A call whose plan does not come together drives nothing, so what an
+    // earlier argument of it already put on the drive goes again.
+    await settleLeftoverFiles(plan);
+    await removeStagedInputs(plan);
+    throw error;
+  }
+
+  // The echoed argument is the path the caller ends up with; what the daemon is
+  // handed is the staging path beside it. The directory of a call is gone by the
+  // time the answer is written, so it is echoed to nobody.
+  for (const entry of [...plan.files, ...plan.inputs]) {
+    toolArgs[entry.argument] = entry.filePath;
+  }
+  return plan;
+}
+
+/** The paths the daemon is handed in place of the echoed ones. */
+function daemonPathArguments(plan) {
+  const paths = {};
+  for (const file of plan.files) {
+    paths[file.argument] = file.writePath;
+  }
+  for (const input of plan.inputs) {
+    paths[input.argument] = input.readPath;
+  }
+  if (plan.directory) {
+    paths[plan.directory.argument] = plan.directory.path;
+  }
+  return paths;
+}
+
+/**
+ * Turns a failed call into a storage failure when the daemon choked on a file
  * rather than on the page. A write that fails is an outage of the network drive
  * and must not read as a browser that could not carry the command out.
  */
 function reclassifyFileFailure(error, plan) {
-  if (!(error instanceof CallError) || error.kind !== 'tool') {
+  const written = [
+    ...plan.files,
+    ...(plan.directory
+      ? [
+          {
+            kind: 'report directory',
+            writePath: plan.directory.path,
+            filePath: plan.directory.path,
+          },
+        ]
+      : []),
+  ];
+  if (
+    !(error instanceof CallError) ||
+    error.kind !== 'tool' ||
+    written.length === 0
+  ) {
     return error;
   }
   const detail =
     typeof error.detail === 'string'
       ? error.detail
       : JSON.stringify(error.detail ?? '');
-  // The daemon only ever saw `writePath`, so that is the path its message can
-  // name.
-  if (!detail.includes(plan.writePath) && !detail.includes(OUTPUT_DIR)) {
+  // The daemon only ever saw the write paths, so those are the paths its message
+  // can name.
+  const hit = written.find(file => detail.includes(file.writePath));
+  if (hit) {
+    return new CallError(
+      'storage',
+      `${hit.kind} could not be written to ${hit.filePath}`,
+      error.detail,
+    );
+  }
+  if (!detail.includes(OUTPUT_DIR)) {
     return error;
   }
   return new CallError(
     'storage',
-    `${plan.kind} could not be written to ${plan.filePath}`,
+    `${plan.command} could not write below ${OUTPUT_DIR}`,
     error.detail,
   );
 }
 
 /**
- * Deals with the file a failed call left at `writePath`. A call that hits its
- * deadline or fails after the write still leaves the daemon's 0600 file on the
- * drive.
+ * Deals with what a failed call left behind. A call that hits its deadline or
+ * fails after a write still leaves the daemon's 0600 file on the drive.
  *
- * A screenshot is written straight under the name the answer would have carried,
- * so a partial one stays and is only made readable: a file only the front's uid
- * can read is of no use to an NFS client arriving under its own. A snapshot is
- * written under a name of the front's own that is renamed onto the caller's only
- * on success; a failed one therefore sits under a name no answer mentioned and
- * no route serves, and is removed instead of left on the drive for good.
+ * A file the front named itself is written straight under the name the answer
+ * would have carried, so a partial one stays and is only made readable: a file
+ * only the front's uid can read is of no use to an NFS client arriving under its
+ * own. A caller-named file is written under a name of the front's own that is
+ * renamed onto the caller's only on success; a failed one therefore sits under a
+ * name no answer mentioned and no route serves, and is removed instead of left
+ * on the drive for good. A directory of a call is removed with what is in it,
+ * since none of it was ever named in an answer.
  *
  * Best effort by design: a call that failed before the write leaves nothing
  * here, and neither a chmod nor an unlink that fails must displace the failure
  * being reported to the caller.
  */
-async function settleLeftoverFile(plan) {
+async function settleLeftoverFile(file) {
   try {
-    if (plan.writePath === plan.filePath) {
-      await fs.chmod(plan.writePath, OUTPUT_FILE_MODE);
+    if (file.writePath === file.filePath) {
+      await fs.chmod(file.writePath, OUTPUT_FILE_MODE);
     } else {
-      await fs.unlink(plan.writePath);
+      await fs.unlink(file.writePath);
     }
   } catch {
-    // No file written, or one this process cannot touch: the call's own
-    // failure is what the caller gets.
+    // No file written, or one this process cannot touch.
   }
+}
+
+async function settleLeftoverFiles(plan) {
+  for (const file of plan.files) {
+    await settleLeftoverFile(file);
+  }
+  if (plan.directory) {
+    await removeStagingDirectory(plan.directory.path);
+  }
+}
+
+/** Removes the copies a call was handed to read. */
+async function removeStagedInputs(plan) {
+  for (const input of plan.inputs) {
+    if (input.directoryPath) {
+      await removeStagingDirectory(input.directoryPath);
+    }
+  }
+}
+
+/**
+ * Where a file is to be found. Every file carries a fetch URL: the client is
+ * bash and curl, so the share path presumes a mount it may not have while the
+ * URL is reachable wherever the call itself was sent from.
+ */
+function fileLocation(fileName, filePath, publicBase) {
+  return {
+    file: fileName,
+    path: filePath,
+    share_path: path.relative(SHARE_ROOT, filePath),
+    url: fileUrl(publicBase, fileName),
+  };
 }
 
 /**
  * Confirms the file the daemon was told to write really is there and makes it
  * readable for everyone reaching the drive, puts it under the name the answer
  * carries and describes it. A tool call that reports success without a file on
- * disk is a storage failure, not a result. Every file carries a fetch URL: the
- * client is bash and curl, so the share path presumes a mount it may not have
- * while the URL is reachable wherever the call itself was sent from.
+ * disk is a storage failure, not a result — unless the tool writes that file
+ * only when the page had the content for it, in which case its absence is
+ * reported as no file at all.
  *
- * The rename is what a caller-named snapshot arrives through, and it is the last
+ * The rename is what a caller-named file arrives through, and it is the last
  * step: an entry someone put under that name meanwhile is replaced, since
- * `rename` acts on the name and not on what it points at. A screenshot names its
- * own file and is already where it belongs.
+ * `rename` acts on the name and not on what it points at.
  */
-async function describeWrittenFile(plan, publicBase) {
+async function describeWrittenFile(file, publicBase) {
   let stats;
   try {
-    stats = await fs.stat(plan.writePath);
+    stats = await fs.stat(file.writePath);
     if (!stats.isFile() || stats.size === 0) {
       throw new Error(`${stats.size} bytes`);
     }
-    await fs.chmod(plan.writePath, OUTPUT_FILE_MODE);
-    if (plan.writePath !== plan.filePath) {
-      await fs.rename(plan.writePath, plan.filePath);
+    await fs.chmod(file.writePath, OUTPUT_FILE_MODE);
+    if (file.writePath !== file.filePath) {
+      await fs.rename(file.writePath, file.filePath);
     }
   } catch (error) {
+    if (file.optional) {
+      await settleLeftoverFile(file);
+      return undefined;
+    }
     throw new CallError(
       'storage',
-      `${plan.kind} was not written to ${plan.filePath}`,
+      `${file.kind} was not written to ${file.filePath}`,
       error.message,
     );
   }
 
   return {
-    file: plan.fileName,
-    path: plan.filePath,
-    share_path: path.relative(SHARE_ROOT, plan.filePath),
-    url: fileUrl(publicBase, plan.fileName),
+    ...fileLocation(file.fileName, file.filePath, publicBase),
     bytes: stats.size,
   };
+}
+
+/**
+ * Takes the files a call left in its own directory out of it, under names the
+ * fetch route serves, and removes the directory. A report the tool did not write
+ * is not one the answer names.
+ */
+async function collectDirectoryFiles(directory, publicBase) {
+  const collected = [];
+  for (const [name, kind] of Object.entries(directory.reports)) {
+    const source = path.join(directory.path, name);
+    const fileName = generatedFileName(
+      directory.target,
+      name.slice(name.indexOf('.') + 1),
+    );
+    const filePath = path.join(OUTPUT_DIR, fileName);
+    let stats;
+    try {
+      stats = await fs.stat(source);
+      await fs.chmod(source, OUTPUT_FILE_MODE);
+      await fs.rename(source, filePath);
+    } catch {
+      continue;
+    }
+    collected.push({
+      kind,
+      source,
+      descriptor: {
+        ...fileLocation(fileName, filePath, publicBase),
+        bytes: stats.size,
+      },
+    });
+  }
+  await removeStagingDirectory(directory.path);
+  return collected;
+}
+
+/**
+ * The recording each browser has running, keyed by session id. A screencast is
+ * the one file that is not there when the call that names it returns: ffmpeg
+ * writes it until `screencast_stop`, which takes no path of its own. The plan is
+ * therefore kept until then, so the stopping call can put the file under the
+ * name the starting call announced and describe it.
+ *
+ * A start the daemon refuses because one is already running comes back as a
+ * successful call carrying an error line, so an entry already there is kept
+ * rather than overwritten by the plan of a recording that never began.
+ */
+const recordings = new Map();
+
+/** The command that finishes a recording. */
+const RECORDING_STOP_COMMAND = 'screencast_stop';
+
+/**
+ * Describes the files one finished call left behind and says which staging path
+ * in its result is which final one.
+ */
+async function describeCallFiles(plan, resolved, command, publicBase) {
+  const descriptors = {};
+  const replacements = [];
+
+  for (const file of plan.files) {
+    if (file.deferred) {
+      if (!recordings.has(resolved.sessionId)) {
+        recordings.set(resolved.sessionId, file);
+      }
+      descriptors[file.kind] = {
+        ...fileLocation(file.fileName, file.filePath, publicBase),
+        pending: true,
+      };
+      continue;
+    }
+    const described = await describeWrittenFile(file, publicBase);
+    if (described) {
+      descriptors[file.kind] = described;
+      replacements.push([file.writePath, file.filePath]);
+    }
+  }
+
+  if (plan.directory) {
+    for (const collected of await collectDirectoryFiles(
+      plan.directory,
+      publicBase,
+    )) {
+      descriptors[collected.kind] = collected.descriptor;
+      replacements.push([collected.source, collected.descriptor.path]);
+    }
+  }
+
+  if (command === RECORDING_STOP_COMMAND) {
+    const recording = recordings.get(resolved.sessionId);
+    if (recording) {
+      recordings.delete(resolved.sessionId);
+      const described = await describeWrittenFile(recording, publicBase);
+      if (described) {
+        descriptors[recording.kind] = described;
+        replacements.push([recording.writePath, recording.filePath]);
+      }
+    }
+  }
+
+  return {descriptors, replacements};
 }
 
 /** Sends one tool invocation and renders its result. */
@@ -1209,7 +1774,7 @@ function spillHead(rendered) {
  */
 async function spillResult(target, rendered, publicBase) {
   await ensureOutputDir();
-  const fileName = generatedFileName(target, 'json');
+  const fileName = generatedFileName(target, SPILL_EXTENSION);
   const filePath = path.join(OUTPUT_DIR, fileName);
   try {
     await fs.writeFile(filePath, rendered, {
@@ -1228,10 +1793,7 @@ async function spillResult(target, rendered, publicBase) {
 
   return {
     spilled: true,
-    file: fileName,
-    path: filePath,
-    share_path: path.relative(SHARE_ROOT, filePath),
-    url: fileUrl(publicBase, fileName),
+    ...fileLocation(fileName, filePath, publicBase),
     bytes: Buffer.byteLength(rendered),
     head: spillHead(rendered),
   };
@@ -1277,6 +1839,24 @@ async function invoke(target, command, args, fullSpeed, publicBase, client) {
   }
 }
 
+/**
+ * Puts the paths of the answer right. A tool names back the path it was handed,
+ * which is the front's staging name and is gone a moment later; it names it in
+ * its structured fields and in its own response lines alike, so the exchange is
+ * made on the rendered result rather than field by field. Every path the front
+ * builds is made of the output directory and a generated name, so neither side
+ * of the exchange carries anything JSON escapes.
+ */
+function withFinalPaths(rendered, replacements) {
+  let result = rendered;
+  for (const [writePath, filePath] of replacements) {
+    if (writePath !== filePath) {
+      result = result.split(writePath).join(filePath);
+    }
+  }
+  return result;
+}
+
 /** Carries out one call that has been admitted, from the file plan to the answer. */
 async function carryOutCall(
   resolved,
@@ -1285,66 +1865,68 @@ async function carryOutCall(
   atFullSpeed,
   publicBase,
 ) {
-  // The written file takes the place of the payload upstream would attach, so
-  // the answer stays small enough for a caller's shell. Where it lands is the
-  // front's decision in either case. The echoed argument is the path the caller
-  // ends up with; what the daemon is handed is `plan.writePath`.
-  const plan = await planWrittenFile(command, resolved.target, toolArgs);
-  if (plan) {
-    toolArgs.filePath = plan.filePath;
-  }
-
-  // The probe comes first: it decides between a browser that is gone, which is
-  // an outage, and a daemon that is gone, which the call itself repairs.
-  await assertTargetReachable(resolved.browserUrl);
-
-  let outcome;
+  // A written file takes the place of the payload upstream would attach, so the
+  // answer stays small enough for a caller's shell, and a file to be read is
+  // looked up where every machine can put one. The echoed arguments are the
+  // paths the caller ends up with; what the daemon is handed are the staging
+  // paths beside them.
+  const plan = await planCall(command, resolved.target, toolArgs);
   try {
-    outcome = await runCommand(
+    let outcome;
+    try {
+      // The probe comes first: it decides between a browser that is gone, which
+      // is an outage, and a daemon that is gone, which the call itself repairs.
+      await assertTargetReachable(resolved.browserUrl);
+      outcome = await runCommand(
+        resolved,
+        command,
+        {...toolArgs, ...daemonPathArguments(plan)},
+        atFullSpeed,
+      );
+    } catch (error) {
+      // Whatever the call left half-written goes, and so does a call's own
+      // directory, whether the browser was never reached or the tool failed.
+      await settleLeftoverFiles(plan);
+      throw reclassifyFileFailure(error, plan);
+    }
+    const {parsed, elapsedMs} = outcome;
+
+    const {descriptors, replacements} = await describeCallFiles(
+      plan,
       resolved,
       command,
-      plan ? {...toolArgs, filePath: plan.writePath} : toolArgs,
-      atFullSpeed,
+      publicBase,
     );
-  } catch (error) {
-    if (!plan) {
-      throw error;
-    }
-    await settleLeftoverFile(plan);
-    throw reclassifyFileFailure(error, plan);
+
+    // What the answer would carry, measured before it is sent: a result past the
+    // cap is written out and named instead, so no call can put hundreds of
+    // kilobytes into a caller's context that it cannot take back.
+    const rendered = withFinalPaths(JSON.stringify(parsed), replacements);
+    const spill =
+      Buffer.byteLength(rendered) > SPILL_BYTES
+        ? await spillResult(resolved.target, rendered, publicBase)
+        : undefined;
+    const result = spill ?? JSON.parse(rendered);
+
+    return {
+      ok: true,
+      target: resolved.target,
+      browser_url: resolved.browserUrl,
+      command,
+      args: toolArgs,
+      // Which profile ran, on every answer, so a log shows plainly whether the
+      // brake was off.
+      pace: atFullSpeed ? 'full' : 'human',
+      elapsed_ms: elapsedMs,
+      title: parsed.pages?.find(page => page.selected)?.title,
+      ...descriptors,
+      result,
+    };
+  } finally {
+    // The copy a call was handed to read is the call's own and outlives it by
+    // nothing.
+    await removeStagedInputs(plan);
   }
-  const {parsed, elapsedMs} = outcome;
-
-  // The tool reports back the path it was handed, which is the front's staging
-  // name and is gone a moment later. Every path in the answer names the file the
-  // caller can actually fetch.
-  if (plan && parsed.snapshotFilePath === plan.writePath) {
-    parsed.snapshotFilePath = plan.filePath;
-  }
-
-  // What the answer would carry, measured before it is sent: a result past the
-  // cap is written out and named instead, so no call can put hundreds of
-  // kilobytes into a caller's context that it cannot take back.
-  const rendered = JSON.stringify(parsed);
-  const spill =
-    Buffer.byteLength(rendered) > SPILL_BYTES
-      ? await spillResult(resolved.target, rendered, publicBase)
-      : undefined;
-
-  return {
-    ok: true,
-    target: resolved.target,
-    browser_url: resolved.browserUrl,
-    command,
-    args: toolArgs,
-    // Which profile ran, on every answer, so a log shows plainly whether the
-    // brake was off.
-    pace: atFullSpeed ? 'full' : 'human',
-    elapsed_ms: elapsedMs,
-    title: parsed.pages?.find(page => page.selected)?.title,
-    ...(plan ? {[plan.kind]: await describeWrittenFile(plan, publicBase)} : {}),
-    result: spill ?? parsed,
-  };
 }
 
 /**
@@ -1386,22 +1968,23 @@ function send(response, status, body) {
 }
 
 /**
- * Serves a file an earlier call left behind — screenshot, snapshot or spilled
- * result — for a caller that does not have the network drive mounted. The
- * client is bash and curl by design, so this route, not the share path, is what
- * a caller on another machine actually reaches the file through.
+ * Serves a file an earlier call left behind — screenshot, snapshot, trace, heap
+ * snapshot, recording, report or spilled result — for a caller that does not
+ * have the network drive mounted. The client is bash and curl by design, so this
+ * route, not the share path, is what a caller on another machine actually
+ * reaches the file through.
  *
  * The front is unauthenticated, so this is a read path into `OUTPUT_DIR` and
  * must be nothing beyond it. Four things hold that, and the last three hold it
- * without relying on the first: the name has to be one the front hands out or
- * one it accepted as a snapshot file name, both of which are made of letters,
- * digits, dot, underscore and hyphen and can therefore carry neither a
- * directory separator nor a leading dot nor a `..`; the path built from it must
- * still lie directly in `OUTPUT_DIR`; the file is opened `O_NOFOLLOW`, so a
- * symlink placed in the guest-writable share cannot carry the read out of the
- * directory; and it must be the only name its inode has, because a hardlink is a
- * regular file with nothing to follow and would otherwise serve whatever the
- * front's uid can read. Only a regular file is answered.
+ * without relying on the first: the name has to be a plain name with an ending
+ * the front knows, made of letters, digits, dot, underscore and hyphen, and can
+ * therefore carry neither a directory separator nor a leading dot nor a `..`;
+ * the path built from it must still lie directly in `OUTPUT_DIR`; the file is
+ * opened `O_NOFOLLOW`, so a symlink placed in the guest-writable share cannot
+ * carry the read out of the directory; and it must be the only name its inode
+ * has, because a hardlink is a regular file with nothing to follow and would
+ * otherwise serve whatever the front's uid can read. Only a regular file is
+ * answered.
  */
 async function sendFile(response, pathname) {
   const requested = pathname.slice(FILE_ROUTE.length);
@@ -1413,10 +1996,7 @@ async function sendFile(response, pathname) {
     // `URIError` cannot travel out as a 422 with a JavaScript message.
     throw new CallError('usage', `not a usable file name: ${requested}`);
   }
-  if (
-    !GENERATED_FILE_NAME_PATTERN.test(fileName) &&
-    !OUTPUT_FILE_NAME_PATTERN.test(fileName)
-  ) {
+  if (!SERVED_FILE_NAME_PATTERN.test(fileName)) {
     throw new CallError('usage', `not a chromectl file name: ${fileName}`);
   }
   const filePath = path.resolve(OUTPUT_DIR, fileName);
@@ -1453,10 +2033,8 @@ async function sendFile(response, pathname) {
     await handle?.close();
   }
 
-  const extension = path.extname(fileName).slice(1);
   response.writeHead(200, {
-    'content-type':
-      CONTENT_TYPE_BY_EXTENSION[extension] ?? 'application/octet-stream',
+    'content-type': contentTypeFor(fileName),
     'content-length': data.length,
   });
   response.end(data);
@@ -1507,7 +2085,7 @@ const server = http.createServer(async (request, response) => {
         ok: true,
         service: 'chromectl',
         targets: listTargets(),
-        commands: ALLOWED_COMMANDS,
+        commands: COMMANDS,
       });
       return;
     }
