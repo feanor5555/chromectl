@@ -7,8 +7,9 @@
  * What the tools of the chromectl front read and write.
  *
  * One table says which argument of which command carries a path and what the
- * front does with it, the other says which arguments carry no path at all, and
- * between the two every argument upstream declares is accounted for. Both are
+ * front does with it, the two others say which arguments carry no path at all —
+ * by name where the name is enough, by command and name where it is not — and
+ * between the three every argument upstream declares is accounted for. All are
  * declarations only: the procedures that plan, stage and describe a file act on
  * them from elsewhere, and keeping the tables apart from those procedures is
  * what makes the file to look at after an upstream bump the small one.
@@ -172,18 +173,17 @@ export function reportExtension(name) {
 
 /**
  * Every argument of the command table that carries no path on the machine the
- * front runs on: a uid, a page index, a key, the text to type, the source of a
- * script. It is the counterpart of `FILE_ARGUMENTS`, and between the two every
- * argument upstream declares is accounted for.
+ * front runs on, whichever command declares it: a uid, a page index, a viewport,
+ * a timeout. It is one counterpart of `FILE_ARGUMENTS`, and between the tables
+ * every argument upstream declares is accounted for.
  *
- * The list is by argument name, and an upstream bump that gives an existing name
- * a new meaning is the one case it does not catch; the names here all carry
- * page-side data today and none of them is a filesystem path anywhere in the
- * table.
+ * The names here say what they hold wherever they turn up, so a tool an upstream
+ * bump adds may carry them without being looked at again. A name that says
+ * nothing on its own — `input`, `value`, `params` — belongs in
+ * `NON_PATH_COMMAND_ARGUMENTS` instead.
  */
 const NON_PATH_ARGUMENTS = new Set([
   'action',
-  'args',
   'autoStop',
   'background',
   'bringToFront',
@@ -195,28 +195,23 @@ const NON_PATH_ARGUMENTS = new Set([
   'dialogAction',
   'extraHttpHeaders',
   'filterName',
-  'format',
   'from_uid',
   'fullPage',
   'function',
   'geolocation',
   'handleBeforeUnload',
   'height',
-  'id',
   'ignoreCache',
   'includePreservedMessages',
   'includePreservedRequests',
   'includeSnapshot',
   'initScript',
-  'input',
   'insightName',
   'insightSetId',
   'isolatedContext',
-  'key',
   'maxDepth',
   'maxNodes',
   'maxSiblings',
-  'mode',
   'msgid',
   'networkConditions',
   'nodeId',
@@ -224,7 +219,6 @@ const NON_PATH_ARGUMENTS = new Set([
   'pageId',
   'pageIdx',
   'pageSize',
-  'params',
   'promptText',
   'quality',
   'reload',
@@ -232,21 +226,49 @@ const NON_PATH_ARGUMENTS = new Set([
   'resourceTypes',
   'serviceWorkerId',
   'submitKey',
-  'text',
   'timeout',
   'to_uid',
   'toolName',
-  'type',
-  'types',
   'uid',
-  'url',
   'userAgent',
-  'value',
   'verbose',
   'viewport',
   'width',
   'x',
   'y',
+]);
+
+/**
+ * The arguments that carry no path on the command that declares them, keyed
+ * `command.argument`.
+ *
+ * A container-ish name says nothing about what it holds: `input`, `value`,
+ * `params`, `args`, `id`, `key`, `mode`, `type`, `types`, `text`, `url` and
+ * `format` each mean whatever the one tool declaring them means by it today. Let
+ * in by name, they would account in advance for an argument of a tool nobody has
+ * read yet — which is the one gap a check by name has, and the reason the entry
+ * names the command as well. Every pair here is the command the built table
+ * gives that name to; the same name on any other command stops the front at
+ * startup until someone says what it holds there.
+ */
+const NON_PATH_COMMAND_ARGUMENTS = new Set([
+  'evaluate_script.args',
+  'execute_3p_developer_tool.params',
+  'execute_webmcp_tool.input',
+  'fill.value',
+  'get_heapsnapshot_class_nodes.id',
+  'lighthouse_audit.mode',
+  'list_console_messages.types',
+  'navigate_page.type',
+  'navigate_page.url',
+  'new_page.url',
+  'press_key.key',
+  'reload_extension.id',
+  'take_screenshot.format',
+  'trigger_extension_action.id',
+  'type_text.text',
+  'uninstall_extension.id',
+  'wait_for.text',
 ]);
 
 /**
@@ -260,13 +282,15 @@ const NON_PATH_ARGUMENTS = new Set([
  * yet: an upstream bump adds a tool, its arguments pass `validateArgs` because
  * they are in the schema, and nothing else stands between them and the daemon.
  *
- * The check is therefore against the two tables rather than against how an
- * argument is spelled — upstream names its path arguments `…Path` today, but
- * that is upstream's habit and not a property this fork may rest on. An argument
- * that is in neither table stops the front at startup, which is the loud failure
- * a merge is looked at again after; the alternative is a silent path escape at
- * the moment nobody is looking. Clearing it is one entry: into `FILE_ARGUMENTS`
- * when the argument carries a path, into `NON_PATH_ARGUMENTS` when it does not.
+ * The check is therefore against the tables rather than against how an argument
+ * is spelled — upstream names its path arguments `…Path` today, but that is
+ * upstream's habit and not a property this fork may rest on. An argument that is
+ * in no table stops the front at startup, which is the loud failure a merge is
+ * looked at again after; the alternative is a silent path escape at the moment
+ * nobody is looking. Clearing it is one entry: into `FILE_ARGUMENTS` when the
+ * argument carries a path, into `NON_PATH_ARGUMENTS` when it carries none and
+ * its name says so on any command, into `NON_PATH_COMMAND_ARGUMENTS` when only
+ * the command it belongs to says what it holds.
  *
  * The tables are parameters so that the refusal itself can be exercised against
  * tables that do not match; the call below passes none and holds the real ones,
@@ -276,13 +300,18 @@ export function assertArgumentsAccountedFor(
   schemas = COMMAND_SCHEMAS,
   fileArguments = FILE_ARGUMENTS,
   nonPathArguments = NON_PATH_ARGUMENTS,
+  scopedNonPathArguments = NON_PATH_COMMAND_ARGUMENTS,
 ) {
   const unaccounted = [];
   for (const [command, schema] of schemas) {
     for (const argument of Object.keys(schema)) {
+      // Asked for the table's own names only: `constructor` and its like are
+      // truthy on every object and would pass as accounted for while nothing in
+      // the tables ever named them.
       if (
-        fileArguments[command]?.[argument] ||
-        nonPathArguments.has(argument)
+        Object.hasOwn(fileArguments[command] ?? {}, argument) ||
+        nonPathArguments.has(argument) ||
+        scopedNonPathArguments.has(`${command}.${argument}`)
       ) {
         continue;
       }
@@ -291,8 +320,9 @@ export function assertArgumentsAccountedFor(
   }
   if (unaccounted.length > 0) {
     throw new Error(
-      `unknown tool arguments, each has to be entered into FILE_ARGUMENTS or ` +
-        `into NON_PATH_ARGUMENTS before the front can serve them: ${unaccounted.join(', ')}`,
+      `unknown tool arguments, each has to be entered into FILE_ARGUMENTS, ` +
+        `into NON_PATH_ARGUMENTS or into NON_PATH_COMMAND_ARGUMENTS before the ` +
+        `front can serve them: ${unaccounted.join(', ')}`,
     );
   }
 }

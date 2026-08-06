@@ -39,6 +39,7 @@ interface FileArguments {
     schemas?: Map<string, Record<string, unknown>>,
     fileArguments?: FileArgumentTable,
     nonPathArguments?: Set<string>,
+    scopedNonPathArguments?: Set<string>,
   ): void;
   assertExtensionsAccountedFor(
     fileArguments?: FileArgumentTable,
@@ -50,6 +51,22 @@ interface FileArguments {
 /** A tool the command table does not know, carrying a path nobody accounted for. */
 const UNKNOWN_ARGUMENT_SCHEMAS = new Map([
   ['fake_tool', {mysteryPath: {name: 'mysteryPath', type: 'string'}}],
+]);
+
+/** An argument named after a property every object carries on its prototype. */
+const INHERITED_NAME_SCHEMAS = new Map([
+  ['take_screenshot', {constructor: {name: 'constructor', type: 'string'}}],
+]);
+
+/** `input` on the command that owns it and on one that never declared it. */
+const SCOPED_NAME_SCHEMAS = new Map([
+  ['execute_webmcp_tool', {input: {name: 'input', type: 'string'}}],
+  ['navigate_page', {input: {name: 'input', type: 'string'}}],
+]);
+
+/** `input` on the command that owns it, alone. */
+const OWNED_NAME_SCHEMAS = new Map([
+  ['execute_webmcp_tool', {input: {name: 'input', type: 'string'}}],
 ]);
 
 /** A path argument whose ending the front has no name and no media type for. */
@@ -128,6 +145,23 @@ describe('chromectl front argument tables', () => {
     assert.throws(
       () => tables.assertArgumentsAccountedFor(UNKNOWN_ARGUMENT_SCHEMAS),
       /fake_tool\.mysteryPath/,
+    );
+  });
+
+  it('refuses an argument named after an inherited property', () => {
+    assert.throws(
+      () => tables.assertArgumentsAccountedFor(INHERITED_NAME_SCHEMAS),
+      /take_screenshot\.constructor/,
+    );
+  });
+
+  it('refuses a name on a command other than the one that declares it', () => {
+    assert.throws(
+      () => tables.assertArgumentsAccountedFor(SCOPED_NAME_SCHEMAS),
+      /navigate_page\.input/,
+    );
+    assert.doesNotThrow(() =>
+      tables.assertArgumentsAccountedFor(OWNED_NAME_SCHEMAS),
     );
   });
 
