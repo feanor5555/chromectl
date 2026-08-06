@@ -22,8 +22,11 @@ import {ClearcutLogger} from './telemetry/ClearcutLogger.js';
 import {bucketizeLatency, buildContext} from './telemetry/transformation.js';
 import type {CallToolResult} from './third_party/index.js';
 import {zod} from './third_party/index.js';
-import type {ToolCategory} from './tools/categories.js';
-import {labels, OFF_BY_DEFAULT_CATEGORIES} from './tools/categories.js';
+import {
+  labels,
+  OFF_BY_DEFAULT_CATEGORIES,
+  ToolCategory,
+} from './tools/categories.js';
 import type {
   DefinedPageTool,
   DevToolsData,
@@ -157,15 +160,44 @@ function buildUnknownArgumentsMessage(
 }
 
 /**
- * The tools that take the browser to another page. The gap between two of them
- * is held open by name rather than by `ToolCategory.NAVIGATION`, because that
- * category also carries pure reads — listing, selecting, closing and resizing a
- * page — which navigate nothing and would be gapped for no reason.
+ * The tools that take the browser to another page by their very purpose. They
+ * are the floor under the observed navigation, not the definition of one: a
+ * navigation is recognised from what the wait around the action saw, and that
+ * is a comparison of URLs, so a reload to the same address reports nothing and
+ * would leave the next call ungapped. The set is held by name rather than by
+ * `ToolCategory.NAVIGATION`, because that category also carries pure reads —
+ * listing, selecting, closing and resizing a page — which navigate nothing.
  */
 const NAVIGATING_TOOLS: ReadonlySet<string> = new Set([
   'navigate_page',
   'new_page',
 ]);
+
+/**
+ * The tools outside the input category that reach the page rather than only
+ * reading what is already known about it.
+ */
+const PAGE_ACTING_TOOLS: ReadonlySet<string> = new Set([
+  'navigate_page',
+  'new_page',
+  'evaluate_script',
+]);
+
+/**
+ * Whether a call has to hold the gap in front of it. Nobody can know in advance
+ * that a click will navigate, and a gap can only be held before an action, so
+ * guaranteeing the distance between two navigations means holding the remainder
+ * in front of every call that acts on the page. It costs nothing unless a
+ * navigation has just ended — which is exactly the moment a person would not yet
+ * have clicked. A call that only reads (listing pages, a snapshot, a
+ * screenshot) changes nothing anybody could watch and is never held.
+ */
+function actsOnThePage(tool: ToolDefinition | DefinedPageTool): boolean {
+  return (
+    tool.annotations.category === ToolCategory.INPUT ||
+    PAGE_ACTING_TOOLS.has(tool.name)
+  );
+}
 
 /**
  * When the last navigating call of this process finished. One daemon serves one
@@ -306,9 +338,9 @@ export class ToolHandler {
     // them, so a switch that only reached the input category would leave a
     // paced value standing at full speed.
     const fullSpeed = isFullSpeedRequest(meta);
-    const navigates = NAVIGATING_TOOLS.has(this.tool.name);
     const startTime = Date.now();
     let success = false;
+    let navigated = false;
     let devToolsData: DevToolsData | undefined;
     let pageUrl: string | undefined;
     let restorePace: (() => void) | undefined;
@@ -316,7 +348,7 @@ export class ToolHandler {
       // Inside the `try`, so the profile of this call is restored on every way
       // out — the gap waited out below is an `await` between the two.
       restorePace = selectPace(fullSpeed);
-      if (navigates && !fullSpeed) {
+      if (actsOnThePage(this.tool) && !fullSpeed) {
         // Held under the mutex, like every other paced wait: a gap the next
         // call could walk through is no gap.
         await holdNavigationGap(lastNavigationEndedAtMs);
@@ -392,6 +424,13 @@ export class ToolHandler {
         context,
         dataFormat,
       );
+      // What the next call keeps its gap from: the navigation the wait around
+      // the action actually observed, whatever tool set it off, and a tool that
+      // navigates by its purpose even when the URL it arrived at is the one it
+      // left. A call that failed navigated nothing and delays no one.
+      navigated =
+        Boolean(response.attachedWaitForResult?.navigatedToUrl) ||
+        (NAVIGATING_TOOLS.has(this.tool.name) && !response.error);
       const result: CallToolResult & {
         structuredContent?: Record<string, unknown>;
       } = {
@@ -430,9 +469,9 @@ export class ToolHandler {
         latencyMs: bucketizeLatency(Date.now() - startTime),
         context,
       });
-      if (navigates) {
+      if (navigated) {
         // Recorded whatever the profile was: a navigation at full speed is
-        // still the one the next braked navigation has to keep its gap from.
+        // still the one the next braked call has to keep its gap from.
         lastNavigationEndedAtMs = Date.now();
       }
       restorePace?.();

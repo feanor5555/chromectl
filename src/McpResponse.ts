@@ -425,6 +425,15 @@ export class McpResponse implements Response {
     return this.#textResponseLines;
   }
 
+  /**
+   * What the wait around the action observed, for the funnel that ran the call:
+   * a navigation is reported here whichever tool set it off, which is what the
+   * gap between two navigations is held from.
+   */
+  get attachedWaitForResult(): WaitForEventsResult | undefined {
+    return this.#attachedWaitForResult;
+  }
+
   get images(): ImageContentData[] {
     return this.#images;
   }

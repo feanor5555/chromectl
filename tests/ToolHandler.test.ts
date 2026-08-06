@@ -16,6 +16,7 @@ import {
   currentPace,
   FULL_SPEED_META_KEY,
   MUTEX_WAIT_CEILING_MS,
+  NAVIGATION_GAP_MAX_MS,
   PACE_FULL,
   PACE_HUMAN,
 } from '../src/pacing.js';
@@ -473,5 +474,116 @@ describe('ToolHandler', () => {
       /is currently disabled/,
     );
     assert.strictEqual(handlerCalled, false);
+  });
+
+  // Last in the file on purpose: the moment of the last navigation is process
+  // state, and every call these tests stamp it with would hold up the next test
+  // in this file for the remainder of the gap.
+  describe('the gap in front of the next call', () => {
+    function gapTool(options: {
+      name: string;
+      category: ToolCategory;
+      navigatedToUrl?: string;
+      fails?: boolean;
+    }) {
+      const tool: ToolDefinition = {
+        name: options.name,
+        description: 'A tool that reports what it did to the page',
+        annotations: {
+          category: options.category,
+          readOnlyHint: false,
+        },
+        schema: {},
+        blockedByDialog: false,
+        verifyFilesSchema: [],
+        handler: async (_request, response) => {
+          if (options.fails) {
+            throw new Error('the page could not be reached');
+          }
+          if (options.navigatedToUrl) {
+            response.attachWaitForResult({
+              navigatedToUrl: options.navigatedToUrl,
+            });
+          }
+        },
+      };
+
+      const serverArgs = parseArguments('1.0.0', ['node', 'script.js'], {
+        CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: 'true',
+      });
+      return new ToolHandler(
+        tool,
+        serverArgs,
+        async () => sinon.createStubInstance(McpContext),
+        new Mutex(),
+      );
+    }
+
+    /**
+     * Runs one call and reports whether it got through without the gap being
+     * waited out. Only the timers are faked, so the moment a navigation is
+     * stamped with stays the real one.
+     */
+    async function completesWithoutTheGap(
+      handler: ToolHandler,
+    ): Promise<boolean> {
+      const clock = sinon.useFakeTimers({
+        toFake: ['setTimeout', 'clearTimeout'],
+      });
+      try {
+        let completed = false;
+        const pending = handler.handle({}).then(result => {
+          completed = true;
+          return result;
+        });
+        await clock.tickAsync(0);
+        const withoutWaiting = completed;
+        await clock.tickAsync(NAVIGATION_GAP_MAX_MS);
+        await pending;
+        return withoutWaiting;
+      } finally {
+        clock.restore();
+      }
+    }
+
+    it('is not held after a navigating call that failed', async () => {
+      const failed = gapTool({
+        name: 'navigate_page',
+        category: ToolCategory.NAVIGATION,
+        fails: true,
+      });
+      const result = await failed.handle({});
+      assert.strictEqual(result.isError, true);
+
+      const click = gapTool({name: 'click', category: ToolCategory.INPUT});
+      assert.strictEqual(await completesWithoutTheGap(click), true);
+    });
+
+    it('is held in front of an input call after an observed navigation', async () => {
+      const clickThrough = gapTool({
+        name: 'click',
+        category: ToolCategory.INPUT,
+        navigatedToUrl: 'https://example.com/next',
+      });
+      await clickThrough.handle({});
+
+      const click = gapTool({name: 'click', category: ToolCategory.INPUT});
+      assert.strictEqual(await completesWithoutTheGap(click), false);
+    });
+
+    it('is not held in front of a call that only reads', async () => {
+      const navigated = gapTool({
+        name: 'navigate_page',
+        category: ToolCategory.NAVIGATION,
+        navigatedToUrl: 'https://example.com/next',
+      });
+      await navigated.handle({});
+
+      const snapshot = gapTool({
+        name: 'take_snapshot',
+        category: ToolCategory.NAVIGATION,
+      });
+      assert.strictEqual(await completesWithoutTheGap(snapshot), true);
+    });
   });
 });
