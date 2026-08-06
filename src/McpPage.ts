@@ -80,9 +80,11 @@ import {TextSnapshot} from './TextSnapshot.js';
 import type {Locator} from './third_party/index.js';
 import {
   PredefinedNetworkConditions,
+  type CdpFrame,
   type CdpPage,
   type Dialog,
   type ElementHandle,
+  type Frame,
   type Viewport,
   type WebMCPTool,
   type Protocol,
@@ -115,6 +117,19 @@ const UNCOUNTED_NAVIGATION_TYPES: ReadonlySet<string> = new Set([
  * same network multiplier.
  */
 const PREPARE_NAVIGATION_TIMEOUT = 3_000;
+
+/**
+ * The end of an interaction a dialog stopped. The renderer is paused while one
+ * is open, so the input command that raised it is answered by nobody and
+ * everything the stream still carried was never sent — but that one command is
+ * dispatched and lands as soon as the dialog is handled, which is what the
+ * caller has to know before it types the same thing again.
+ */
+function dialogInterruption(dialog: Dialog): InteractionInterruptedError {
+  return new InteractionInterruptedError(
+    `A dialog opened while the interaction was being carried out (${dialog.type()}: ${dialog.message()}). Nothing after the input that raised it was sent, and that input itself may still reach the page once the dialog is handled. The dialog is still open.`,
+  );
+}
 import type {
   ContextPage,
   DevToolsData,
@@ -512,6 +527,10 @@ export class McpPage implements ContextPage {
    * trigger reports is lost by giving up on that command — a trigger's return
    * value is never read — and the dialog itself is what the helper and the
    * response report.
+   *
+   * `frame` is the frame the interaction addresses, so a navigation is counted
+   * only where it concerns that interaction. Without a frame the main frame is
+   * meant, which is what a tool naming no element acts on.
    */
   async waitForEventsAfterTrigger(
     prepare: () => Promise<() => Promise<unknown>>,
@@ -519,15 +538,26 @@ export class McpPage implements ContextPage {
       timeout?: number;
       handleDialog?:
         DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
+      frame?: Frame;
     },
   ): Promise<WaitForEventsResult> {
     await pauseBeforeAction();
+    const urlBeforeAction = this.pptrPage.url();
     const block = this.#observeRendererBlock();
     try {
-      const watch = this.#watchPrepareStage();
+      const watch = this.#watchPrepareStage(options?.frame);
       let trigger: () => Promise<unknown>;
       try {
         trigger = await prepare();
+      } catch (error) {
+        const dialog = watch.openedDialog();
+        if (dialog) {
+          // Whatever the prepare stage failed at, the dialog is what stopped
+          // it: nothing it asked the renderer was answered from the moment one
+          // was open.
+          throw dialogInterruption(dialog);
+        }
+        throw error;
       } finally {
         watch.stop();
       }
@@ -538,9 +568,7 @@ export class McpPage implements ContextPage {
         // action, so the dialog stays open and the trigger is not sent after
         // it: a keystroke dispatched into a paused renderer reaches nothing
         // until someone handles the dialog.
-        throw new InteractionInterruptedError(
-          `A dialog opened while the interaction was being carried out (${dialog.type()}: ${dialog.message()}). What was left of it never reached the page, and the dialog is still open.`,
-        );
+        throw dialogInterruption(dialog);
       }
 
       if (!watch.navigationStarted()) {
@@ -549,7 +577,11 @@ export class McpPage implements ContextPage {
           options,
         );
       }
-      return await this.#finishAfterNavigationDuringPrepare(trigger);
+      return await this.#finishAfterNavigationDuringPrepare(
+        trigger,
+        urlBeforeAction,
+        watch.openedDialog,
+      );
     } finally {
       block.stop();
     }
@@ -589,18 +621,41 @@ export class McpPage implements ContextPage {
    * listener this class already keeps. Only a dialog that opened while the
    * watch ran counts, because a dialog left over from an earlier call is what
    * `throwIfDialogOpen` reports before the tool starts.
+   *
+   * The session reports the navigation of every frame the page holds, an ad
+   * slot, an embedded video and a tracking frame included, and the watch runs
+   * for as long as the paced stream does — seconds on a long value. Only the
+   * frame the interaction addresses and the frames it sits in are therefore
+   * counted: those are the documents a navigation takes away from under the
+   * stream, and anything else navigating leaves it typing into the same field
+   * it started in.
    */
-  #watchPrepareStage(): {
+  #watchPrepareStage(addressedFrame?: Frame): {
     stop: () => void;
     navigationStarted: () => boolean;
     openedDialog: () => Dialog | undefined;
   } {
     let navigationStarted = false;
     const dialogBefore = this.#dialog;
+    const frameId = (frame: Frame): string =>
+      (frame as unknown as CdpFrame)._id;
+    const watchedFrameIds = new Set<string>([
+      frameId(this.pptrPage.mainFrame()),
+    ]);
+    for (
+      let frame: Frame | null = addressedFrame ?? null;
+      frame;
+      frame = frame.parentFrame()
+    ) {
+      watchedFrameIds.add(frameId(frame));
+    }
     const client = (this.pptrPage as unknown as CdpPage)._client();
     const onFrameStartedNavigating = (
       event: Protocol.Page.FrameStartedNavigatingEvent,
     ): void => {
+      if (!watchedFrameIds.has(event.frameId)) {
+        return;
+      }
       if (UNCOUNTED_NAVIGATION_TYPES.has(event.navigationType)) {
         return;
       }
@@ -643,27 +698,57 @@ export class McpPage implements ContextPage {
    * is the document that is leaving, which is why its failure is logged rather
    * than raised: the call's result is the navigation, not the last keystroke of
    * a page nobody will see again.
+   *
+   * What the call reports is what actually happened: a navigation the page
+   * confirmed or a URL that changed, and nothing when the start led nowhere —
+   * the gap the next call keeps is stamped off that report. The document it
+   * returns on has to have stopped changing as well, the same condition the
+   * helper's own wait ends on, so the next call does not act on a page that is
+   * still being built.
    */
   async #finishAfterNavigationDuringPrepare(
     trigger: () => Promise<unknown>,
+    urlBeforeAction: string,
+    openedDialog: () => Dialog | undefined,
   ): Promise<WaitForEventsResult> {
     try {
       await abandonIfBlocked(trigger());
     } catch (error) {
       logger?.('the trigger failed on a page that was already leaving', error);
     }
+    const dialog = openedDialog();
+    if (dialog) {
+      // A page that asks before it is left — the `beforeunload` prompt — holds
+      // the navigation until someone answers, so there is nothing to wait out
+      // and nothing to report but the dialog.
+      throw dialogInterruption(dialog);
+    }
     const networkMultiplier = getNetworkMultiplierFromString(
       this.networkConditions,
     );
+    let navigationCompleted = false;
     try {
       await this.pptrPage.waitForNavigation({
         timeout: PREPARE_NAVIGATION_TIMEOUT * networkMultiplier,
       });
+      navigationCompleted = true;
     } catch (error) {
       logger?.('no navigation completed after one had started', error);
     }
+    try {
+      await this.createWaitForHelper(
+        this.cpuThrottlingRate,
+        networkMultiplier,
+      ).waitForStableDom();
+    } catch (error) {
+      logger?.('the DOM kept changing after the navigation', error);
+    }
     await settleAfterAction();
-    return {navigatedToUrl: this.pptrPage.url()};
+    const urlAfterAction = this.pptrPage.url();
+    if (!navigationCompleted && urlAfterAction === urlBeforeAction) {
+      return {};
+    }
+    return {navigatedToUrl: urlAfterAction};
   }
 
   dispose(): void {

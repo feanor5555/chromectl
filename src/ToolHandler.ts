@@ -428,6 +428,17 @@ export class ToolHandler {
       // the action actually observed, whatever tool set it off, and a tool that
       // navigates by its purpose even when the URL it arrived at is the one it
       // left. A call that failed navigated nothing and delays no one.
+      //
+      // `navigatedToUrl` is derived from a plain comparison of the URL before
+      // and after the action, which a hash change and a `pushState` satisfy
+      // while the watch over the prepare stage counts neither as a navigation
+      // (`UNCOUNTED_NAVIGATION_TYPES`). The two definitions differ, and the
+      // wider one is stamped from on purpose: a click on an in-page anchor is
+      // therefore reported as a navigation and costs the next acting call one
+      // navigation gap, at most `NAVIGATION_GAP_MAX_MS`. That is the whole cost
+      // — no input is lost and none is sent twice — and it is paid to keep the
+      // stamp on what a watcher would see as a page change, rather than on what
+      // one CDP event type happened to be called.
       navigated =
         Boolean(response.attachedWaitForResult?.navigatedToUrl) ||
         (NAVIGATING_TOOLS.has(this.tool.name) && !response.error);

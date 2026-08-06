@@ -17,6 +17,7 @@ import type {
   Dialog,
   ElementHandle,
   Extension,
+  Frame,
   ScreenRecorder,
   Viewport,
   DevTools,
@@ -324,6 +325,8 @@ export type ContextPage = Readonly<{
       timeout?: number;
       handleDialog?:
         DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
+      /** The frame the interaction addresses. Defaults to the main frame. */
+      frame?: Frame;
     },
   ): Promise<WaitForEventsResult>;
   getThirdPartyDeveloperTools(): ToolGroups;
