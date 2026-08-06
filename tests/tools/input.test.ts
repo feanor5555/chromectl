@@ -15,6 +15,7 @@ import type {ParsedArguments} from '../../src/bin/chrome-devtools-mcp-cli-option
 import type {McpContext} from '../../src/McpContext.js';
 import {McpResponse} from '../../src/McpResponse.js';
 import {selectPace} from '../../src/pacing.js';
+import {pointerPosition, recordPointerAt} from '../../src/pointerTravel.js';
 import {TextSnapshot} from '../../src/TextSnapshot.js';
 import {
   click,
@@ -469,7 +470,7 @@ describe('input', () => {
         await mcpPage.pptrPage.setContent(recordingPage);
         // The pointer is put in a corner, so the path across the page is long
         // enough that no two of its points round to the same coordinate.
-        mcpPage.setPointerPosition({x: 4, y: 4});
+        recordPointerAt(mcpPage, {x: 4, y: 4});
 
         await clickTheButton(response, context);
 
@@ -504,7 +505,7 @@ describe('input', () => {
       await withMcpContext(async (response, context) => {
         const mcpPage = context.getSelectedMcpPage();
         await mcpPage.pptrPage.setContent(recordingPage);
-        mcpPage.setPointerPosition({x: 4, y: 4});
+        recordPointerAt(mcpPage, {x: 4, y: 4});
 
         const restore = selectPace(true);
         try {
@@ -553,12 +554,12 @@ describe('input', () => {
       await withMcpContext(async (response, context) => {
         const mcpPage = context.getSelectedMcpPage();
         await mcpPage.pptrPage.setContent(recordingPage);
-        const before = mcpPage.pointerPosition;
+        const before = pointerPosition(mcpPage);
         assert.strictEqual(before, undefined);
 
         await clickTheButton(response, context);
 
-        const kept = mcpPage.pointerPosition;
+        const kept = pointerPosition(mcpPage);
         assert.ok(kept, 'the pointer position was not kept');
         const moves = (await mcpPage.pptrPage.evaluate('moves')) as Array<
           [number, number, number]
@@ -597,7 +598,7 @@ describe('input', () => {
         const mcpPage = context.getSelectedMcpPage();
         await mcpPage.pptrPage.setContent(recordingForm);
         // Far enough from the two fields that the path has points to take.
-        mcpPage.setPointerPosition({x: 700, y: 500});
+        recordPointerAt(mcpPage, {x: 700, y: 500});
         mcpPage.textSnapshot = await TextSnapshot.create(mcpPage);
         const nodes = [...mcpPage.textSnapshot.idToNode.values()];
         const checkbox = nodes.find(node => node.role === 'checkbox');

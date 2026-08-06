@@ -28,6 +28,7 @@ import {
   travelsPointer,
 } from '../pacing.js';
 import {
+  recordPointerAt,
   recordPointerOn,
   travelPaced,
   travelToElement,
@@ -244,7 +245,7 @@ async function pressPacedAt(
     await travelPaced(page, {x, y});
   }
   await mouse.move(x, y);
-  page.setPointerPosition({x, y});
+  recordPointerAt(page, {x, y});
   await pressButtonPaced(mouse, clickCount);
 }
 

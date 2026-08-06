@@ -12,7 +12,6 @@ import type {
   DuplicateStringGroup,
 } from '../HeapSnapshotManager.js';
 import type {McpPage} from '../McpPage.js';
-import type {PointerPoint} from '../pacing.js';
 import {zod} from '../third_party/index.js';
 import type {
   Dialog,
@@ -312,10 +311,6 @@ export type ContextPage = Readonly<{
   getDialog(): Dialog | undefined;
   clearDialog(): void;
   throwIfDialogOpen(): void;
-
-  /** Where the pointer stands on this page, if anything has moved it yet. */
-  readonly pointerPosition: PointerPoint | undefined;
-  setPointerPosition(position: PointerPoint): void;
 
   waitForEventsAfterAction(
     action: () => Promise<unknown>,

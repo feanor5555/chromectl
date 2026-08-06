@@ -75,7 +75,6 @@ import {
   pauseForDialogRead,
   settleAfterAction,
   takeLeadPause,
-  type PointerPoint,
 } from './pacing.js';
 import {
   ConsoleCollector,
@@ -183,9 +182,6 @@ export class McpPage implements ContextPage {
   #dialog?: Dialog;
   #dialogHandler: (dialog: Dialog) => void;
 
-  // Pointer
-  #pointerPosition?: PointerPoint;
-
   thirdPartyDeveloperTools: ToolGroups = [];
 
   networkCollector: NetworkCollector;
@@ -257,22 +253,6 @@ export class McpPage implements ContextPage {
 
   get devtoolsUniverse(): TargetUniverse | undefined {
     return this.#devtoolsUniverse;
-  }
-
-  /**
-   * Where this page's pointer stands, as far as this process knows. It is kept
-   * per page rather than per session, because puppeteer's own mouse state is
-   * per page and a coordinate belongs to the document it was taken in.
-   *
-   * A navigation does not clear it — a physical pointer does not move because a
-   * page loaded — so it is undefined only for a page nothing has moved on yet.
-   */
-  get pointerPosition(): PointerPoint | undefined {
-    return this.#pointerPosition;
-  }
-
-  setPointerPosition(position: PointerPoint): void {
-    this.#pointerPosition = {x: position.x, y: position.y};
   }
 
   getDialog(): Dialog | undefined {
