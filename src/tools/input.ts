@@ -1355,6 +1355,23 @@ export const fillForm = definePageTool({
   },
 });
 
+/**
+ * Switches the file chooser interception of the page on or off over its primary
+ * CDP session.
+ *
+ * Chrome answers `Page.*` and `Input.*` commands from separate agents, so the
+ * switch takes hold only once its own answer is back: a press dispatched before
+ * that can reach the page ahead of it and open a chooser nobody intercepts.
+ */
+async function interceptFileChooser(
+  page: ContextPage,
+  enabled: boolean,
+): Promise<void> {
+  // @ts-expect-error internal API
+  const client = page.pptrPage._client();
+  await client.send('Page.setInterceptFileChooserDialog', {enabled});
+}
+
 export const uploadFile = definePageTool({
   name: 'upload_file',
   description: 'Upload a file through a provided element.',
@@ -1409,6 +1426,10 @@ export const uploadFile = definePageTool({
         // page had never offered a chooser.
         buttonIsDown = true;
         await pressPaced(request.page, handle, 1);
+        // The interception is switched on and acknowledged before the release
+        // is dispatched, so the chooser the page opens is held for the wait
+        // below instead of passing it by.
+        await abandonIfBlocked(interceptFileChooser(request.page, true));
         const [fileChooser] = await Promise.all([
           request.page.pptrPage.waitForFileChooser({timeout: 3000}),
           (async () => {
@@ -1418,6 +1439,15 @@ export const uploadFile = definePageTool({
         ]);
         await abandonIfBlocked(fileChooser.accept([filePath]));
       } catch (error) {
+        try {
+          // Nothing switches the interception off again once the upload has
+          // failed, and a page left with it on swallows every file chooser
+          // opened after this tool has returned.
+          await abandonIfBlocked(interceptFileChooser(request.page, false));
+        } catch {
+          // The failed upload is what the caller has to read, not a page that
+          // would not take the switch back.
+        }
         if (error instanceof InteractionInterruptedError) {
           // The page stopped the interaction, and that is what the caller has
           // to read: the element is not what failed and may well take a file.
