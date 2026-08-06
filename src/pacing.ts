@@ -11,8 +11,9 @@
  * either cuts an honest input off in the middle of a field or is so wide that a
  * hung daemon is never noticed. `callBudgetMs` therefore derives the ceiling
  * from the work the call actually carries: the fixed overhead every call pays,
- * plus the worst case of the pauses and characters it types, plus a safety
- * margin of 1.5, and never less than the 60 s floor that ends a hung daemon.
+ * plus the worst case of the pauses and characters it types, plus the wait a
+ * caller's own `timeout` argument asks for, plus a safety margin of 1.5, and
+ * never less than the 60 s floor that ends a hung daemon.
  *
  * The figures the brake works to: a key stays down 70–140 ms, the gap to the
  * next press is 15–80 ms, and every paced action is preceded by a 250–700 ms
@@ -418,8 +419,8 @@ interface FormElement {
   value?: unknown;
 }
 
-/** The paced work of one call. */
-interface PacedWork {
+/** The work of one call, in the terms the budget is derived from. */
+interface CallWork {
   /** Characters typed one by one. */
   characters: number;
   /**
@@ -428,6 +429,12 @@ interface PacedWork {
    * helper's own windows around it.
    */
   actions: number;
+  /**
+   * Longest the call may sit waiting on a `timeout` the caller set itself. It
+   * is not pacing and no profile shortens it: what it bounds is a page the call
+   * waits for, so it counts at every speed.
+   */
+  waitMs: number;
 }
 
 /**
@@ -438,13 +445,30 @@ function characterCount(value: unknown): number {
   return typeof value === 'string' ? Array.from(value).length : 0;
 }
 
-/** What one tool call types, and in how many separate actions. */
-function pacedWork(tool: string | undefined, args: ToolArguments): PacedWork {
+/**
+ * The wait one call's own `timeout` argument asks for. Every tool that takes
+ * one takes it under that name and in milliseconds (`timeoutSchema`), so it is
+ * read off the arguments rather than per tool: `wait_for` waits out a text that
+ * may never appear, `navigate_page` and `new_page` a load that may never
+ * finish, and all three may be told to wait longer than the floor grants.
+ *
+ * Anything the schema itself drops counts as nothing: zero and below select the
+ * tool's own default, which is short enough to sit inside the fixed overhead.
+ */
+function callerWaitMs(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
+    : 0;
+}
+
+/** What one tool call types, in how many separate actions, and what it waits. */
+function callWork(tool: string | undefined, args: ToolArguments): CallWork {
+  const waitMs = callerWaitMs(args.timeout);
   switch (tool) {
     case 'type_text':
-      return {characters: characterCount(args.text), actions: 1};
+      return {characters: characterCount(args.text), actions: 1, waitMs};
     case 'fill':
-      return {characters: characterCount(args.value), actions: 1};
+      return {characters: characterCount(args.value), actions: 1, waitMs};
     case 'fill_form': {
       const elements: FormElement[] = Array.isArray(args.elements)
         ? (args.elements as FormElement[])
@@ -453,10 +477,10 @@ function pacedWork(tool: string | undefined, args: ToolArguments): PacedWork {
         (total, element) => total + characterCount(element?.value),
         0,
       );
-      return {characters, actions: Math.max(1, elements.length)};
+      return {characters, actions: Math.max(1, elements.length), waitMs};
     }
     default:
-      return {characters: 0, actions: 1};
+      return {characters: 0, actions: 1, waitMs};
   }
 }
 
@@ -466,22 +490,25 @@ function pacedWork(tool: string | undefined, args: ToolArguments): PacedWork {
  *
  * A call at full speed pays for no pacing at all, so it falls back to the floor
  * whatever it types: what is left of it are the waits for the page, which the
- * floor has always covered.
+ * floor has always covered. The one exception is a wait the caller asked for by
+ * name — no profile makes a page arrive sooner, so that wait is counted at
+ * either speed.
  */
 export function callBudgetMs(
   tool?: string,
   args?: ToolArguments,
   fullSpeed = false,
 ): number {
-  if (fullSpeed) {
-    return MIN_CALL_BUDGET_MS;
-  }
-  const {characters, actions} = pacedWork(tool, args ?? {});
-  const work =
-    CALL_OVERHEAD_MS +
-    actions * ACTION_OVERHEAD_MS +
-    characters * CHARACTER_MAX_MS;
-  return Math.max(MIN_CALL_BUDGET_MS, Math.ceil(work * BUDGET_SAFETY_FACTOR));
+  const {characters, actions, waitMs} = callWork(tool, args ?? {});
+  const paced = fullSpeed
+    ? 0
+    : CALL_OVERHEAD_MS +
+      actions * ACTION_OVERHEAD_MS +
+      characters * CHARACTER_MAX_MS;
+  return Math.max(
+    MIN_CALL_BUDGET_MS,
+    Math.ceil((paced + waitMs) * BUDGET_SAFETY_FACTOR),
+  );
 }
 
 /**

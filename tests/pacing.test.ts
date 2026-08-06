@@ -10,6 +10,7 @@ import {describe, it} from 'node:test';
 import sinon from 'sinon';
 
 import {
+  BUDGET_SAFETY_FACTOR,
   CALL_OVERHEAD_MS,
   callBudgetMs,
   CHARACTER_MAX_MS,
@@ -295,6 +296,44 @@ describe('pacing', () => {
       );
     });
 
+    it('covers a wait the caller asked for by name', () => {
+      const timeout = 300_000;
+
+      for (const tool of ['wait_for', 'navigate_page', 'new_page']) {
+        const budgetMs = callBudgetMs(tool, {timeout});
+        assert.ok(
+          budgetMs > timeout,
+          `${tool}: ${budgetMs} does not cover ${timeout}`,
+        );
+        assert.ok(
+          budgetMs > callBudgetMs(tool, {}),
+          `${tool}: the timeout adds nothing to the budget`,
+        );
+      }
+    });
+
+    it('counts that wait at full speed too', () => {
+      const timeout = 300_000;
+
+      assert.ok(callBudgetMs('wait_for', {timeout}, true) > timeout);
+      assert.strictEqual(
+        callBudgetMs('wait_for', {timeout}, true),
+        Math.ceil(timeout * BUDGET_SAFETY_FACTOR),
+      );
+    });
+
+    it('leaves a call without an own timeout where it was', () => {
+      // Zero and below are what the tool schema drops in favour of its own
+      // default, and a non-number never reaches a tool at all.
+      for (const timeout of [0, -1, undefined, 'soon']) {
+        assert.strictEqual(
+          callBudgetMs('wait_for', {timeout}),
+          callBudgetMs('wait_for', {}),
+        );
+      }
+      assert.strictEqual(callBudgetMs('wait_for', {}), MIN_CALL_BUDGET_MS);
+    });
+
     it('falls back to the floor at full speed', () => {
       const value = 'a'.repeat(2_000);
 
@@ -327,6 +366,7 @@ describe('pacing', () => {
         ['click', {}],
         ['fill', {value}],
         ['type_text', {text: value}],
+        ['wait_for', {text: [value], timeout: 300_000}],
       ] as Array<[string | undefined, Record<string, unknown> | undefined]>) {
         assert.strictEqual(
           queuedCallBudgetMs(tool, args),
