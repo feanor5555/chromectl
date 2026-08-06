@@ -188,9 +188,19 @@ const EXTENSION_ALTERNATION = FILE_EXTENSIONS.map(extension =>
 const GENERATED_NAME_STEM =
   'chromectl-[A-Za-z0-9-]+-[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}';
 
+/**
+ * The longest name a file of this service can carry: what a filesystem takes,
+ * so nothing that exists on the drive is excluded. A generated name carries the
+ * name of its target, and a tighter bound would tie fetchability to how long
+ * that name is. Beyond it a name only reaches the drive to come back as
+ * `ENAMETOOLONG`, which is indistinguishable from a drive that is broken.
+ */
+const MAX_SERVED_FILE_NAME_LENGTH = 255;
+
 /** A file of this service: a plain name with an ending the front knows. */
 const SERVED_FILE_NAME_PATTERN = new RegExp(
-  `^[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:${EXTENSION_ALTERNATION})$`,
+  `^(?=.{1,${MAX_SERVED_FILE_NAME_LENGTH}}$)` +
+    `[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:${EXTENSION_ALTERNATION})$`,
 );
 
 /** The file names the front builds itself. */
@@ -924,7 +934,10 @@ function validateArgs(command, args) {
   const schema = COMMAND_SCHEMAS.get(command);
   const validated = {};
   for (const [name, value] of Object.entries(args)) {
-    const definition = schema[name];
+    // Asked for the schema's own names only: `constructor` and its like are
+    // truthy on every object and would slip past this refusal to fail later as
+    // a fault of the service.
+    const definition = Object.hasOwn(schema, name) ? schema[name] : undefined;
     if (!definition) {
       const known = Object.keys(schema).join(', ') || 'none';
       throw new CallError(
@@ -2357,7 +2370,10 @@ async function sendFile(response, pathname) {
     'content-disposition': `attachment; filename="${fileName}"`,
   });
   try {
-    await pipeline(handle.createReadStream(), response);
+    // The handle stays this function's to close, on every way out of it, which
+    // is why the stream is told not to close it: a stream that closes its own
+    // source would leave the `finally` closing a handle that is already gone.
+    await pipeline(handle.createReadStream({autoClose: false}), response);
   } catch {
     // The head is out, so nothing can be said on this socket any more: a caller
     // that walked away mid-download and a read that stopped delivering both end

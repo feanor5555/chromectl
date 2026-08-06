@@ -134,7 +134,11 @@ export function resolveTarget(target) {
     throw new TargetError(`illegal target name: ${JSON.stringify(target)}`);
   }
 
-  const entry = loadRegistry()[target];
+  // Only a name the registry carries itself is an entry: `constructor` and its
+  // like are truthy on every object and would be read as an entry without a
+  // browser URL instead of falling back to a host.
+  const registry = loadRegistry();
+  const entry = Object.hasOwn(registry, target) ? registry[target] : undefined;
   const browserUrl = entry
     ? entry.browserUrl
     : target.includes(':')
