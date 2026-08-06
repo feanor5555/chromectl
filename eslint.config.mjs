@@ -2,6 +2,8 @@
  * @license
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Modified by the chromectl fork.
  */
 
 import js from '@eslint/js';
@@ -38,6 +40,7 @@ export default defineConfig([
             'puppeteer.config.cjs',
             'eslint.config.mjs',
             'rollup.config.mjs',
+            'chromectl/*.mjs',
             'skills/memory-leak-debugging/references/compare_snapshots.js',
           ],
         },
