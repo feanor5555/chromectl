@@ -726,14 +726,14 @@ async function replaceDaemon(resolved, generation) {
  * The retry happens once. If the fresh daemon fails the same way, the failure
  * goes to the caller instead of starting another daemon.
  *
- * How long the call may take is derived from the call itself (`src/pacing.ts`)
- * and covers two separate ceilings. The work budget is derived because a
- * command that types character by character lasts as long as its text is long,
- * so a fixed ceiling would cut an honest input off in the middle of a field; at
- * full speed nothing is typed character by character and it falls back to the
- * floor. On top of it comes the fixed ceiling for the wait, because the daemon
- * serializes on one browser and this call may be queued behind another before
- * it does anything.
+ * How long the call may take is drawn once per call in `invoke` and handed down
+ * (`src/pacing.ts`); it covers two separate ceilings. The work budget is derived
+ * because a command that types character by character lasts as long as its text
+ * is long, so a fixed ceiling would cut an honest input off in the middle of a
+ * field; at full speed nothing is typed character by character and it falls back
+ * to the floor. On top of it comes the fixed ceiling for the wait, because the
+ * daemon serializes on one browser and this call may be queued behind another
+ * before it does anything.
  *
  * This is the outermost of the three deadlines one call passes through and the
  * shortest of them, so a timeout is reported here rather than by a socket
@@ -744,9 +744,8 @@ async function replaceDaemon(resolved, generation) {
  * `CLIENT_TIMEOUT_HEADROOM_MS`, so it can only fire after this one and a caller
  * gets a reported failure instead of a silence.
  */
-async function invokeTool(resolved, command, args, fullSpeed) {
+async function invokeTool(resolved, command, args, fullSpeed, budgetMs) {
   const message = {method: 'invoke_tool', tool: command, args, fullSpeed};
-  const budgetMs = queuedCallBudgetMs(command, args, fullSpeed);
   let generation = await ensureDaemon(resolved);
 
   for (let attempt = 0; ; attempt++) {
@@ -1976,9 +1975,15 @@ async function describeCallFiles(plan, resolved, command, publicBase) {
 }
 
 /** Sends one tool invocation and renders its result. */
-async function runCommand(resolved, command, toolArgs, fullSpeed) {
+async function runCommand(resolved, command, toolArgs, fullSpeed, budgetMs) {
   const started = Date.now();
-  const response = await invokeTool(resolved, command, toolArgs, fullSpeed);
+  const response = await invokeTool(
+    resolved,
+    command,
+    toolArgs,
+    fullSpeed,
+    budgetMs,
+  );
   const parsed = response.success
     ? await renderToolResult(response.result)
     : undefined;
@@ -2066,15 +2071,15 @@ async function invoke(target, command, args, fullSpeed, publicBase, client) {
     throw error;
   }
 
+  // Drawn once and handed down: the deadline the call actually runs under and
+  // the figure a refusal names the caller must be the same one, and a second
+  // evaluation of a drawn budget would be a second figure.
+  const budgetMs = queuedCallBudgetMs(command, toolArgs, atFullSpeed);
+
   // Before anything is planned, written or sent: a browser still carrying out a
   // call nobody waits for takes no second one, bar the one that clears a dialog.
   assertAdmissible(resolved, command);
-  const entry = registerCall(
-    resolved,
-    command,
-    queuedCallBudgetMs(command, toolArgs, atFullSpeed),
-    client,
-  );
+  const entry = registerCall(resolved, command, budgetMs, client);
   try {
     return await carryOutCall(
       resolved,
@@ -2082,6 +2087,7 @@ async function invoke(target, command, args, fullSpeed, publicBase, client) {
       toolArgs,
       atFullSpeed,
       publicBase,
+      budgetMs,
     );
   } finally {
     unregisterCall(resolved, entry);
@@ -2113,6 +2119,7 @@ async function carryOutCall(
   toolArgs,
   atFullSpeed,
   publicBase,
+  budgetMs,
 ) {
   // A written file takes the place of the payload upstream would attach, so the
   // answer stays small enough for a caller's shell, and a file to be read is
@@ -2131,6 +2138,7 @@ async function carryOutCall(
         command,
         {...toolArgs, ...daemonPathArguments(plan)},
         atFullSpeed,
+        budgetMs,
       );
     } catch (error) {
       // Whatever the call left half-written goes, and so does a call's own
