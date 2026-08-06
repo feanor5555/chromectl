@@ -26,11 +26,13 @@ interface ResolvedTarget {
   target: string;
   browserUrl: string;
   sessionId: string;
+  emulateFocusedPages: boolean;
 }
 
 interface Registry {
   resolveTarget(target: string): ResolvedTarget;
   sessionIdFor(browserUrl: string): string;
+  TargetError: new (message: string) => Error;
 }
 
 const PAUL = 'http://100.89.199.44:9222';
@@ -42,6 +44,14 @@ const REGISTRY_FILE = {
     'paul-loud': {browserUrl: 'HTTP://100.89.199.44:9222/'},
     'paul-http-port': {browserUrl: 'http://100.89.199.44:80'},
     jonas: {browserUrl: 'http://100.89.136.112:9222'},
+    unfocused: {
+      browserUrl: 'http://100.89.136.112:9333',
+      emulateFocusedPages: false,
+    },
+    'focus-typo': {
+      browserUrl: 'http://100.89.136.112:9444',
+      emulateFocusedPages: 'false',
+    },
   },
 };
 
@@ -129,6 +139,29 @@ describe('chromectl target registry', () => {
     const resolved = registry.resolveTarget('100.89.199.44:9222');
     assert.strictEqual(resolved.target, '100.89.199.44:9222');
     assert.strictEqual(resolved.browserUrl, PAUL);
+  });
+
+  it('takes the focus emulation off an entry and leaves it on otherwise', () => {
+    assert.strictEqual(
+      registry.resolveTarget('unfocused').emulateFocusedPages,
+      false,
+    );
+    // An entry without the option, and a name that is no entry at all.
+    assert.strictEqual(
+      registry.resolveTarget('paul').emulateFocusedPages,
+      true,
+    );
+    assert.strictEqual(
+      registry.resolveTarget('100.89.199.44:9222').emulateFocusedPages,
+      true,
+    );
+  });
+
+  it('refuses a focus emulation setting that is no boolean', () => {
+    assert.throws(
+      () => registry.resolveTarget('focus-typo'),
+      registry.TargetError,
+    );
   });
 
   it('produces a session id the daemon accepts', () => {

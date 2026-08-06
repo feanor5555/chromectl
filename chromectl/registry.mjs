@@ -7,8 +7,9 @@
  * Target registry for chromectl.
  *
  * A caller names a target in plain words. This module turns that name into the
- * browser URL of a running Chrome and into the hex session id that scopes the
- * daemon for it. The digest never leaves the service.
+ * browser URL of a running Chrome, into the hex session id that scopes the
+ * daemon for it, and into the settings that browser's daemon is started with.
+ * The digest never leaves the service.
  *
  * The session id belongs to the browser, not to the wording of the request: it
  * is derived from the resolved browser URL, so a registry alias and the bare
@@ -119,15 +120,44 @@ export function sessionIdFor(browserUrl) {
 }
 
 /**
- * Resolves a target name to `{target, browserUrl, sessionId}`.
+ * Whether the daemon of a target emulates every page as focused and active.
  *
- * A name found in the registry takes its browser URL from there. Any other
- * legal name is read as a host or `host:port`, so the registry is a
- * convenience and never a gate.
+ * On unless an entry says `"emulateFocusedPages": false`: a browser nobody
+ * watches behaves like the foreground everywhere, which is what several agents
+ * on one Chrome need. Where a real, visible Chrome is driven, the frontmost tab
+ * is a meaningful question and the emulation is switched off for that target.
+ *
+ * Only a boolean answers it. A string or a number is a typo in the registry and
+ * would leave the emulation quietly on, so it is refused instead.
+ */
+function emulateFocusedPagesOf(target, entry) {
+  const value = entry?.emulateFocusedPages;
+  if (value === undefined) {
+    return true;
+  }
+  if (typeof value !== 'boolean') {
+    throw new TargetError(
+      `registry entry for ${target} has a non-boolean ` +
+        `emulateFocusedPages: ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Resolves a target name to `{target, browserUrl, sessionId,
+ * emulateFocusedPages}`.
+ *
+ * A name found in the registry takes its browser URL and its daemon settings
+ * from there. Any other legal name is read as a host or `host:port` and gets
+ * the defaults, so the registry is a convenience and never a gate.
  *
  * Names that arrive at the same browser URL share one session id and therefore
  * one daemon; the returned `target` keeps the caller's own wording, which is
- * what the answer and a screenshot name are built from.
+ * what the answer and a screenshot name are built from. The settings belong to
+ * the browser as well: they reach a daemon at its start, so of two names for
+ * one browser the one that started the daemon is the one whose settings are in
+ * force until it is replaced.
  */
 export function resolveTarget(target) {
   if (typeof target !== 'string' || !TARGET_PATTERN.test(target)) {
@@ -149,7 +179,12 @@ export function resolveTarget(target) {
     throw new TargetError(`registry entry for ${target} has no browserUrl`);
   }
 
-  return {target, browserUrl, sessionId: sessionIdFor(browserUrl)};
+  return {
+    target,
+    browserUrl,
+    sessionId: sessionIdFor(browserUrl),
+    emulateFocusedPages: emulateFocusedPagesOf(target, entry),
+  };
 }
 
 /** All registered target names. */

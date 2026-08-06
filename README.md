@@ -83,6 +83,12 @@ the front refuses to start. `chromectl/targets.example.json` shows the shape. A
 caller may also name a host or `host:port` directly instead of a registered
 name; the CDP port defaults to 9222.
 
+An entry may carry `"emulateFocusedPages": false`. Every daemon otherwise
+emulates all its pages as focused and active, which is what several agents on
+one browser need; on a browser somebody watches it makes the frontmost tab
+meaningless, so such a target switches it off. The setting reaches the daemon at
+its start, so it takes effect for the target the daemon was started for.
+
 The registry holds addresses of this network and therefore lives with the
 machine configuration, not in this repository.
 

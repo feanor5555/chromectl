@@ -15,12 +15,13 @@ import {pathToFileURL} from 'node:url';
  * outside the TypeScript program, and this test loads the very same file the
  * same way rather than a compiled copy of it.
  *
- * What is covered here is the reachability probe alone. It is the one part of
- * the daemon layer a test process can drive in process: it is a plain fetch of
- * the target's CDP endpoint and touches no daemon of its own. The lifecycle
- * beside it — starting, stopping and replacing a daemon — is exercised through
- * the front's own process in `front.test.ts`, because provoking it here would
- * have this test runner write and be signalled through the daemon pid file.
+ * What is covered here is the reachability probe and the argument list a daemon
+ * start is built from. They are the parts of the daemon layer a test process can
+ * drive in process: a plain fetch of the target's CDP endpoint, and a list built
+ * from a resolved target. The lifecycle beside them — starting, stopping and
+ * replacing a daemon — is exercised through the front's own process in
+ * `front.test.ts`, because provoking it here would have this test runner write
+ * and be signalled through the daemon pid file.
  */
 const DAEMON_MODULE = pathToFileURL(path.resolve('chromectl/daemon.mjs')).href;
 
@@ -32,6 +33,10 @@ interface CallFailure {
 
 interface Daemon {
   assertTargetReachable(browserUrl: string): Promise<void>;
+  daemonStartArgs(resolved: {
+    browserUrl: string;
+    emulateFocusedPages?: boolean;
+  }): string[];
 }
 
 /** A port nothing listens on: bound to find a free one, then given up again. */
@@ -85,6 +90,28 @@ describe('chromectl target probe', () => {
       assert.ok(message.includes('500'), `${message} does not name the status`);
       return true;
     });
+  });
+
+  it('gives the daemon of an unfocused target the flag for it', () => {
+    const browserUrl = 'http://127.0.0.1:9222';
+    const off = daemon.daemonStartArgs({
+      browserUrl,
+      emulateFocusedPages: false,
+    });
+    const on = daemon.daemonStartArgs({browserUrl, emulateFocusedPages: true});
+    const unset = daemon.daemonStartArgs({browserUrl});
+
+    assert.ok(off.includes('--no-emulate-focused-pages'));
+    // The daemon emulates a focused page by default, so nothing is passed for
+    // the targets that keep it.
+    assert.ok(!on.includes('--no-emulate-focused-pages'));
+    assert.deepStrictEqual(on, unset);
+    // The flag is the only difference; the browser and the server flags stay.
+    assert.deepStrictEqual(
+      off.filter(arg => arg !== '--no-emulate-focused-pages'),
+      on,
+    );
+    assert.ok(on.includes(`--browserUrl=${browserUrl}`));
   });
 
   it('takes a target that answers its version', async () => {

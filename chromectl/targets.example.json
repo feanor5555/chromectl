@@ -3,6 +3,11 @@
     "local": {
       "browserUrl": "http://127.0.0.1:9333",
       "description": "Chrome on the same machine, started by hand with a remote debugging port and its own user-data-dir."
+    },
+    "visible": {
+      "browserUrl": "http://127.0.0.1:9222",
+      "emulateFocusedPages": false,
+      "description": "A Chrome somebody watches: its frontmost tab is a real question, so its daemon does not emulate every page as focused and active."
     }
   }
 }

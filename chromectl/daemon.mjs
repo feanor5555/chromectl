@@ -175,13 +175,29 @@ function withDaemonLifecycle(sessionId, operation) {
   return started;
 }
 
+/**
+ * The arguments one daemon start is built from: the browser to attach to, the
+ * server flags every daemon carries, and what the registry says about this
+ * target.
+ *
+ * Only a setting that departs from the daemon's own default becomes a flag. The
+ * daemon emulates every page as focused and active unless told otherwise, so a
+ * target that keeps that behaviour is started exactly as before and only a
+ * target the registry switches it off for adds `--no-emulate-focused-pages`.
+ */
+export function daemonStartArgs({browserUrl, emulateFocusedPages}) {
+  return [
+    `--browserUrl=${browserUrl}`,
+    ...DAEMON_ARGS,
+    ...(emulateFocusedPages === false ? ['--no-emulate-focused-pages'] : []),
+  ];
+}
+
 /** Starts the daemon of one browser; a daemon that came up is a new generation. */
-async function startTargetDaemon({browserUrl, sessionId}) {
+async function startTargetDaemon(resolved) {
+  const {browserUrl, sessionId} = resolved;
   try {
-    await startDaemon(
-      [`--browserUrl=${browserUrl}`, ...DAEMON_ARGS],
-      sessionId,
-    );
+    await startDaemon(daemonStartArgs(resolved), sessionId);
   } catch (error) {
     throw new CallError(
       'unreachable',
