@@ -239,6 +239,16 @@ if (!Number.isInteger(SPILL_BYTES) || SPILL_BYTES <= 0) {
 }
 
 /**
+ * How many bytes of request body the front takes: an operator setting, like the
+ * pacing figures and like `SPILL_BYTES`, not a measurement. It is a transport
+ * bound and nothing else — the front is a proxy, so the figure sits where no
+ * legitimate argument reaches it, well above the source of an
+ * `evaluate_script` function or the text of a `fill_form`, and only stops a body
+ * that is being sent to fill this process's memory.
+ */
+const REQUEST_BYTES = 1_048_576;
+
+/**
  * How long a spilled result stays on the drive.
  *
  * A spilled file is the only one nobody asked for: the caller wanted the result
@@ -588,6 +598,10 @@ async function startTargetDaemon({browserUrl, sessionId}) {
     );
   }
   daemonGenerations.set(sessionId, daemonGeneration(sessionId) + 1);
+  // Whatever the daemon before this one was recording is over: ffmpeg was its
+  // child. The plan of that recording goes with it, so no later stop describes
+  // a file that stopped being written when the daemon did.
+  await forgetRecording(sessionId);
 }
 
 /** Waits until the daemon process of one browser is gone. */
@@ -1034,7 +1048,8 @@ const HEAP_SNAPSHOT_INPUT = {direction: 'in', extensions: ['heapsnapshot']};
  * into a temp directory nobody can reach — the image of a screenshot, the video
  * of a recording. `optional` marks a file a tool writes only when the page had
  * the content it would hold, so its absence is a result and not a failure.
- * `deferred` marks the one whose file is finished by a later call.
+ * `deferred` marks the one whose file is finished by a later call; that one is
+ * never optional, since the call finishing it is the call that promised it.
  *
  * `out-dir` is a directory a tool fills with files of its own naming. The front
  * hands it one of its own, takes the files named in `reports` out of it
@@ -1106,7 +1121,6 @@ const FILE_ARGUMENTS = {
       kind: 'recording',
       always: true,
       deferred: true,
-      optional: true,
       extensions: ['mp4', 'webm'],
     },
   },
@@ -1133,32 +1147,189 @@ for (const command of COMMANDS) {
 }
 
 /**
- * What an argument name has to look like to be one that carries a path on the
- * machine the front runs on. Every path argument upstream declares is spelled
- * this way, which is what lets the front recognise one it has no route for.
+ * Every argument of the command table that carries no path on the machine the
+ * front runs on: a uid, a page index, a key, the text to type, the source of a
+ * script. It is the counterpart of `FILE_ARGUMENTS`, and between the two every
+ * argument upstream declares is accounted for.
+ *
+ * The list is by argument name, and an upstream bump that gives an existing name
+ * a new meaning is the one case it does not catch; the names here all carry
+ * page-side data today and none of them is a filesystem path anywhere in the
+ * table.
  */
-const PATH_ARGUMENT_PATTERN = /path$/i;
+const NON_PATH_ARGUMENTS = new Set([
+  'action',
+  'args',
+  'autoStop',
+  'background',
+  'bringToFront',
+  'classIndex',
+  'colorScheme',
+  'cpuThrottlingRate',
+  'dblClick',
+  'device',
+  'dialogAction',
+  'extraHttpHeaders',
+  'filterName',
+  'format',
+  'from_uid',
+  'fullPage',
+  'function',
+  'geolocation',
+  'handleBeforeUnload',
+  'height',
+  'id',
+  'ignoreCache',
+  'includePreservedMessages',
+  'includePreservedRequests',
+  'includeSnapshot',
+  'initScript',
+  'input',
+  'insightName',
+  'insightSetId',
+  'isolatedContext',
+  'key',
+  'maxDepth',
+  'maxNodes',
+  'maxSiblings',
+  'mode',
+  'msgid',
+  'networkConditions',
+  'nodeId',
+  'objectId',
+  'pageId',
+  'pageIdx',
+  'pageSize',
+  'params',
+  'promptText',
+  'quality',
+  'reload',
+  'reqid',
+  'resourceTypes',
+  'serviceWorkerId',
+  'submitKey',
+  'text',
+  'timeout',
+  'to_uid',
+  'toolName',
+  'type',
+  'types',
+  'uid',
+  'url',
+  'userAgent',
+  'value',
+  'verbose',
+  'viewport',
+  'width',
+  'x',
+  'y',
+]);
 
 /**
- * Refuses an argument that names a path the front has no route for.
+ * Refuses to start while one argument of the command table is unaccounted for.
  *
  * The daemon runs with `--allowUnrestrictedPaths`, so a path that travelled
  * through as the caller wrote it would read and write wherever the front's user
- * can. Every path argument the front knows is filled in by the front itself; a
- * tool an upstream bump brings with a path argument that is not in
- * `FILE_ARGUMENTS` therefore lands here as a plain refusal instead of as a way
- * out of `OUTPUT_DIR`.
+ * can, from an endpoint that asks for no authentication. Every path argument the
+ * front knows is filled in by the front itself, and the question is what happens
+ * to the one it does not know yet: an upstream bump adds a tool, its arguments
+ * pass `validateArgs` because they are in the schema, and nothing else stands
+ * between them and the daemon.
+ *
+ * The check is therefore against the two tables rather than against how an
+ * argument is spelled — upstream names its path arguments `…Path` today, but
+ * that is upstream's habit and not a property this fork may rest on. An argument
+ * that is in neither table stops the front at startup, which is the loud failure
+ * a merge is looked at again after; the alternative is a silent path escape at
+ * the moment nobody is looking. Clearing it is one entry: into `FILE_ARGUMENTS`
+ * when the argument carries a path, into `NON_PATH_ARGUMENTS` when it does not.
  */
-function assertPathArgumentsKnown(command, toolArgs, specs) {
-  for (const argument of Object.keys(toolArgs)) {
-    if (!PATH_ARGUMENT_PATTERN.test(argument) || specs?.[argument]) {
-      continue;
+function assertArgumentsAccountedFor() {
+  const unaccounted = [];
+  for (const [command, schema] of COMMAND_SCHEMAS) {
+    for (const argument of Object.keys(schema)) {
+      if (
+        FILE_ARGUMENTS[command]?.[argument] ||
+        NON_PATH_ARGUMENTS.has(argument)
+      ) {
+        continue;
+      }
+      unaccounted.push(`${command}.${argument}`);
     }
-    throw new CallError(
-      'usage',
-      `${command}: ${argument} names a path on the machine the front runs on ` +
-        'and has no route through the front',
+  }
+  if (unaccounted.length > 0) {
+    throw new Error(
+      `unknown tool arguments, each has to be entered into FILE_ARGUMENTS or ` +
+        `into NON_PATH_ARGUMENTS before the front can serve them: ${unaccounted.join(', ')}`,
     );
+  }
+}
+
+assertArgumentsAccountedFor();
+
+/**
+ * The caller-chosen output names in flight, each with the browser that took it
+ * and how many of its calls hold it. `OUTPUT_DIR` is flat and its names carry no
+ * target, so two browsers writing `page.txt` at the same time would both stage
+ * under their own random name and then both rename onto that one file: nothing
+ * is corrupted, the loser's answer merely names a file that holds the other
+ * browser's page, with its own byte count beside it and no way for either caller
+ * to notice. Two calls of the same browser are the caller's own sequence and
+ * keep the last one, as any two writes to one name do.
+ */
+const claimedOutputNames = new Map();
+
+/**
+ * Takes one caller-chosen name for the browser that is about to write it, or
+ * refuses the call while another browser holds it. The refusal is a `busy`, the
+ * same kind a call queued behind another gets: the name is free again as soon as
+ * that call has ended, and picking another one is the caller's other way on.
+ */
+function claimOutputName(command, argument, fileName, resolved) {
+  const claim = claimedOutputNames.get(fileName);
+  if (claim === undefined) {
+    claimedOutputNames.set(fileName, {
+      sessionId: resolved.sessionId,
+      holders: 1,
+    });
+    return;
+  }
+  if (claim.sessionId !== resolved.sessionId) {
+    throw new CallError(
+      'busy',
+      `${command}: ${argument} ${fileName} is being written by another browser ` +
+        'right now — name another file, or wait for that call to end',
+    );
+  }
+  claim.holders += 1;
+}
+
+/** Gives one name back. */
+function releaseOutputName(file) {
+  if (!file.claimed) {
+    return;
+  }
+  file.claimed = false;
+  const claim = claimedOutputNames.get(file.fileName);
+  if (claim === undefined) {
+    return;
+  }
+  claim.holders -= 1;
+  if (claim.holders <= 0) {
+    claimedOutputNames.delete(file.fileName);
+  }
+}
+
+/**
+ * Gives the names of one finished call back. The name of a recording is not one
+ * of them: its file is written until the stopping call renames it, so the claim
+ * stays with the plan in `recordings` and is given back when that plan is.
+ */
+function releaseOutputNames(plan) {
+  for (const file of plan.files) {
+    if (!file.retained) {
+      releaseOutputName(file);
+    }
   }
 }
 
@@ -1189,7 +1360,7 @@ function assertPathArgumentsKnown(command, toolArgs, specs) {
  * the browser is driven at all. They are no longer the boundary, and an entry
  * planted after them is replaced by the rename rather than refused.
  */
-async function planOutputFile(command, argument, spec, target, toolArgs) {
+async function planOutputFile(command, argument, spec, resolved, toolArgs) {
   const extensions =
     typeof spec.extensions === 'function'
       ? spec.extensions(toolArgs)
@@ -1197,7 +1368,7 @@ async function planOutputFile(command, argument, spec, target, toolArgs) {
   const requested = toolArgs[argument];
 
   if (requested === undefined) {
-    const fileName = generatedFileName(target, extensions[0]);
+    const fileName = generatedFileName(resolved.target, extensions[0]);
     const filePath = path.join(OUTPUT_DIR, fileName);
     return {
       ...spec,
@@ -1241,13 +1412,18 @@ async function planOutputFile(command, argument, spec, target, toolArgs) {
       `${command}: ${requested} exists in ${OUTPUT_DIR} under more than one name`,
     );
   }
+  claimOutputName(command, argument, requested, resolved);
 
   return {
     ...spec,
     argument,
     fileName: requested,
     filePath,
-    writePath: path.join(OUTPUT_DIR, generatedFileName(target, extension)),
+    claimed: true,
+    writePath: path.join(
+      OUTPUT_DIR,
+      generatedFileName(resolved.target, extension),
+    ),
   };
 }
 
@@ -1409,9 +1585,8 @@ async function removeStagingDirectory(directoryPath) {
 }
 
 /** What one call writes and reads, from its arguments and the table above. */
-async function planCall(command, target, toolArgs) {
+async function planCall(command, resolved, toolArgs) {
   const specs = FILE_ARGUMENTS[command];
-  assertPathArgumentsKnown(command, toolArgs, specs);
   const plan = {command, files: [], inputs: [], directory: undefined};
   if (!specs) {
     return plan;
@@ -1426,26 +1601,34 @@ async function planCall(command, target, toolArgs) {
           command,
           argument,
           spec,
-          target,
+          resolved.target,
           toolArgs,
         );
       } else if (spec.direction === 'out') {
         if (named || spec.always) {
           plan.files.push(
-            await planOutputFile(command, argument, spec, target, toolArgs),
+            await planOutputFile(command, argument, spec, resolved, toolArgs),
           );
         }
       } else if (named) {
         plan.inputs.push(
-          await planInputFile(command, argument, spec, target, toolArgs),
+          await planInputFile(
+            command,
+            argument,
+            spec,
+            resolved.target,
+            toolArgs,
+          ),
         );
       }
     }
   } catch (error) {
     // A call whose plan does not come together drives nothing, so what an
-    // earlier argument of it already put on the drive goes again.
+    // earlier argument of it already put on the drive goes again, and the names
+    // it had taken are free for the next call.
     await settleLeftoverFiles(plan);
     await removeStagedInputs(plan);
+    releaseOutputNames(plan);
     throw error;
   }
 
@@ -1474,11 +1657,36 @@ function daemonPathArguments(plan) {
 }
 
 /**
+ * Every path of one call that exists for this process only, each with the path
+ * the answer names in its place: the staging name a file is written under, the
+ * copy an upload is read from, and the recording of that browser, whose staging
+ * file is still being written while other calls run.
+ */
+function stagingReplacements(plan, sessionId) {
+  const pairs = plan.files.map(file => [file.writePath, file.filePath]);
+  for (const input of plan.inputs) {
+    pairs.push([input.readPath, input.filePath]);
+  }
+  const recording = recordings.get(sessionId);
+  if (recording) {
+    pairs.push([recording.writePath, recording.filePath]);
+  }
+  return pairs;
+}
+
+/**
  * Turns a failed call into a storage failure when the daemon choked on a file
  * rather than on the page. A write that fails is an outage of the network drive
  * and must not read as a browser that could not carry the command out.
+ *
+ * The reason a failure carries is the daemon's own text, and the daemon only
+ * ever saw the staging paths, so it is the text that names them; they are
+ * exchanged for the paths the answer names, here as everywhere else.
  */
-function reclassifyFileFailure(error, plan) {
+function reclassifyFileFailure(error, plan, sessionId) {
+  if (!(error instanceof CallError) || error.kind !== 'tool') {
+    return error;
+  }
   const written = [
     ...plan.files,
     ...(plan.directory
@@ -1491,35 +1699,30 @@ function reclassifyFileFailure(error, plan) {
         ]
       : []),
   ];
-  if (
-    !(error instanceof CallError) ||
-    error.kind !== 'tool' ||
-    written.length === 0
-  ) {
-    return error;
-  }
   const detail =
     typeof error.detail === 'string'
       ? error.detail
       : JSON.stringify(error.detail ?? '');
-  // The daemon only ever saw the write paths, so those are the paths its message
-  // can name.
+  const clean = withFinalPaths(detail, stagingReplacements(plan, sessionId));
   const hit = written.find(file => detail.includes(file.writePath));
   if (hit) {
     return new CallError(
       'storage',
       `${hit.kind} could not be written to ${hit.filePath}`,
-      error.detail,
+      clean,
     );
   }
-  if (!detail.includes(OUTPUT_DIR)) {
+  if (detail.includes(OUTPUT_DIR)) {
+    return new CallError(
+      'storage',
+      `${plan.command} could not write below ${OUTPUT_DIR}`,
+      clean,
+    );
+  }
+  if (clean === detail) {
     return error;
   }
-  return new CallError(
-    'storage',
-    `${plan.command} could not write below ${OUTPUT_DIR}`,
-    error.detail,
-  );
+  return new CallError(error.kind, error.message, clean);
 }
 
 /**
@@ -1614,7 +1817,9 @@ async function describeWrittenFile(file, publicBase) {
     throw new CallError(
       'storage',
       `${file.kind} was not written to ${file.filePath}`,
-      error.message,
+      // The staging name is this process's business and names nothing a caller
+      // can fetch, so it does not travel out in the reason either.
+      withFinalPaths(String(error.message), [[file.writePath, file.filePath]]),
     );
   }
 
@@ -1666,9 +1871,17 @@ async function collectDirectoryFiles(directory, publicBase) {
  * therefore kept until then, so the stopping call can put the file under the
  * name the starting call announced and describe it.
  *
+ * One plan belongs to one recording, and it goes when that recording can no
+ * longer be running: with every `screencast_stop`, whether the stop succeeded or
+ * failed, and with every new daemon generation, since ffmpeg is the daemon's
+ * child and dies with it. A plan that outlived its recording would otherwise be
+ * described by the next stop — a file that nobody wrote, under the name of a
+ * recording that had ended long before.
+ *
  * A start the daemon refuses because one is already running comes back as a
- * successful call carrying an error line, so an entry already there is kept
- * rather than overwritten by the plan of a recording that never began.
+ * successful call carrying an error line. Nothing will be written to the plan of
+ * that call, so the entry already there is kept and it is that entry the answer
+ * names: the file the running recording goes to is the one this caller will get.
  */
 const recordings = new Map();
 
@@ -1676,8 +1889,34 @@ const recordings = new Map();
 const RECORDING_STOP_COMMAND = 'screencast_stop';
 
 /**
+ * Drops the plan of a recording that can no longer be running and settles what
+ * it left: on the ordinary path the stopping call has already renamed the file
+ * onto the caller's name and there is nothing under the staging one, on every
+ * other path the staging file is what a recording nobody will ever be told about
+ * would sit in.
+ */
+async function forgetRecording(sessionId) {
+  const recording = recordings.get(sessionId);
+  if (recording === undefined) {
+    return;
+  }
+  recordings.delete(sessionId);
+  recording.retained = false;
+  releaseOutputName(recording);
+  await settleLeftoverFile(recording);
+}
+
+/**
  * Describes the files one finished call left behind and says which staging path
  * in its result is which final one.
+ *
+ * Every path of the call is exchanged, whether or not a file was written under
+ * it: the staging name is this process's business, a caller can neither fetch it
+ * nor do anything with it, and a tool that names back the path it was handed
+ * must not be quoted naming it. The two exchanges the plan alone does not say
+ * come first — the file a call's own directory is emptied into, and the
+ * recording a refused start is told about, which is the one already running and
+ * not the one this call planned.
  */
 async function describeCallFiles(plan, resolved, command, publicBase) {
   const descriptors = {};
@@ -1685,19 +1924,22 @@ async function describeCallFiles(plan, resolved, command, publicBase) {
 
   for (const file of plan.files) {
     if (file.deferred) {
-      if (!recordings.has(resolved.sessionId)) {
+      const running = recordings.get(resolved.sessionId);
+      const started = running ?? file;
+      if (running === undefined) {
+        file.retained = true;
         recordings.set(resolved.sessionId, file);
       }
       descriptors[file.kind] = {
-        ...fileLocation(file.fileName, file.filePath, publicBase),
+        ...fileLocation(started.fileName, started.filePath, publicBase),
         pending: true,
       };
+      replacements.push([file.writePath, started.filePath]);
       continue;
     }
     const described = await describeWrittenFile(file, publicBase);
     if (described) {
       descriptors[file.kind] = described;
-      replacements.push([file.writePath, file.filePath]);
     }
   }
 
@@ -1714,15 +1956,17 @@ async function describeCallFiles(plan, resolved, command, publicBase) {
   if (command === RECORDING_STOP_COMMAND) {
     const recording = recordings.get(resolved.sessionId);
     if (recording) {
-      recordings.delete(resolved.sessionId);
-      const described = await describeWrittenFile(recording, publicBase);
-      if (described) {
-        descriptors[recording.kind] = described;
-        replacements.push([recording.writePath, recording.filePath]);
-      }
+      // A recording the front promised and that is not on disk, or is on disk
+      // with nothing in it, fails the call: the caller asked for that file, and
+      // the answer would otherwise report a success for a name leading nowhere.
+      descriptors[recording.kind] = await describeWrittenFile(
+        recording,
+        publicBase,
+      );
     }
   }
 
+  replacements.push(...stagingReplacements(plan, resolved.sessionId));
   return {descriptors, replacements};
 }
 
@@ -1870,7 +2114,7 @@ async function carryOutCall(
   // looked up where every machine can put one. The echoed arguments are the
   // paths the caller ends up with; what the daemon is handed are the staging
   // paths beside them.
-  const plan = await planCall(command, resolved.target, toolArgs);
+  const plan = await planCall(command, resolved, toolArgs);
   try {
     let outcome;
     try {
@@ -1887,7 +2131,7 @@ async function carryOutCall(
       // Whatever the call left half-written goes, and so does a call's own
       // directory, whether the browser was never reached or the tool failed.
       await settleLeftoverFiles(plan);
-      throw reclassifyFileFailure(error, plan);
+      throw reclassifyFileFailure(error, plan, resolved.sessionId);
     }
     const {parsed, elapsedMs} = outcome;
 
@@ -1924,8 +2168,15 @@ async function carryOutCall(
     };
   } finally {
     // The copy a call was handed to read is the call's own and outlives it by
-    // nothing.
+    // nothing, and so is the name it took.
     await removeStagedInputs(plan);
+    releaseOutputNames(plan);
+    // A stop ends the recording whether the call succeeded or failed: the
+    // browser is not recording afterwards either way, and a plan kept beyond it
+    // would be described by the next stop as a file this one already took.
+    if (command === RECORDING_STOP_COMMAND) {
+      await forgetRecording(resolved.sessionId);
+    }
   }
 }
 
@@ -2053,17 +2304,42 @@ function requestPathname(url) {
   }
 }
 
+/**
+ * Reads one request body.
+ *
+ * The chunks are kept as buffers and decoded once, at the end: a chunk boundary
+ * falls wherever TCP put it, and a UTF-8 sequence split across two of them would
+ * decode to replacement characters on both sides if each chunk were decoded on
+ * its own. The body carries the text that gets typed into pages and the source
+ * of `evaluate_script`, so a silently altered character is a call that types
+ * something other than what was sent. The size is counted in bytes for the same
+ * reason, which is also the unit `REQUEST_BYTES` is named in.
+ *
+ * A body past the cap ends the reading, not the connection: the socket carries
+ * the answer that says so, and a caller that is told the limit and the figure
+ * can act on it, while a reset connection is a caller guessing why. What is
+ * still on the way is dropped unread.
+ */
 function readBody(request) {
   return new Promise((resolve, reject) => {
-    let body = '';
+    const chunks = [];
+    let bytes = 0;
     request.on('data', chunk => {
-      body += chunk;
-      if (body.length > 64 * 1024) {
-        reject(new CallError('usage', 'request body too large'));
-        request.destroy();
+      bytes += chunk.length;
+      if (bytes > REQUEST_BYTES) {
+        chunks.length = 0;
+        request.pause();
+        reject(
+          new CallError(
+            'usage',
+            `request body is larger than the ${REQUEST_BYTES} bytes the front takes`,
+          ),
+        );
+        return;
       }
+      chunks.push(chunk);
     });
-    request.on('end', () => resolve(body));
+    request.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     request.on('error', reject);
   });
 }
