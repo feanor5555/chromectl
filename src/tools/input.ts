@@ -10,6 +10,7 @@ import process from 'node:process';
 
 import {
   abandonIfBlocked,
+  answerOrAbandon,
   currentInterruption,
   InteractionInterruptedError,
 } from '../interruption.js';
@@ -249,14 +250,33 @@ async function pressButtonPaced(
  */
 async function selectAllPaced(keyboard: Keyboard): Promise<void> {
   const modifier: KeyInput = process.platform === 'darwin' ? 'Meta' : 'Control';
-  await keyboard.down(modifier);
+  await abandonIfBlocked(keyboard.down(modifier));
   try {
     await sleepKeyIntervalMs();
-    await keyboard.press('a', {delay: drawKeyHoldMs()});
+    await abandonIfBlocked(keyboard.press('a', {delay: drawKeyHoldMs()}));
   } finally {
-    await keyboard.up(modifier);
+    await abandonIfBlocked(keyboard.up(modifier));
   }
   await sleepKeyIntervalMs();
+}
+
+/**
+ * Undoes what an interaction left held once the wrapper around it has torn its
+ * block signal down again — a button still pressed, a modifier still held. The
+ * command is dispatched either way; what an open dialog changes is that nothing
+ * waits for it, because the renderer answers it only once someone handles the
+ * dialog and the interaction it belonged to is already decided.
+ */
+async function releaseAfterAction(
+  page: ContextPage,
+  release: () => Promise<unknown>,
+): Promise<void> {
+  const dispatched = release().catch(() => undefined);
+  const dialog = page.getDialog();
+  if (dialog && !dialog.handled) {
+    return;
+  }
+  await dispatched;
 }
 
 /**
@@ -298,49 +318,51 @@ async function readTypeableField(
   handle: ElementHandle<Element>,
   value: string,
 ): Promise<TypeableField> {
-  return await handle.evaluate((element, target): TypeableField => {
-    const classify = (
-      typeable: boolean,
-      current: string,
-      readsRenderedText = false,
-    ): TypeableField => {
-      const alreadyEqual = current === target;
-      const continues =
-        !alreadyEqual && current.length > 0 && target.startsWith(current);
-      return {
-        typeable,
-        hasContent: current.length > 0,
-        alreadyEqual,
-        keptPrefixLength: continues ? current.length : 0,
-        readsRenderedText,
+  return await answerOrAbandon(
+    handle.evaluate((element, target): TypeableField => {
+      const classify = (
+        typeable: boolean,
+        current: string,
+        readsRenderedText = false,
+      ): TypeableField => {
+        const alreadyEqual = current === target;
+        const continues =
+          !alreadyEqual && current.length > 0 && target.startsWith(current);
+        return {
+          typeable,
+          hasContent: current.length > 0,
+          alreadyEqual,
+          keptPrefixLength: continues ? current.length : 0,
+          readsRenderedText,
+        };
       };
-    };
-    if (element instanceof HTMLInputElement) {
-      const typeableTypes = [
-        'text',
-        'url',
-        'tel',
-        'search',
-        'password',
-        'number',
-        'email',
-      ];
-      return classify(typeableTypes.includes(element.type), element.value);
-    }
-    if (element instanceof HTMLTextAreaElement) {
-      return classify(true, element.value);
-    }
-    if (element instanceof HTMLElement && element.isContentEditable) {
-      return classify(true, element.innerText, true);
-    }
-    return {
-      typeable: false,
-      hasContent: false,
-      alreadyEqual: false,
-      keptPrefixLength: 0,
-      readsRenderedText: false,
-    };
-  }, value);
+      if (element instanceof HTMLInputElement) {
+        const typeableTypes = [
+          'text',
+          'url',
+          'tel',
+          'search',
+          'password',
+          'number',
+          'email',
+        ];
+        return classify(typeableTypes.includes(element.type), element.value);
+      }
+      if (element instanceof HTMLTextAreaElement) {
+        return classify(true, element.value);
+      }
+      if (element instanceof HTMLElement && element.isContentEditable) {
+        return classify(true, element.innerText, true);
+      }
+      return {
+        typeable: false,
+        hasContent: false,
+        alreadyEqual: false,
+        keptPrefixLength: 0,
+        readsRenderedText: false,
+      };
+    }, value),
+  );
 }
 
 /**
@@ -352,18 +374,20 @@ async function readTypeableField(
 async function readToggleState(
   handle: ElementHandle<Element>,
 ): Promise<boolean | 'mixed'> {
-  return await handle.evaluate(element => {
-    if (
-      (element instanceof HTMLInputElement && element.indeterminate) ||
-      element.getAttribute('aria-checked') === 'mixed'
-    ) {
-      return 'mixed';
-    }
-    return (
-      (element instanceof HTMLInputElement && element.checked) ||
-      element.getAttribute('aria-checked') === 'true'
-    );
-  });
+  return await answerOrAbandon(
+    handle.evaluate(element => {
+      if (
+        (element instanceof HTMLInputElement && element.indeterminate) ||
+        element.getAttribute('aria-checked') === 'mixed'
+      ) {
+        return 'mixed';
+      }
+      return (
+        (element instanceof HTMLInputElement && element.checked) ||
+        element.getAttribute('aria-checked') === 'true'
+      );
+    }),
+  );
 }
 
 /**
@@ -374,23 +398,25 @@ async function readToggleState(
  * an editable element takes it from a collapsed range over its own content.
  */
 async function placeCaretAtEnd(handle: ElementHandle<Element>): Promise<void> {
-  await handle.evaluate(element => {
-    if (
-      element instanceof HTMLInputElement ||
-      element instanceof HTMLTextAreaElement
-    ) {
-      const current = element.value;
-      element.value = '';
-      element.value = current;
-      return;
-    }
-    const range = element.ownerDocument.createRange();
-    range.selectNodeContents(element);
-    range.collapse(false);
-    const selection = element.ownerDocument.defaultView?.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-  });
+  await abandonIfBlocked(
+    handle.evaluate(element => {
+      if (
+        element instanceof HTMLInputElement ||
+        element instanceof HTMLTextAreaElement
+      ) {
+        const current = element.value;
+        element.value = '';
+        element.value = current;
+        return;
+      }
+      const range = element.ownerDocument.createRange();
+      range.selectNodeContents(element);
+      range.collapse(false);
+      const selection = element.ownerDocument.defaultView?.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    }),
+  );
 }
 
 /**
@@ -624,32 +650,35 @@ export const click = definePageTool({
     // button logically down for every later interaction with the page.
     let release: (() => Promise<void>) | undefined;
     try {
-      const result = await request.page.waitForEventsAfterTrigger(async () => {
-        // `Locator.hover` inside the press waits for the viewport and for a
-        // bounding box that stops moving, but not for the element to be
-        // enabled — the one condition `Locator.click` would add.
-        await waitUntilEnabled(handle);
-        if (shouldSelectNativeOption) {
-          // Picking an option sets a value and paces nothing, so this branch
-          // stays whole inside the window, the click it falls back to
-          // included.
+      const result = await request.page.waitForEventsAfterTrigger(
+        async () => {
+          // `Locator.hover` inside the press waits for the viewport and for a
+          // bounding box that stops moving, but not for the element to be
+          // enabled — the one condition `Locator.click` would add.
+          await waitUntilEnabled(handle);
+          if (shouldSelectNativeOption) {
+            // Picking an option sets a value and paces nothing, so this branch
+            // stays whole inside the window, the click it falls back to
+            // included.
+            return async () => {
+              if (await selectNativeSelectOption(handle)) {
+                return;
+              }
+              release = releaseButton;
+              await pressPaced(handle, mouse, clickCount);
+              release = undefined;
+              await releaseButton();
+            };
+          }
+          release = releaseButton;
+          await pressPaced(handle, mouse, clickCount);
           return async () => {
-            if (await selectNativeSelectOption(handle)) {
-              return;
-            }
-            release = releaseButton;
-            await pressPaced(handle, mouse, clickCount);
             release = undefined;
             await releaseButton();
           };
-        }
-        release = releaseButton;
-        await pressPaced(handle, mouse, clickCount);
-        return async () => {
-          release = undefined;
-          await releaseButton();
-        };
-      });
+        },
+        {frame: handle.frame},
+      );
       response.appendResponseLine(
         request.params.dblClick
           ? `Successfully double clicked on the element`
@@ -665,7 +694,7 @@ export const click = definePageTool({
       // A press that never reached its release would leave the button down for
       // every later interaction with the page.
       if (release) {
-        await mouse.up(pressOptions(clickCount)).catch(() => undefined);
+        await releaseAfterAction(request.page, releaseButton);
       }
     }
   },
@@ -725,7 +754,7 @@ export const clickAt = definePageTool({
       // A press that never reached its release would leave the button down for
       // every later interaction with the page.
       if (release) {
-        await mouse.up(pressOptions(clickCount)).catch(() => undefined);
+        await releaseAfterAction(page, releaseButton);
       }
     }
   },
@@ -752,17 +781,20 @@ export const hover = definePageTool({
     const uid = request.params.uid;
     using handle = await request.page.getElementByUid(uid);
     try {
-      const result = await request.page.waitForEventsAfterTrigger(async () => {
-        // The pointer arrives the way it arrives for a paced click: the jump
-        // that brings the element into view is waited out first, so the hover
-        // itself is all that is left inside the navigation expectation. What a
-        // hover sets off — a menu, a tooltip — is then waited for by the window
-        // behind it rather than raced against the pause in front of it.
-        await waitUntilInViewport(handle);
-        return async () => {
-          await handle.asLocator().hover();
-        };
-      });
+      const result = await request.page.waitForEventsAfterTrigger(
+        async () => {
+          // The pointer arrives the way it arrives for a paced click: the jump
+          // that brings the element into view is waited out first, so the hover
+          // itself is all that is left inside the navigation expectation. What a
+          // hover sets off — a menu, a tooltip — is then waited for by the
+          // window behind it rather than raced against the pause in front of it.
+          await waitUntilInViewport(handle);
+          return async () => {
+            await handle.asLocator().hover();
+          };
+        },
+        {frame: handle.frame},
+      );
       response.appendResponseLine(`Successfully hovered over the element`);
       response.attachWaitForResult(result);
       if (request.params.includeSnapshot) {
@@ -857,13 +889,15 @@ async function buildFillAction(
     value = optionValue;
   }
 
-  const isToggle = await handle.evaluate(el => {
-    if (el instanceof HTMLInputElement) {
-      return el.type === 'checkbox' || el.type === 'radio';
-    }
-    const role = el.getAttribute('role');
-    return role === 'checkbox' || role === 'radio' || role === 'switch';
-  });
+  const isToggle = await answerOrAbandon(
+    handle.evaluate(el => {
+      if (el instanceof HTMLInputElement) {
+        return el.type === 'checkbox' || el.type === 'radio';
+      }
+      const role = el.getAttribute('role');
+      return role === 'checkbox' || role === 'radio' || role === 'switch';
+    }),
+  );
 
   if (isToggle) {
     if (!['true', 'false'].includes(value)) {
@@ -941,7 +975,7 @@ async function buildFillAction(
       action: changeNothing,
     };
   }
-  await handle.focus();
+  await abandonIfBlocked(handle.focus());
   let text = value;
   if (content.keptPrefixLength > 0) {
     // What stands there is the beginning of what is wanted, so it stays and
@@ -1030,16 +1064,19 @@ export const fill = definePageTool({
     const uid = request.params.uid;
     using handle = await page.getElementByUid(uid);
     let decision: FillDecision = 'typed';
-    const result = await page.waitForEventsAfterTrigger(async () => {
-      const prepared = await fillFormElement(
-        handle,
-        uid,
-        request.params.value,
-        page,
-      );
-      decision = prepared.decision;
-      return prepared.action;
-    });
+    const result = await page.waitForEventsAfterTrigger(
+      async () => {
+        const prepared = await fillFormElement(
+          handle,
+          uid,
+          request.params.value,
+          page,
+        );
+        decision = prepared.decision;
+        return prepared.action;
+      },
+      {frame: handle.frame},
+    );
     response.appendResponseLine(
       fillDecisionNote(decision) ?? `Successfully filled out the element`,
     );
@@ -1120,26 +1157,31 @@ export const drag = definePageTool({
     );
     using toHandle = await request.page.getElementByUid(request.params.to_uid);
 
-    const result = await request.page.waitForEventsAfterTrigger(async () => {
-      // Both ends can be off screen, and the drag brings each of them into
-      // view in one jump: the source before the button goes down, the target
-      // while it is held.
-      const wasInViewport =
-        (await fromHandle.isIntersectingViewport({threshold: 0})) &&
-        (await toHandle.isIntersectingViewport({threshold: 0}));
-      await fromHandle.drag(toHandle);
-      // Drag-and-drop mechanics rather than pace: the browser needs a moment
-      // between the two drag events, at any speed.
-      await new Promise(resolve => setTimeout(resolve, 50));
-      // The pointer now stands on the target with the button down. What a
-      // person spends here is taking in the view the drag jumped to and
-      // holding the element a moment before letting go of it.
-      await pauseAfterScroll(!wasInViewport);
-      await sleepMs(drawMouseHoldMs());
-      return async () => {
-        await toHandle.drop(fromHandle);
-      };
-    });
+    const result = await request.page.waitForEventsAfterTrigger(
+      async () => {
+        // Both ends can be off screen, and the drag brings each of them into
+        // view in one jump: the source before the button goes down, the target
+        // while it is held.
+        const wasInViewport =
+          (await fromHandle.isIntersectingViewport({threshold: 0})) &&
+          (await toHandle.isIntersectingViewport({threshold: 0}));
+        await fromHandle.drag(toHandle);
+        // Drag-and-drop mechanics rather than pace: the browser needs a moment
+        // between the two drag events, at any speed.
+        await new Promise(resolve => setTimeout(resolve, 50));
+        // The pointer now stands on the target with the button down. What a
+        // person spends here is taking in the view the drag jumped to and
+        // holding the element a moment before letting go of it.
+        await pauseAfterScroll(!wasInViewport);
+        await sleepMs(drawMouseHoldMs());
+        return async () => {
+          await toHandle.drop(fromHandle);
+        };
+      },
+      // The drop is what the page acts on, so the target's frame is the one
+      // the interaction addresses.
+      {frame: toHandle.frame},
+    );
     response.appendResponseLine(`Successfully dragged an element`);
     response.attachWaitForResult(result);
     if (request.params.includeSnapshot) {
@@ -1180,16 +1222,19 @@ export const fillForm = definePageTool({
     for (const element of request.params.elements) {
       using handle = await page.getElementByUid(element.uid);
       let decision: FillDecision = 'typed';
-      lastResult = await page.waitForEventsAfterTrigger(async () => {
-        const prepared = await fillFormElement(
-          handle,
-          element.uid,
-          element.value,
-          page,
-        );
-        decision = prepared.decision;
-        return prepared.action;
-      });
+      lastResult = await page.waitForEventsAfterTrigger(
+        async () => {
+          const prepared = await fillFormElement(
+            handle,
+            element.uid,
+            element.value,
+            page,
+          );
+          decision = prepared.decision;
+          return prepared.action;
+        },
+        {frame: handle.frame},
+      );
       const note = fillDecisionNote(decision);
       if (note) {
         notes.push(`${element.uid}: ${note}`);
@@ -1294,36 +1339,45 @@ export const pressKey = definePageTool({
   verifyFilesSchema: [],
   handler: async (request, response) => {
     const page = request.page;
+    const keyboard = page.pptrPage.keyboard;
     const tokens = parseKey(request.params.key);
     const [key, ...modifiers] = tokens;
+    const heldModifiers: KeyInput[] = [];
 
-    const result = await page.waitForEventsAfterAction(async () => {
-      const heldModifiers: KeyInput[] = [];
-      try {
+    try {
+      // The modifiers are reached for one after the other, with a gap between
+      // them, and the key itself is what the page acts on: the combination is
+      // therefore prepared and only the key press runs under the navigation
+      // expectation. A key can raise a dialog like any other input — Enter in a
+      // form, a shortcut behind a `confirm` — so every dispatch here is given up
+      // on the moment the renderer stops answering.
+      const result = await page.waitForEventsAfterTrigger(async () => {
         for (const modifier of modifiers) {
-          await page.pptrPage.keyboard.down(modifier);
+          await abandonIfBlocked(keyboard.down(modifier));
           heldModifiers.push(modifier);
           // A hand reaches for one modifier after the other and then for the
           // key, so a gap separates every press from the next.
           await sleepKeyIntervalMs();
         }
-        await page.pptrPage.keyboard.press(key, {delay: drawKeyHoldMs()});
-      } finally {
-        // Release every modifier that was successfully pressed, even if a
-        // later key event throws. Otherwise a failed press leaves modifiers
-        // logically held down in the browser (see #2309).
-        for (const modifier of heldModifiers.toReversed()) {
-          await page.pptrPage.keyboard.up(modifier);
-        }
-      }
-    });
+        return async () => {
+          await keyboard.press(key, {delay: drawKeyHoldMs()});
+        };
+      });
 
-    response.appendResponseLine(
-      `Successfully pressed key: ${request.params.key}`,
-    );
-    response.attachWaitForResult(result);
-    if (request.params.includeSnapshot) {
-      response.includeSnapshot();
+      response.appendResponseLine(
+        `Successfully pressed key: ${request.params.key}`,
+      );
+      response.attachWaitForResult(result);
+      if (request.params.includeSnapshot) {
+        response.includeSnapshot();
+      }
+    } finally {
+      // Release every modifier that was successfully pressed, even if a later
+      // key event throws. Otherwise a failed press leaves modifiers logically
+      // held down in the browser (see #2309).
+      for (const modifier of heldModifiers.toReversed()) {
+        await releaseAfterAction(page, () => keyboard.up(modifier));
+      }
     }
   },
 });
