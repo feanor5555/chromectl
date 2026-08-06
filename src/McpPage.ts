@@ -70,11 +70,11 @@ import {
   observeRendererBlock,
 } from './interruption.js';
 import {
-  drawPreActionPauseMs,
   pauseBeforeAction,
+  pauseBeforeTravel,
   pauseForDialogRead,
   settleAfterAction,
-  travelsPointer,
+  takeLeadPause,
   type PointerPoint,
 } from './pacing.js';
 import {
@@ -185,7 +185,6 @@ export class McpPage implements ContextPage {
 
   // Pointer
   #pointerPosition?: PointerPoint;
-  #leadPauseMs?: number;
 
   thirdPartyDeveloperTools: ToolGroups = [];
 
@@ -274,17 +273,6 @@ export class McpPage implements ContextPage {
 
   setPointerPosition(position: PointerPoint): void {
     this.#pointerPosition = {x: position.x, y: position.y};
-  }
-
-  /**
-   * The pause reserved for an action that travels, handed over and cleared in
-   * one go: what is left of it after the path's own duration is what the
-   * traveller waits out, and an action that never asks for it pays nothing.
-   */
-  takeLeadPause(): number {
-    const reserved = this.#leadPauseMs ?? 0;
-    this.#leadPauseMs = undefined;
-    return reserved;
   }
 
   getDialog(): Dialog | undefined {
@@ -605,9 +593,12 @@ export class McpPage implements ContextPage {
    * a stream, or between a press and its release.
    *
    * `pointerTravel` says that the prepare stage brings the pointer to its
-   * target along a path. Part of that pause is then the travel itself, so it is
-   * reserved rather than slept here and the prepare stage waits out what its
-   * drawn path leaves of it.
+   * target along a path. Part of that pause is then the travel itself, so only
+   * its fixed lower end is slept here and the rest is reserved for the prepare
+   * stage to wait out what its drawn path leaves of it. The fixed part is
+   * slept rather than reserved as well because the prepare stage of such an
+   * action begins by scrolling the target into view, and a scroll is as visible
+   * to the page as the interaction it leads up to.
    *
    * Everything the prepare stage does is visible to the page — the first click
    * of a double click, every keystroke of a fill but the last, the selection
@@ -637,11 +628,11 @@ export class McpPage implements ContextPage {
       pointerTravel?: boolean;
     },
   ): Promise<WaitForEventsResult> {
-    if (options?.pointerTravel && travelsPointer()) {
-      // The pause is what the pointer spends reaching the target, and the
-      // target's coordinates are not known yet: it is reserved here and the
-      // traveller waits out what its own path leaves of it.
-      this.#leadPauseMs = drawPreActionPauseMs();
+    if (options?.pointerTravel) {
+      // Part of the pause is what the pointer spends reaching the target, and
+      // the target's coordinates are not known yet: that part is reserved here
+      // and the traveller waits out what its own path leaves of it.
+      await pauseBeforeTravel();
     } else {
       await pauseBeforeAction();
     }
@@ -688,8 +679,11 @@ export class McpPage implements ContextPage {
     } finally {
       // A reservation nothing travelled against is dropped rather than waited
       // out: the action is over, and a pause taken behind it is no pause before
-      // anything.
-      this.#leadPauseMs = undefined;
+      // anything. It is noted, because an action that asked for a reservation
+      // and then travelled nowhere took a shorter pause than it should have.
+      if (takeLeadPause() > 0) {
+        logger?.('a pause reserved for a travelling action went unspent');
+      }
       block.stop();
     }
   }

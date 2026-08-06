@@ -10,6 +10,7 @@ import {describe, it} from 'node:test';
 import sinon from 'sinon';
 
 import {
+  ACTION_OVERHEAD_MS,
   BUDGET_SAFETY_FACTOR,
   CALL_OVERHEAD_MS,
   callBudgetMs,
@@ -42,6 +43,7 @@ import {
   pauseAfterScroll,
   pauseBeforeAction,
   pauseForDialogRead,
+  pauseBeforeTravel,
   POINTER_CURVATURE_MAX,
   POINTER_PATH_MAX_MS,
   POINTER_POINTS_MAX,
@@ -60,6 +62,7 @@ import {
   SETTLE_MIN_MS,
   sleepKeyIntervalMs,
   sleepMs,
+  takeLeadPause,
   travelsPointer,
   WAIT_FOR_HELPER_MAX_MS,
 } from '../src/pacing.js';
@@ -524,10 +527,32 @@ describe('pacing', () => {
       }
     });
 
-    it('is nothing at full speed', () => {
+    it('waits out its fixed part and reserves the rest', async () => {
+      const before = Date.now();
+      const fixedMs = await pauseBeforeTravel();
+      const elapsedMs = Date.now() - before;
+      const reservedMs = takeLeadPause();
+
+      assert.strictEqual(fixedMs, PRE_ACTION_PAUSE_MIN_MS);
+      assert.ok(elapsedMs >= fixedMs - 1, `${elapsedMs} ms were waited out`);
+      assert.ok(
+        fixedMs + reservedMs >= PRE_ACTION_PAUSE_MIN_MS &&
+          fixedMs + reservedMs <= PRE_ACTION_PAUSE_MAX_MS,
+        `${fixedMs} plus ${reservedMs} is not one drawn pause`,
+      );
+      assert.strictEqual(
+        takeLeadPause(),
+        0,
+        'the reservation was handed out twice',
+      );
+    });
+
+    it('reserves nothing at a pace whose pointer does not travel', async () => {
       const restore = selectPace(true);
       try {
         assert.strictEqual(drawPreActionPauseMs(), 0);
+        assert.strictEqual(await pauseBeforeTravel(), 0);
+        assert.strictEqual(takeLeadPause(), 0);
       } finally {
         restore();
       }
@@ -607,6 +632,23 @@ describe('pacing', () => {
       assert.ok(
         callBudgetMs('fill_form', {elements}) > worstCaseMs,
         `${callBudgetMs('fill_form', {elements})} does not cover ${worstCaseMs}`,
+      );
+    });
+
+    it('counts a travelling action as its fixed pause plus its path', () => {
+      const perAction =
+        SCROLL_PAUSE_MAX_MS + SETTLE_MAX_MS + WAIT_FOR_HELPER_MAX_MS;
+
+      // The path is paid for out of the pause, so what an action can cost is
+      // the fixed part of the pause plus the whole path, and never the drawn
+      // pause and the path one after the other.
+      assert.ok(
+        ACTION_OVERHEAD_MS >=
+          PRE_ACTION_PAUSE_MIN_MS + POINTER_PATH_MAX_MS + perAction,
+      );
+      assert.ok(
+        ACTION_OVERHEAD_MS <
+          PRE_ACTION_PAUSE_MAX_MS + POINTER_PATH_MAX_MS + perAction,
       );
     });
 

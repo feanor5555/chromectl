@@ -12,7 +12,12 @@ import {
   type InterruptionReason,
 } from '../src/interruption.js';
 import {McpPage} from '../src/McpPage.js';
-import {selectPace} from '../src/pacing.js';
+import {
+  PRE_ACTION_PAUSE_MAX_MS,
+  PRE_ACTION_PAUSE_MIN_MS,
+  selectPace,
+  takeLeadPause,
+} from '../src/pacing.js';
 import {Locator, type Frame, type Page} from '../src/third_party/index.js';
 import type {WaitForHelper} from '../src/WaitForHelper.js';
 
@@ -235,5 +240,88 @@ describe('the navigation watched over a paced interaction', () => {
       restorePace();
       mcpPage.dispose();
     }
+  });
+});
+
+/**
+ * What the prepare stage of one action is preceded by. The pace is the human
+ * one here, because the whole subject is what is waited out before anything of
+ * the action reaches the page.
+ */
+describe('the pause in front of a paced action', () => {
+  /**
+   * Runs one action out and reports how long the prepare stage was kept
+   * waiting and what was reserved for it by the time it ran.
+   */
+  async function measurePrepare(
+    options: {pointerTravel?: boolean; travels?: boolean} = {},
+  ): Promise<{sleptMs: number; reservedMs: number; leftOverMs: number}> {
+    const {mcpPage} = createFakePage();
+    const startedAtMs = Date.now();
+    let sleptMs = 0;
+    let reservedMs = 0;
+    try {
+      await mcpPage.waitForEventsAfterTrigger(
+        async () => {
+          sleptMs = Date.now() - startedAtMs;
+          if (options.travels ?? true) {
+            reservedMs = takeLeadPause();
+          }
+          return async () => undefined;
+        },
+        {pointerTravel: options.pointerTravel},
+      );
+    } finally {
+      mcpPage.dispose();
+    }
+    return {sleptMs, reservedMs, leftOverMs: takeLeadPause()};
+  }
+
+  it('is waited out whole where the pointer does not travel', async () => {
+    const {sleptMs, reservedMs} = await measurePrepare();
+
+    assert.ok(
+      sleptMs >= PRE_ACTION_PAUSE_MIN_MS - 1,
+      `the prepare stage ran after ${sleptMs} ms`,
+    );
+    assert.strictEqual(
+      reservedMs,
+      0,
+      'a pause was reserved for an action that travels nowhere',
+    );
+  });
+
+  it('keeps only its fixed part in front of a travelling action', async () => {
+    const {sleptMs, reservedMs} = await measurePrepare({pointerTravel: true});
+
+    // The fixed part is the lower end of the interval, whatever was drawn: a
+    // scroll into view is the first thing such an action does, and it may not
+    // land in the same instant as the previous call's last event.
+    assert.ok(
+      sleptMs >= PRE_ACTION_PAUSE_MIN_MS - 1,
+      `the prepare stage ran after ${sleptMs} ms`,
+    );
+    assert.ok(
+      sleptMs < PRE_ACTION_PAUSE_MAX_MS,
+      `${sleptMs} ms were slept in front of an action that travels`,
+    );
+    assert.ok(
+      sleptMs + reservedMs >= PRE_ACTION_PAUSE_MIN_MS - 1 &&
+        sleptMs + reservedMs <= PRE_ACTION_PAUSE_MAX_MS + 50,
+      `${sleptMs} ms slept and ${reservedMs} ms reserved are not one drawn pause`,
+    );
+  });
+
+  it('leaves no reservation behind for the action after it', async () => {
+    const {leftOverMs} = await measurePrepare({
+      pointerTravel: true,
+      travels: false,
+    });
+
+    assert.strictEqual(
+      leftOverMs,
+      0,
+      'a pause nothing travelled against outlived its action',
+    );
   });
 });

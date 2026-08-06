@@ -20,8 +20,10 @@
  * pause. A target the page had to jump to costs a further 1000–1200 ms before
  * the action follows. The pointer reaches that target along a drawn path of at
  * most 20 points with 8–45 ms between them, and the pause in front of the action
- * pays for it: what is left of it once the path's own duration is known is what
- * is waited out. A 400–900 ms settle window follows the action, charged per
+ * pays for the path: the lower end of the pause is waited out before anything of
+ * the action reaches the page, and what is left of the drawn pause once the
+ * path's own duration is known is waited out in front of the first move. A
+ * 400–900 ms settle window follows the action, charged per
  * action like the pauses, because the wrapper that waits it out is entered once
  * per action and a form of many short fields is one call of many actions. A
  * dialog answered automatically is read for 800–2000 ms first. Every one of
@@ -203,11 +205,16 @@ export const CALL_OVERHEAD_MS = NAVIGATION_GAP_MAX_MS;
  * short fields pays every one of these as often as it has elements.
  *
  * The pause before the action and the path the pointer travels are one term,
- * not two: the pause is what the path is taken out of, and what is left of it
- * is waited out, so an action pays the longer of the two and never both.
+ * not two: the lower end of the pause is waited out before the action starts,
+ * the rest of it is what the path is taken out of, and what is left of that is
+ * waited out. An action therefore pays the longer of the whole pause and the
+ * path plus that fixed lower end, never the pause and the path in full.
  */
 export const ACTION_OVERHEAD_MS =
-  Math.max(PRE_ACTION_PAUSE_MAX_MS, POINTER_PATH_MAX_MS) +
+  Math.max(
+    PRE_ACTION_PAUSE_MAX_MS,
+    POINTER_PATH_MAX_MS + PRE_ACTION_PAUSE_MIN_MS,
+  ) +
   SCROLL_PAUSE_MAX_MS +
   SETTLE_MAX_MS +
   WAIT_FOR_HELPER_MAX_MS;
@@ -487,11 +494,59 @@ export function pauseBeforeAction(): Promise<number> {
 /**
  * The same pause as a figure, for an action that spends part of it moving the
  * pointer to its target: the target's coordinates are not known when the pause
- * is drawn, so it is reserved here and waited out once the path is drawn and
- * what is left of it is known.
+ * is drawn, so what is not waited out in front of the action is reserved and
+ * spent once the path is drawn.
  */
 export function drawPreActionPauseMs(): number {
   return drawFromPace(activePace.preActionPauseMs);
+}
+
+/**
+ * What is left of a drawn pre-action pause for the path to spend. One action
+ * runs at a time — calls serialize on the process-wide tool mutex, the same
+ * reason the profile itself is held this way — so a single reservation is the
+ * whole truth here.
+ */
+let reservedLeadPauseMs = 0;
+
+/** Puts one reservation in place, replacing whatever stood there. */
+export function reserveLeadPause(ms: number): void {
+  reservedLeadPauseMs = ms;
+}
+
+/**
+ * Hands the reservation to the path about to be travelled and clears it, so
+ * nothing behind that path can spend it a second time. Zero is what an action
+ * that reserved nothing gets, and what the caller that drops an unspent
+ * reservation reads.
+ */
+export function takeLeadPause(): number {
+  const reserved = reservedLeadPauseMs;
+  reservedLeadPauseMs = 0;
+  return reserved;
+}
+
+/**
+ * The pause in front of an action whose pointer still has to travel to its
+ * target. It is split in two: the lower end of the interval is waited out here,
+ * so nothing the action does — the scroll that brings the target into view
+ * first of all — reaches the page in the same instant as the previous call's
+ * last event, and the rest is reserved for the path, which waits out what its
+ * own duration leaves of it. The action therefore pays the fixed part plus the
+ * longer of the rest and the path, rather than the pause and the path in full.
+ *
+ * Where the pointer does not travel at all there is nothing to reserve for and
+ * the whole pause is waited out like any other.
+ */
+export async function pauseBeforeTravel(): Promise<number> {
+  if (!activePace.travelsPointer) {
+    return await pauseBeforeAction();
+  }
+  const drawn = drawPreActionPauseMs();
+  const fixedMs = Math.min(drawn, activePace.preActionPauseMs[0]);
+  reserveLeadPause(drawn - fixedMs);
+  await sleepMs(fixedMs);
+  return fixedMs;
 }
 
 /**

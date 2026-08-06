@@ -20,9 +20,11 @@ import {
   drawMouseHoldMs,
   pauseAfterScroll,
   pauseBeforeAction,
+  pauseBeforeTravel,
   sleepKeyIntervalMs,
   sleepMouseClickGapMs,
   sleepMs,
+  takeLeadPause,
   travelsPointer,
 } from '../pacing.js';
 import {
@@ -399,6 +401,27 @@ async function readTypeableField(
         readsRenderedText: false,
       };
     }, value),
+  );
+}
+
+/**
+ * Whether the element takes its value from a click rather than from a keystroke
+ * stream: a checkbox, a radio button or a switch. It is read before the fill's
+ * own wrapper is entered, because a toggle is reached the way a click target is
+ * reached — the pointer travels to it — and the pause that wrapper takes is
+ * drawn differently for an action that travels.
+ */
+async function isToggleElement(
+  handle: ElementHandle<Element>,
+): Promise<boolean> {
+  return await answerOrAbandon(
+    handle.evaluate(el => {
+      if (el instanceof HTMLInputElement) {
+        return el.type === 'checkbox' || el.type === 'radio';
+      }
+      const role = el.getAttribute('role');
+      return role === 'checkbox' || role === 'radio' || role === 'switch';
+    }),
   );
 }
 
@@ -919,6 +942,7 @@ async function buildFillAction(
   uid: string,
   requestedValue: string,
   page: ContextPage,
+  isToggle: boolean,
 ): Promise<PreparedFill> {
   // The pause at the transition to this field — reaching it, looking at it —
   // is taken by the wrapper this runs inside. `fill_form` enters that wrapper
@@ -936,16 +960,6 @@ async function buildFillAction(
     }
     value = optionValue;
   }
-
-  const isToggle = await answerOrAbandon(
-    handle.evaluate(el => {
-      if (el instanceof HTMLInputElement) {
-        return el.type === 'checkbox' || el.type === 'radio';
-      }
-      const role = el.getAttribute('role');
-      return role === 'checkbox' || role === 'radio' || role === 'switch';
-    }),
-  );
 
   if (isToggle) {
     if (!['true', 'false'].includes(value)) {
@@ -1057,6 +1071,21 @@ async function buildFillAction(
 }
 
 /**
+ * Whether a fill of this element will move the pointer, reported against the
+ * element the caller named like every other failure of a fill.
+ */
+async function fillTravelsPointer(
+  handle: ElementHandle<Element>,
+  uid: string,
+): Promise<boolean> {
+  try {
+    return await isToggleElement(handle);
+  } catch (error) {
+    handleActionError(error, uid);
+  }
+}
+
+/**
  * The same, with every failure reported against the element the caller named,
  * whether it happens while the field is being prepared or while the change
  * itself runs.
@@ -1066,10 +1095,11 @@ async function fillFormElement(
   uid: string,
   value: string,
   page: ContextPage,
+  isToggle: boolean,
 ): Promise<PreparedFill> {
   let prepared: PreparedFill;
   try {
-    prepared = await buildFillAction(handle, uid, value, page);
+    prepared = await buildFillAction(handle, uid, value, page, isToggle);
   } catch (error) {
     handleActionError(error, uid);
   }
@@ -1112,6 +1142,9 @@ export const fill = definePageTool({
     const uid = request.params.uid;
     using handle = await page.getElementByUid(uid);
     let decision: FillDecision = 'typed';
+    // A toggle takes its value from a paced click and the pointer travels to
+    // it; every other field takes keystrokes and the pointer stays where it is.
+    const isToggle = await fillTravelsPointer(handle, uid);
     const result = await page.waitForEventsAfterTrigger(
       async () => {
         const prepared = await fillFormElement(
@@ -1119,11 +1152,12 @@ export const fill = definePageTool({
           uid,
           request.params.value,
           page,
+          isToggle,
         );
         decision = prepared.decision;
         return prepared.action;
       },
-      {frame: handle.frame},
+      {frame: handle.frame, pointerTravel: isToggle},
     );
     response.appendResponseLine(
       fillDecisionNote(decision) ?? `Successfully filled out the element`,
@@ -1205,17 +1239,20 @@ export const drag = definePageTool({
     );
     using toHandle = await request.page.getElementByUid(request.params.to_uid);
 
+    // Both ends can be off screen, and the drag brings each of them into view
+    // in one jump: the source before the button goes down, the target while it
+    // is held. Where the source stands in view the pointer travels to it, so
+    // the two are read here, in front of the wrapper: the pause that wrapper
+    // takes is the one the travel is paid out of, and it is drawn differently
+    // for an action that travels.
+    const fromInViewport = await fromHandle.isIntersectingViewport({
+      threshold: 0,
+    });
+    const wasInViewport =
+      fromInViewport && (await toHandle.isIntersectingViewport({threshold: 0}));
+
     const result = await request.page.waitForEventsAfterTrigger(
       async () => {
-        // Both ends can be off screen, and the drag brings each of them into
-        // view in one jump: the source before the button goes down, the target
-        // while it is held.
-        const fromInViewport = await fromHandle.isIntersectingViewport({
-          threshold: 0,
-        });
-        const wasInViewport =
-          fromInViewport &&
-          (await toHandle.isIntersectingViewport({threshold: 0}));
         if (fromInViewport && travelsPointer()) {
           // The pointer reaches the source the way it reaches a click target.
           // A source the page still has to jump to has no point to travel to
@@ -1237,7 +1274,7 @@ export const drag = definePageTool({
       },
       // The drop is what the page acts on, so the target's frame is the one
       // the interaction addresses.
-      {frame: toHandle.frame},
+      {frame: toHandle.frame, pointerTravel: fromInViewport},
     );
     if (travelsPointer()) {
       // The drag left the pointer on the element it dropped onto, which is
@@ -1284,6 +1321,7 @@ export const fillForm = definePageTool({
     for (const element of request.params.elements) {
       using handle = await page.getElementByUid(element.uid);
       let decision: FillDecision = 'typed';
+      const isToggle = await fillTravelsPointer(handle, element.uid);
       lastResult = await page.waitForEventsAfterTrigger(
         async () => {
           const prepared = await fillFormElement(
@@ -1291,11 +1329,12 @@ export const fillForm = definePageTool({
             element.uid,
             element.value,
             page,
+            isToggle,
           );
           decision = prepared.decision;
           return prepared.action;
         },
-        {frame: handle.frame},
+        {frame: handle.frame, pointerTravel: isToggle},
       );
       const note = fillDecisionNote(decision);
       if (note) {
@@ -1358,6 +1397,10 @@ export const uploadFile = definePageTool({
       // the button instead of leaving it down for every later interaction.
       let buttonIsDown = false;
       try {
+        // Nothing wraps this press, so the pause in front of it is taken here:
+        // its fixed part before the approach begins, the rest reserved for the
+        // path the pointer travels inside the press.
+        await pauseBeforeTravel();
         // The approach and the press run in front of `Promise.all`, because
         // the chooser's 3 s budget starts when that is entered: a paced
         // approach inside it would spend a large part of the budget before the
@@ -1383,6 +1426,9 @@ export const uploadFile = definePageTool({
           `Failed to upload file. The element could not accept the file directly, and clicking it did not trigger a file chooser.`,
         );
       } finally {
+        // A reservation the press never travelled against belongs to no later
+        // action, so it is dropped rather than left standing.
+        takeLeadPause();
         // A press that never reached its release would leave the button down
         // for every later interaction with the page.
         if (buttonIsDown) {

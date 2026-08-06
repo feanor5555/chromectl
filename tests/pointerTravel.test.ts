@@ -13,6 +13,7 @@ import {observeInterruptions} from '../src/interruption.js';
 import {
   drawPointerPath,
   drawViewportEdgePoint,
+  reserveLeadPause,
   type PointerPoint,
 } from '../src/pacing.js';
 import {travelPaced} from '../src/pointerTravel.js';
@@ -29,7 +30,6 @@ interface RecordedMove {
 function stubPage(
   options: {
     position?: PointerPoint;
-    leadPauseMs?: number;
     layoutViewport?: {clientWidth: number; clientHeight: number};
     layoutMetricsFail?: boolean;
     viewport?: {width: number; height: number} | null;
@@ -37,7 +37,6 @@ function stubPage(
 ): {page: ContextPage; moves: RecordedMove[]; position: () => PointerPoint} {
   const moves: RecordedMove[] = [];
   let position = options.position;
-  let leadPauseMs = options.leadPauseMs ?? 0;
   const page = {
     pptrPage: {
       mouse: {
@@ -68,11 +67,6 @@ function stubPage(
     },
     setPointerPosition(next: PointerPoint): void {
       position = {x: next.x, y: next.y};
-    },
-    takeLeadPause(): number {
-      const reserved = leadPauseMs;
-      leadPauseMs = 0;
-      return reserved;
     },
   };
   return {
@@ -155,8 +149,9 @@ describe('the pointer travel', () => {
   it('waits out what is left of the reserved pause before setting off', async () => {
     const expected = pathFromSeed(33, from, to);
     const leadPauseMs = expected.durationMs + 250;
-    const {page, moves} = stubPage({position: from, leadPauseMs});
+    const {page, moves} = stubPage({position: from});
 
+    reserveLeadPause(leadPauseMs);
     const {elapsedMs} = await travel(33, page, to);
 
     assert.strictEqual(moves[0].atMs, 250);
@@ -165,15 +160,40 @@ describe('the pointer travel', () => {
 
   it('waits nothing when the path is longer than the pause', async () => {
     const expected = pathFromSeed(34, from, to);
-    const {page, moves} = stubPage({
-      position: from,
-      leadPauseMs: Math.floor(expected.durationMs / 2),
-    });
+    const {page, moves} = stubPage({position: from});
 
+    reserveLeadPause(Math.floor(expected.durationMs / 2));
     const {elapsedMs} = await travel(34, page, to);
 
     assert.strictEqual(moves[0].atMs, 0);
     assert.strictEqual(elapsedMs, expected.durationMs);
+  });
+
+  it('spends the reservation on a target it already stands on', async () => {
+    const {page, moves, position} = stubPage({position: to});
+
+    reserveLeadPause(400);
+    const {elapsedMs} = await travel(38, page, to);
+
+    // Nothing moved, so nothing is dispatched: a pointer standing still emits
+    // no event on any real input stack.
+    assert.deepStrictEqual(moves, []);
+    assert.strictEqual(elapsedMs, 400);
+    assert.deepStrictEqual(position(), to);
+  });
+
+  it('takes the reservation only once', async () => {
+    const next = {x: 300, y: 200};
+    const {page} = stubPage({position: from});
+
+    reserveLeadPause(5_000);
+    const first = await travel(39, page, to);
+    const second = await travel(39, page, next);
+
+    assert.strictEqual(first.elapsedMs, 5_000);
+    // The second travel sets off from where the first left the pointer and
+    // pays for itself: the reservation belonged to the action before it.
+    assert.strictEqual(second.elapsedMs, pathFromSeed(39, to, next).durationMs);
   });
 
   it('stops where it stands when the page interrupts it', async () => {

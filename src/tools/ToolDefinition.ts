@@ -316,8 +316,6 @@ export type ContextPage = Readonly<{
   /** Where the pointer stands on this page, if anything has moved it yet. */
   readonly pointerPosition: PointerPoint | undefined;
   setPointerPosition(position: PointerPoint): void;
-  /** The pause reserved for a travelling action, returned and cleared. */
-  takeLeadPause(): number;
 
   waitForEventsAfterAction(
     action: () => Promise<unknown>,

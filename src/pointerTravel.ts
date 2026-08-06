@@ -21,6 +21,7 @@ import {
   drawPointerPath,
   drawViewportEdgePoint,
   sleepMs,
+  takeLeadPause,
   type PointerPoint,
 } from './pacing.js';
 import type {CdpPage, ElementHandle} from './third_party/index.js';
@@ -83,8 +84,11 @@ async function pointerStart(page: ContextPage): Promise<PointerPoint> {
  * absorbed that way instead of being added to the path's drawn duration.
  *
  * What is left of the pause reserved before the action is waited out first, so
- * the action costs what it always cost: the pause, or the path when the path is
- * the longer of the two.
+ * the action costs what it always cost: the reserved rest of the pause, or the
+ * path when the path is the longer of the two. A travel that finds no
+ * reservation is one whose call site forgot to ask for one — it then pays the
+ * whole pause and the path on top of it, which is what the note in the log is
+ * about.
  *
  * The loop stops where it stands once the page it moves on has begun to leave
  * or has raised a dialog, like every other paced stream. Where it runs to the
@@ -97,7 +101,11 @@ export async function travelPaced(
 ): Promise<void> {
   const mouse = page.pptrPage.mouse;
   const path = drawPointerPath(await pointerStart(page), to);
-  await sleepMs(page.takeLeadPause() - path.durationMs);
+  const reservedMs = takeLeadPause();
+  if (reservedMs === 0 && path.points.length > 0) {
+    logger?.('the pointer travelled against a pause nobody reserved');
+  }
+  await sleepMs(reservedMs - path.durationMs);
   let dueAtMs = Date.now();
   for (const point of path.points) {
     if (currentInterruption()) {

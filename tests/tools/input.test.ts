@@ -583,6 +583,67 @@ describe('input', () => {
     });
   });
 
+  describe('the pointer of a fill', () => {
+    const recordingForm = html`<input type="checkbox" /><input type="text" />
+      <script>
+        moves = [];
+        document.addEventListener('mousemove', event => {
+          moves.push([event.clientX, event.clientY]);
+        });
+      </script>`;
+
+    it('travels to a field it clicks and to no field it types into', async () => {
+      await withMcpContext(async (response, context) => {
+        const mcpPage = context.getSelectedMcpPage();
+        await mcpPage.pptrPage.setContent(recordingForm);
+        // Far enough from the two fields that the path has points to take.
+        mcpPage.setPointerPosition({x: 700, y: 500});
+        mcpPage.textSnapshot = await TextSnapshot.create(mcpPage);
+        const nodes = [...mcpPage.textSnapshot.idToNode.values()];
+        const checkbox = nodes.find(node => node.role === 'checkbox');
+        const textbox = nodes.find(node => node.role === 'textbox');
+        assert.ok(checkbox && textbox);
+
+        await fill.handler(
+          {params: {uid: checkbox.id, value: 'true'}, page: mcpPage},
+          response,
+          context,
+        );
+        const toTheCheckbox = (
+          (await mcpPage.pptrPage.evaluate('moves')) as unknown[]
+        ).length;
+        await mcpPage.pptrPage.evaluate('moves = []');
+        await fill.handler(
+          {params: {uid: textbox.id, value: 'typed'}, page: mcpPage},
+          new McpResponse({} as ParsedArguments),
+          context,
+        );
+        const toTheTextbox = (
+          (await mcpPage.pptrPage.evaluate('moves')) as unknown[]
+        ).length;
+
+        // A toggle takes its value from a click, so the pointer reaches it the
+        // way it reaches any click target, and the pause in front of the fill
+        // is drawn to pay for that path.
+        assert.ok(
+          toTheCheckbox >= 8,
+          `only ${toTheCheckbox} moves reached the checkbox`,
+        );
+        assert.strictEqual(
+          toTheTextbox,
+          0,
+          'the pointer travelled to a field that takes keystrokes',
+        );
+        assert.strictEqual(
+          await mcpPage.pptrPage.evaluate(
+            () => document.querySelector<HTMLInputElement>('input')?.checked,
+          ),
+          true,
+        );
+      });
+    });
+  });
+
   describe('hover', () => {
     it('hovers', async () => {
       await withMcpContext(async (response, context) => {
