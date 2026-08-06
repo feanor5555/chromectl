@@ -60,9 +60,21 @@ process.env['CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS'] = '1';
 const HOST = process.env['CHROMECTL_HOST'] ?? '0.0.0.0';
 const PORT = Number(process.env['CHROMECTL_PORT'] ?? 8091);
 
-/** Commands a caller may invoke: page operation plus page inspection. */
+/**
+ * Commands a caller may invoke: page selection, page operation and page
+ * inspection.
+ *
+ * `select_page` decides which of the browser's tabs the following commands act
+ * on. The selection lives in the daemon of that target — one MCP server process
+ * per session id holds it — so it stays in force for every further call against
+ * the same target until another `select_page`, until the selected tab is closed
+ * (the daemon then falls back to the first page) or until the daemon is
+ * replaced. Without it a caller could list the tabs but never leave the first
+ * one.
+ */
 const ALLOWED_COMMANDS = [
   'list_pages',
+  'select_page',
   'navigate_page',
   'click',
   'type_text',
