@@ -1278,8 +1278,16 @@ export const uploadFile = definePageTool({
     )) as ElementHandle<HTMLInputElement>;
 
     try {
-      await handle.uploadFile(filePath);
-    } catch {
+      // Handing the file over is a command like any other, and a renderer that
+      // has stopped answering holds it just as long, so it is dispatched under
+      // the signal that gives up on it.
+      await abandonIfBlocked(handle.uploadFile(filePath));
+    } catch (error) {
+      if (error instanceof InteractionInterruptedError) {
+        // Nothing about the element failed here: the page stopped answering,
+        // and clicking it would dispatch into the same silence.
+        throw error;
+      }
       // Some sites use a proxy element to trigger file upload instead of
       // a type=file element. In this case, we want to default to
       // Page.waitForFileChooser() and upload the file this way.
@@ -1298,18 +1306,27 @@ export const uploadFile = definePageTool({
         const [fileChooser] = await Promise.all([
           request.page.pptrPage.waitForFileChooser({timeout: 3000}),
           (async () => {
-            await mouse.up(pressOptions(1));
+            await abandonIfBlocked(mouse.up(pressOptions(1)));
             buttonIsDown = false;
           })(),
         ]);
-        await fileChooser.accept([filePath]);
-      } catch {
+        await abandonIfBlocked(fileChooser.accept([filePath]));
+      } catch (error) {
+        if (error instanceof InteractionInterruptedError) {
+          // The page stopped the interaction, and that is what the caller has
+          // to read: the element is not what failed and may well take a file.
+          throw error;
+        }
         throw new Error(
           `Failed to upload file. The element could not accept the file directly, and clicking it did not trigger a file chooser.`,
         );
       } finally {
+        // A press that never reached its release would leave the button down
+        // for every later interaction with the page.
         if (buttonIsDown) {
-          await mouse.up(pressOptions(1)).catch(() => undefined);
+          await releaseAfterAction(request.page, () =>
+            mouse.up(pressOptions(1)),
+          );
         }
       }
     }
