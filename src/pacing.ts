@@ -144,6 +144,23 @@ export const ACTION_OVERHEAD_MS =
 export const BUDGET_SAFETY_FACTOR = 1.5;
 
 /**
+ * Longest a single CDP command may stay unanswered before the connection gives
+ * up on it. Puppeteer's own default is 180 s, which is the whole ceiling a call
+ * queued behind this one may wait — so a command that never comes back holds
+ * the browser for three minutes and the caller is told nothing about why.
+ *
+ * The bound is the worst case of one paced action with the same margin the
+ * budget grants, not the per-call budget: a call may legitimately last as long
+ * as the text it types, a single CDP command may not. It sits above the 10 s a
+ * navigation is given and below the 60 s floor of a call, so a tool's own
+ * timeout still fires first and this one is left for what no timeout covers —
+ * a renderer paused by a dialog, which answers nothing at all.
+ */
+export const PROTOCOL_TIMEOUT_MS = Math.ceil(
+  ACTION_OVERHEAD_MS * BUDGET_SAFETY_FACTOR,
+);
+
+/**
  * No call is granted less than this. A call that types nothing keeps the
  * ceiling it has always had, and a daemon that hangs still ends.
  */

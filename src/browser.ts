@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import {PROTOCOL_TIMEOUT_MS} from './pacing.js';
 import type {
   Browser,
   ChromeReleaseChannel,
@@ -66,6 +67,10 @@ export async function ensureBrowserConnected(options: {
     handleDevToolsAsPage: true,
     blocklist: options.blocklist,
     allowlist: options.allowlist,
+    // A CDP command that is never answered — a keystroke sent to a renderer a
+    // modal dialog has paused — would otherwise hold the browser for puppeteer's
+    // default of 180 s, the whole time a queued call may wait.
+    protocolTimeout: PROTOCOL_TIMEOUT_MS,
   };
 
   let autoConnect = false;

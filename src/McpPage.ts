@@ -63,6 +63,12 @@ import {
   createTargetUniverse,
   type TargetUniverse,
 } from './devtools/DevtoolsUtils.js';
+import {
+  abandonIfBlocked,
+  InteractionInterruptedError,
+  observeInterruptions,
+  observeRendererBlock,
+} from './interruption.js';
 import {pauseBeforeAction, settleAfterAction} from './pacing.js';
 import {
   ConsoleCollector,
@@ -74,6 +80,7 @@ import {TextSnapshot} from './TextSnapshot.js';
 import type {Locator} from './third_party/index.js';
 import {
   PredefinedNetworkConditions,
+  type CdpPage,
   type Dialog,
   type ElementHandle,
   type Viewport,
@@ -89,6 +96,25 @@ import {takeSnapshot} from './tools/snapshot.js';
 import type {ToolGroups} from './tools/thirdPartyDeveloper.js';
 const DEFAULT_TIMEOUT = 5_000;
 const NAVIGATION_TIMEOUT = 10_000;
+
+/**
+ * The navigation types the expectation over the trigger does not count. The set
+ * is upstream's own (`WaitForHelper.waitForNavigationStarted`), kept identical
+ * so the observation over the prepare stage reports what the window over the
+ * trigger would have reported had the navigation started a moment later.
+ */
+const UNCOUNTED_NAVIGATION_TYPES: ReadonlySet<string> = new Set([
+  'historySameDocument',
+  'historyDifferentDocument',
+  'sameDocument',
+]);
+
+/**
+ * How long a navigation that started during the prepare stage is waited out.
+ * The same figure the helper grants a navigation it saw itself, scaled by the
+ * same network multiplier.
+ */
+const PREPARE_NAVIGATION_TIMEOUT = 3_000;
 import type {
   ContextPage,
   DevToolsData,
@@ -472,6 +498,20 @@ export class McpPage implements ContextPage {
    * the element and the keystrokes leading up to the last one, so a pause taken
    * after that would fall between the second-to-last and the last keystroke of
    * a stream, or between a press and its release.
+   *
+   * Everything the prepare stage does is visible to the page — the first click
+   * of a double click, every keystroke of a fill but the last, the selection
+   * that clears a field, the drag that picks an element up — so the page can
+   * start navigating or raise a dialog while it runs, in front of the window
+   * that only covers the trigger. Both are therefore watched for over the
+   * prepare stage itself, and both stop the paced stream where it stands.
+   *
+   * The dialog is watched for over the trigger as well, one step further than
+   * the prepare stage: it pauses the renderer, and the input command in flight
+   * when it opens is answered only once someone handles it. Nothing of what the
+   * trigger reports is lost by giving up on that command — a trigger's return
+   * value is never read — and the dialog itself is what the helper and the
+   * response report.
    */
   async waitForEventsAfterTrigger(
     prepare: () => Promise<() => Promise<unknown>>,
@@ -482,8 +522,148 @@ export class McpPage implements ContextPage {
     },
   ): Promise<WaitForEventsResult> {
     await pauseBeforeAction();
-    const trigger = await prepare();
-    return await this.#waitForEvents(trigger, options);
+    const block = this.#observeRendererBlock();
+    try {
+      const watch = this.#watchPrepareStage();
+      let trigger: () => Promise<unknown>;
+      try {
+        trigger = await prepare();
+      } finally {
+        watch.stop();
+      }
+
+      const dialog = watch.openedDialog();
+      if (dialog) {
+        // The renderer is paused and no input tool hands the helper a dialog
+        // action, so the dialog stays open and the trigger is not sent after
+        // it: a keystroke dispatched into a paused renderer reaches nothing
+        // until someone handles the dialog.
+        throw new InteractionInterruptedError(
+          `A dialog opened while the interaction was being carried out (${dialog.type()}: ${dialog.message()}). What was left of it never reached the page, and the dialog is still open.`,
+        );
+      }
+
+      if (!watch.navigationStarted()) {
+        return await this.#waitForEvents(
+          () => abandonIfBlocked(trigger()),
+          options,
+        );
+      }
+      return await this.#finishAfterNavigationDuringPrepare(trigger);
+    } finally {
+      block.stop();
+    }
+  }
+
+  /**
+   * Watches for the renderer being paused by a dialog, for as long as one
+   * action dispatches anything. What the paced helpers take from it is a signal
+   * rather than a state, because it has to arrive while a command is in flight:
+   * that command is the one the dialog is holding.
+   */
+  #observeRendererBlock(): {stop: () => void} {
+    let rendererBlocked: () => void;
+    const blocked = new Promise<void>(resolve => {
+      rendererBlocked = resolve;
+    });
+    const onDialog = (): void => {
+      rendererBlocked();
+    };
+    this.pptrPage.on('dialog', onDialog);
+    const restore = observeRendererBlock(blocked);
+    return {
+      stop: (): void => {
+        restore();
+        this.pptrPage.off('dialog', onDialog);
+      },
+    };
+  }
+
+  /**
+   * Watches the prepare stage for the two things that make the rest of a paced
+   * stream pointless or unsafe, and exposes them to that stream as one
+   * interruption check.
+   *
+   * The navigation is read from the page's own session, so the observation
+   * costs no round trip and needs no upstream file; the dialog is read from the
+   * listener this class already keeps. Only a dialog that opened while the
+   * watch ran counts, because a dialog left over from an earlier call is what
+   * `throwIfDialogOpen` reports before the tool starts.
+   */
+  #watchPrepareStage(): {
+    stop: () => void;
+    navigationStarted: () => boolean;
+    openedDialog: () => Dialog | undefined;
+  } {
+    let navigationStarted = false;
+    const dialogBefore = this.#dialog;
+    const client = (this.pptrPage as unknown as CdpPage)._client();
+    const onFrameStartedNavigating = (
+      event: Protocol.Page.FrameStartedNavigatingEvent,
+    ): void => {
+      if (UNCOUNTED_NAVIGATION_TYPES.has(event.navigationType)) {
+        return;
+      }
+      navigationStarted = true;
+    };
+    client.on('Page.frameStartedNavigating', onFrameStartedNavigating);
+
+    const openedDialog = (): Dialog | undefined => {
+      const dialog = this.#dialog;
+      if (!dialog || dialog === dialogBefore || dialog.handled) {
+        return undefined;
+      }
+      return dialog;
+    };
+    const restoreInterruptionCheck = observeInterruptions(() => {
+      if (navigationStarted) {
+        return 'navigation';
+      }
+      return openedDialog() ? 'dialog' : undefined;
+    });
+
+    return {
+      stop: (): void => {
+        restoreInterruptionCheck();
+        client.off('Page.frameStartedNavigating', onFrameStartedNavigating);
+      },
+      navigationStarted: (): boolean => navigationStarted,
+      openedDialog,
+    };
+  }
+
+  /**
+   * Ends an action whose page began to navigate before the trigger ran. The
+   * helper is not entered at all: its expectation is armed when it is entered
+   * and the navigation is already under way, so it would wait out its window
+   * for a start that has happened and report nothing.
+   *
+   * The trigger is still run, so the bookkeeping the caller hung on it — a
+   * mouse button left down for it to release — is completed. What it fails at
+   * is the document that is leaving, which is why its failure is logged rather
+   * than raised: the call's result is the navigation, not the last keystroke of
+   * a page nobody will see again.
+   */
+  async #finishAfterNavigationDuringPrepare(
+    trigger: () => Promise<unknown>,
+  ): Promise<WaitForEventsResult> {
+    try {
+      await abandonIfBlocked(trigger());
+    } catch (error) {
+      logger?.('the trigger failed on a page that was already leaving', error);
+    }
+    const networkMultiplier = getNetworkMultiplierFromString(
+      this.networkConditions,
+    );
+    try {
+      await this.pptrPage.waitForNavigation({
+        timeout: PREPARE_NAVIGATION_TIMEOUT * networkMultiplier,
+      });
+    } catch (error) {
+      logger?.('no navigation completed after one had started', error);
+    }
+    await settleAfterAction();
+    return {navigatedToUrl: this.pptrPage.url()};
   }
 
   dispose(): void {

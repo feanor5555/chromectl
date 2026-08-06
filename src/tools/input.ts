@@ -9,6 +9,11 @@
 import process from 'node:process';
 
 import {
+  abandonIfBlocked,
+  currentInterruption,
+  InteractionInterruptedError,
+} from '../interruption.js';
+import {
   currentPace,
   drawKeyHoldMs,
   drawMouseHoldMs,
@@ -97,6 +102,13 @@ let useRightShift = false;
  * `continuesStream` says that this text picks up an earlier piece of the same
  * stream, so the gap of the key before it is still owed and is waited out
  * before the first character.
+ *
+ * The stream stops where it stands once the page it types into has begun to
+ * leave: the test sits at the gap between two keys, where the stream is idle
+ * anyway, and reads a field rather than asking the browser anything. A dialog
+ * cannot wait for that gap, because the keystroke that raised it is the one it
+ * is holding, so every keystroke is dispatched under the signal that gives up
+ * on a command the renderer will not answer.
  */
 async function typePaced(
   keyboard: Keyboard,
@@ -105,6 +117,9 @@ async function typePaced(
 ): Promise<void> {
   let gapOwed = options.continuesStream ?? false;
   for (const character of text) {
+    if (currentInterruption()) {
+      return;
+    }
     if (gapOwed) {
       await sleepKeyIntervalMs();
     }
@@ -112,18 +127,18 @@ async function typePaced(
     const holdMs = drawKeyHoldMs();
     if (!isKeyboardKey(character)) {
       await sleepMs(holdMs);
-      await keyboard.sendCharacter(character);
+      await abandonIfBlocked(keyboard.sendCharacter(character));
     } else if (SHIFTED_CHARACTERS.has(character)) {
       const shift: KeyInput = useRightShift ? 'ShiftRight' : 'ShiftLeft';
       useRightShift = !useRightShift;
-      await keyboard.down(shift);
+      await abandonIfBlocked(keyboard.down(shift));
       try {
-        await keyboard.press(character, {delay: holdMs});
+        await abandonIfBlocked(keyboard.press(character, {delay: holdMs}));
       } finally {
-        await keyboard.up(shift);
+        await abandonIfBlocked(keyboard.up(shift));
       }
     } else {
-      await keyboard.press(character, {delay: holdMs});
+      await abandonIfBlocked(keyboard.press(character, {delay: holdMs}));
     }
   }
 }
@@ -200,18 +215,29 @@ async function pressPacedAt(
  * are not sent in the same instant. `mouse.click` reaches neither of those —
  * its single `delay` is the dwell of the last press and it leaves the earlier
  * ones and the gap between them at zero.
+ *
+ * A click of the sequence that set the page moving is the last one: the test
+ * sits in the gap before the next press, so no further button goes down on a
+ * document that is leaving. What is left down then is nothing, and the release
+ * the caller holds fails against a button that is not pressed — which is why
+ * that release is run where such a failure is expected. A dialog is not waited
+ * for at the gap but given up on where the press stands, because the press is
+ * what it holds.
  */
 async function pressButtonPaced(
   mouse: Mouse,
   clickCount: number,
 ): Promise<void> {
   for (let count = 1; count < clickCount; count++) {
-    await mouse.down(pressOptions(count));
+    await abandonIfBlocked(mouse.down(pressOptions(count)));
     await sleepMs(drawMouseHoldMs());
-    await mouse.up(pressOptions(count));
+    await abandonIfBlocked(mouse.up(pressOptions(count)));
     await sleepMouseClickGapMs();
+    if (currentInterruption()) {
+      return;
+    }
   }
-  await mouse.down(pressOptions(clickCount));
+  await abandonIfBlocked(mouse.down(pressOptions(clickCount)));
   await sleepMs(drawMouseHoldMs());
 }
 
@@ -493,6 +519,11 @@ async function focusedElement(
 }
 
 function handleActionError(error: unknown, uid: string): never {
+  if (error instanceof InteractionInterruptedError) {
+    // Nothing about the element failed here: the page stopped the interaction,
+    // and what stopped it is what the caller has to read.
+    throw error;
+  }
   logger?.('failed to act using a locator', error);
   const reason =
     error instanceof ElementNotReadyError
