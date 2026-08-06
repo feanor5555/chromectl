@@ -53,7 +53,6 @@
  *                          "full_speed": false}
  */
 
-import {randomBytes} from 'node:crypto';
 import {createWriteStream} from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -71,13 +70,34 @@ import {queuedCallBudgetMs} from '../build/src/pacing.js';
 
 import {
   assertKnownCommand,
-  COMMAND_SCHEMAS,
   COMMANDS,
-  enumeratedArgument,
   validateArgs,
   validateFullSpeed,
 } from './commands.mjs';
 import {CallError, STATUS_BY_KIND} from './errors.mjs';
+import {
+  extensionsOf,
+  FILE_ARGUMENTS,
+  reportExtension,
+} from './filearguments.mjs';
+import {
+  contentTypeFor,
+  FILE_ROUTE,
+  fileLocation,
+  generatedFileName,
+  generatedName,
+  GENERATED_DIRECTORY_NAME_PATTERN,
+  GENERATED_FILE_NAME_PATTERN,
+  MAX_FILE_NAME_LENGTH,
+  OUTPUT_DIR,
+  OUTPUT_DIR_MODE,
+  OUTPUT_FILE_MODE,
+  PLAIN_FILE_NAME_PATTERN,
+  SERVED_FILE_NAME_PATTERN,
+  SPILL_EXTENSION,
+  SPILL_RETENTION_MS,
+  STAGING_DIR_MODE,
+} from './filenames.mjs';
 import {
   listTargets,
   loadRegistry,
@@ -116,148 +136,6 @@ const PUBLIC_BASE = (
 ).replace(/\/+$/, '');
 
 /**
- * Where every file a call writes lands: `/home/wu/share/screenshots` on the
- * host the front runs on (`CHROMECTL_SCREENSHOT_DIR`), a directory of the house
- * network drive that is served over Samba and exported over NFS, so every
- * machine reaches the file the front only names. It is the single directory the
- * front lets a call write into, and every path the front hands the daemon
- * points inside it.
- */
-const OUTPUT_DIR =
-  process.env['CHROMECTL_SCREENSHOT_DIR'] ?? '/home/wu/share/screenshots';
-
-/** Root of the network drive, used to name the file share-relative. */
-const SHARE_ROOT = process.env['CHROMECTL_SHARE_ROOT'] ?? '/home/wu/share';
-
-/** Path prefix the front serves the files of earlier calls under. */
-const FILE_ROUTE = '/files/';
-
-/**
- * The daemon writes with mode 0600 and creates directories under the front's
- * umask. Both are widened afterwards: an NFS client arrives under its own uid
- * and would otherwise be handed a file it cannot read.
- */
-const OUTPUT_DIR_MODE = 0o775;
-const OUTPUT_FILE_MODE = 0o644;
-
-/**
- * Mode of a directory one call works in. Nothing but the front and the daemon it
- * started ever looks inside one, and both run as the same user, so it is theirs
- * alone; what comes out of it is moved into `OUTPUT_DIR` and made readable
- * there.
- */
-const STAGING_DIR_MODE = 0o700;
-
-/**
- * The longest name a caller may pick. A filesystem takes 255 bytes, and this
- * sits well under it, with room for the generated staging name that stands
- * beside a caller's own. The bound is what keeps a mistyped name a mistyped
- * name: without it such a name reaches the drive and comes back as
- * `ENAMETOOLONG`, which is indistinguishable from a drive that is broken.
- */
-const MAX_FILE_NAME_LENGTH = 128;
-
-/**
- * The only shape of file name a caller may name, for a file to be written as
- * well as for one to be read. It carries no directory separator and does not
- * start with a dot, so such a name can neither leave `OUTPUT_DIR` nor address
- * one of its parents, and `..` cannot be written at all.
- */
-const PLAIN_FILE_NAME_PATTERN = new RegExp(
-  `^[A-Za-z0-9][A-Za-z0-9._-]{0,${MAX_FILE_NAME_LENGTH - 1}}$`,
-);
-
-/**
- * The endings a file of this service carries. Every tool that writes one
- * enforces its own ending on the path it was handed (`McpContext.saveFile`
- * replaces whatever extension arrives), so this is that set, plus the one a
- * spilled result gets. Demanding the ending on a name a caller picks keeps the
- * path in the answer the path that lands on disk.
- *
- * The screenshot endings are the formats upstream declares for `take_screenshot`
- * rather than a copy of them. The rest a tool decides inside its own code, which
- * is nowhere declared, so those stay a list — one `assertExtensionsAccountedFor`
- * holds against what the tables can actually produce.
- */
-const FILE_EXTENSIONS = [
-  ...enumeratedArgument('take_screenshot', 'format').values,
-  'txt',
-  'json',
-  'json.gz',
-  'spill.json',
-  'heapsnapshot',
-  'network-request',
-  'network-response',
-  'mp4',
-  'webm',
-  'html',
-];
-
-const EXTENSION_ALTERNATION = FILE_EXTENSIONS.map(extension =>
-  extension.replaceAll('.', '\\.'),
-).join('|');
-
-/** The stem of every name the front builds itself: target, moment, randomness. */
-const GENERATED_NAME_STEM =
-  'chromectl-[A-Za-z0-9-]+-[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}';
-
-/**
- * The longest name a file of this service can carry: what a filesystem takes,
- * so nothing that exists on the drive is excluded. A generated name carries the
- * name of its target, and a tighter bound would tie fetchability to how long
- * that name is. Beyond it a name only reaches the drive to come back as
- * `ENAMETOOLONG`, which is indistinguishable from a drive that is broken.
- */
-const MAX_SERVED_FILE_NAME_LENGTH = 255;
-
-/** A file of this service: a plain name with an ending the front knows. */
-const SERVED_FILE_NAME_PATTERN = new RegExp(
-  `^(?=.{1,${MAX_SERVED_FILE_NAME_LENGTH}}$)` +
-    `[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:${EXTENSION_ALTERNATION})$`,
-);
-
-/** The file names the front builds itself. */
-const GENERATED_FILE_NAME_PATTERN = new RegExp(
-  `^${GENERATED_NAME_STEM}\\.(?:${EXTENSION_ALTERNATION})$`,
-);
-
-/**
- * The directory names the front builds itself: the same stem without an ending,
- * which is what a call's staging directory carries and no file of the front does.
- */
-const GENERATED_DIRECTORY_NAME_PATTERN = new RegExp(`^${GENERATED_NAME_STEM}$`);
-
-const CONTENT_TYPE_BY_EXTENSION = {
-  png: 'image/png',
-  jpeg: 'image/jpeg',
-  webp: 'image/webp',
-  txt: 'text/plain; charset=utf-8',
-  json: 'application/json; charset=utf-8',
-  'json.gz': 'application/gzip',
-  'spill.json': 'application/json; charset=utf-8',
-  heapsnapshot: 'application/json; charset=utf-8',
-  'network-request': 'application/octet-stream',
-  'network-response': 'application/octet-stream',
-  mp4: 'video/mp4',
-  webm: 'video/webm',
-  html: 'text/html; charset=utf-8',
-};
-
-/**
- * What a file is served as. The longest known ending a name carries decides, so
- * `.json.gz` is not read as the `.json` it also ends in.
- */
-function contentTypeFor(fileName) {
-  const extension = FILE_EXTENSIONS.filter(candidate =>
-    fileName.endsWith(`.${candidate}`),
-  ).sort((left, right) => right.length - left.length)[0];
-  return CONTENT_TYPE_BY_EXTENSION[extension] ?? 'application/octet-stream';
-}
-
-/** The ending a spilled result carries, which is what the pruning goes by. */
-const SPILL_EXTENSION = 'spill.json';
-
-/**
  * From how many bytes of rendered result on the answer names a file instead of
  * carrying the result: an operator setting, like the pacing figures, not a
  * measurement. It sits well above a routine snapshot, which is the caller's
@@ -288,27 +166,6 @@ if (!Number.isInteger(SPILL_BYTES) || SPILL_BYTES <= 0) {
  * that is being sent to fill this process's memory.
  */
 const REQUEST_BYTES = 1_048_576;
-
-/**
- * How long a spilled result stays on the drive.
- *
- * A spilled file is the only one nobody asked for: the caller wanted the result
- * in its answer, and the file exists because the answer could not carry it — the
- * text of a permanently logged-in page among them, as a world-readable file on a
- * password-less share. It therefore expires, while a screenshot and a
- * caller-named snapshot are artifacts someone asked for and stay until someone
- * removes them.
- */
-const SPILL_RETENTION_MS = Number(
-  process.env['CHROMECTL_SPILL_RETENTION_MS'] ?? 86_400_000,
-);
-if (!Number.isInteger(SPILL_RETENTION_MS) || SPILL_RETENTION_MS <= 0) {
-  // A typo here would read as "keeps them forever", which is the exposure the
-  // retention exists to end, so it is a startup fault.
-  throw new Error(
-    `CHROMECTL_SPILL_RETENTION_MS must be a positive whole number of milliseconds, got ${JSON.stringify(process.env['CHROMECTL_SPILL_RETENTION_MS'])}`,
-  );
-}
 
 /** How much of a spilled result the answer still carries, in characters. */
 const SPILL_HEAD_CHARS = 2_048;
@@ -366,7 +223,10 @@ const BROWSER_LINK_GONE = /^(Not connected|MCP client not initialized)$/;
  * every file-writing tool is confined to `/tmp`. The widening is safe here
  * because the front is the layer that confines the path: no path a caller sends
  * is forwarded, the front fills every path argument in itself and every file it
- * lets a call write or read stays in `OUTPUT_DIR`.
+ * lets a call write or read stays in `OUTPUT_DIR`. `FILE_ARGUMENTS` in
+ * `filearguments.mjs` is where that confinement is declared, and the check
+ * beside it is what refuses to start the front while one argument of the
+ * command table is unaccounted for.
  */
 const DAEMON_ARGS = [
   '--viaCli',
@@ -809,42 +669,6 @@ async function renderToolResult(result) {
 }
 
 /**
- * Builds the name of one entry the front creates: the target the call ran on,
- * the UTC moment down to the millisecond and eight random hex characters. Two
- * calls running at the same time therefore cannot land on the same name even
- * within one millisecond. The name carries no colons, so a Windows client
- * reaching the drive over Samba can open it.
- *
- * A target name without a single letter or digit slugs to nothing, and a name
- * with an empty slug is not one `GENERATED_FILE_NAME_PATTERN` matches: the file
- * would sit on the drive while the URL in the answer came back a 400. The
- * registry lets no such name through today (`TARGET_PATTERN` demands a letter or
- * digit first), so the fixed slug is what keeps the two patterns tied to each
- * other rather than to that rule.
- */
-function generatedName(target) {
-  const slug =
-    target.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'target';
-  const stamp = new Date().toISOString().replace(/[-:.]/g, '');
-  return `chromectl-${slug}-${stamp}-${randomBytes(4).toString('hex')}`;
-}
-
-/** The same name with the ending the file it stands for carries. */
-function generatedFileName(target, extension) {
-  return `${generatedName(target)}.${extension}`;
-}
-
-/**
- * The address a written file is fetched under. Every name the front hands out
- * is made of letters, digits, dot, underscore and hyphen, so the encoding
- * changes nothing; it is applied so that the answer stays a URL whatever a name
- * ever comes to carry.
- */
-function fileUrl(publicBase, fileName) {
-  return `${publicBase}${FILE_ROUTE}${encodeURIComponent(fileName)}`;
-}
-
-/**
  * Removes what the front left behind and has outlived `SPILL_RETENTION_MS`:
  * spilled results and staging directories.
  *
@@ -926,322 +750,6 @@ async function ensureOutputDir() {
   // sure: the expiry rides along with it instead of on a timer.
   await pruneExpiredEntries();
 }
-
-/** The heap snapshot a reader tool is pointed at: written by an earlier call. */
-const HEAP_SNAPSHOT_INPUT = {direction: 'in', extensions: ['heapsnapshot']};
-
-/**
- * The path arguments of every command, and what the front does with each.
- *
- * `out` is a file the daemon writes. The directory is the front's decision and a
- * caller names at most the file, so the answer can hand back a location the
- * caller actually reaches; the name lands in the answer under `kind`, with a
- * fetch URL beside it. `always` marks an argument the front fills in whether or
- * not the caller named one, because the payload would otherwise travel inline or
- * into a temp directory nobody can reach — the image of a screenshot, the video
- * of a recording. `optional` marks a file a tool writes only when the page had
- * the content it would hold, so its absence is a result and not a failure.
- * `deferred` marks the one whose file is finished by a later call; that one is
- * never optional, since the call finishing it is the call that promised it.
- *
- * `extensions` are the endings a tool enforces, the first of them the one a name
- * the front builds itself carries. `extensionsFrom` stands in its place where
- * the ending is the format the caller asked for: it names the argument that
- * carries it, and both the ending and the fallback come out of the command
- * table instead of being written down here a second time.
- *
- * `out-dir` is a directory a tool fills with files of its own naming. The front
- * hands it one of its own, takes the files named in `reports` out of it
- * afterwards and removes it.
- *
- * `in` is a file the daemon reads, `in-dir` a directory it reads. Both are
- * looked up in `OUTPUT_DIR`: that directory lies on the network drive every
- * machine reaches, so a caller on another machine puts the file there — or an
- * earlier call of its own wrote it — and names it here.
- *
- * The heap snapshot readers are derived from the command table instead of being
- * listed, so an upstream bump brings its new ones along.
- */
-const FILE_ARGUMENTS = {
-  take_screenshot: {
-    filePath: {
-      direction: 'out',
-      kind: 'screenshot',
-      always: true,
-      extensionsFrom: 'format',
-    },
-  },
-  take_snapshot: {
-    filePath: {direction: 'out', kind: 'snapshot', extensions: ['txt']},
-  },
-  evaluate_script: {
-    filePath: {direction: 'out', kind: 'output', extensions: ['json']},
-  },
-  take_heapsnapshot: {
-    filePath: {
-      direction: 'out',
-      kind: 'heapsnapshot',
-      extensions: ['heapsnapshot'],
-    },
-  },
-  performance_start_trace: {
-    filePath: {
-      direction: 'out',
-      kind: 'trace',
-      extensions: ['json', 'json.gz'],
-      optional: true,
-    },
-  },
-  performance_stop_trace: {
-    filePath: {
-      direction: 'out',
-      kind: 'trace',
-      extensions: ['json', 'json.gz'],
-      optional: true,
-    },
-  },
-  get_network_request: {
-    requestFilePath: {
-      direction: 'out',
-      kind: 'request_body',
-      extensions: ['network-request'],
-      optional: true,
-    },
-    responseFilePath: {
-      direction: 'out',
-      kind: 'response_body',
-      extensions: ['network-response'],
-      optional: true,
-    },
-  },
-  screencast_start: {
-    filePath: {
-      direction: 'out',
-      kind: 'recording',
-      always: true,
-      deferred: true,
-      extensions: ['mp4', 'webm'],
-    },
-  },
-  lighthouse_audit: {
-    outputDirPath: {
-      direction: 'out-dir',
-      always: true,
-      reports: {'report.json': 'report_json', 'report.html': 'report_html'},
-    },
-  },
-  upload_file: {filePath: {direction: 'in', staged: true}},
-  install_extension: {path: {direction: 'in-dir'}},
-  close_heapsnapshot: {filePath: HEAP_SNAPSHOT_INPUT},
-  compare_heapsnapshots: {
-    baseFilePath: HEAP_SNAPSHOT_INPUT,
-    currentFilePath: HEAP_SNAPSHOT_INPUT,
-  },
-};
-
-for (const command of COMMANDS) {
-  if (command.startsWith('get_heapsnapshot_')) {
-    FILE_ARGUMENTS[command] = {filePath: HEAP_SNAPSHOT_INPUT};
-  }
-}
-
-/**
- * The endings one path argument may carry in one call: the format the caller
- * asked for where the tool names its output by one, the fixed set otherwise. The
- * first is the ending a name the front builds itself gets.
- */
-function extensionsOf(command, spec, toolArgs) {
-  if (spec.extensionsFrom === undefined) {
-    return spec.extensions ?? [];
-  }
-  const {fallback} = enumeratedArgument(command, spec.extensionsFrom);
-  return [toolArgs[spec.extensionsFrom] ?? fallback];
-}
-
-/** Every ending one path argument can carry, over all calls a caller can make. */
-function possibleExtensionsOf(command, spec) {
-  if (spec.extensionsFrom === undefined) {
-    return spec.extensions ?? [];
-  }
-  return enumeratedArgument(command, spec.extensionsFrom).values;
-}
-
-/** The ending a report of an output directory carries: `report.json` is a json. */
-function reportExtension(name) {
-  return name.slice(name.indexOf('.') + 1);
-}
-
-/**
- * Every argument of the command table that carries no path on the machine the
- * front runs on: a uid, a page index, a key, the text to type, the source of a
- * script. It is the counterpart of `FILE_ARGUMENTS`, and between the two every
- * argument upstream declares is accounted for.
- *
- * The list is by argument name, and an upstream bump that gives an existing name
- * a new meaning is the one case it does not catch; the names here all carry
- * page-side data today and none of them is a filesystem path anywhere in the
- * table.
- */
-const NON_PATH_ARGUMENTS = new Set([
-  'action',
-  'args',
-  'autoStop',
-  'background',
-  'bringToFront',
-  'classIndex',
-  'colorScheme',
-  'cpuThrottlingRate',
-  'dblClick',
-  'device',
-  'dialogAction',
-  'extraHttpHeaders',
-  'filterName',
-  'format',
-  'from_uid',
-  'fullPage',
-  'function',
-  'geolocation',
-  'handleBeforeUnload',
-  'height',
-  'id',
-  'ignoreCache',
-  'includePreservedMessages',
-  'includePreservedRequests',
-  'includeSnapshot',
-  'initScript',
-  'input',
-  'insightName',
-  'insightSetId',
-  'isolatedContext',
-  'key',
-  'maxDepth',
-  'maxNodes',
-  'maxSiblings',
-  'mode',
-  'msgid',
-  'networkConditions',
-  'nodeId',
-  'objectId',
-  'pageId',
-  'pageIdx',
-  'pageSize',
-  'params',
-  'promptText',
-  'quality',
-  'reload',
-  'reqid',
-  'resourceTypes',
-  'serviceWorkerId',
-  'submitKey',
-  'text',
-  'timeout',
-  'to_uid',
-  'toolName',
-  'type',
-  'types',
-  'uid',
-  'url',
-  'userAgent',
-  'value',
-  'verbose',
-  'viewport',
-  'width',
-  'x',
-  'y',
-]);
-
-/**
- * Refuses to start while one argument of the command table is unaccounted for.
- *
- * The daemon runs with `--allowUnrestrictedPaths`, so a path that travelled
- * through as the caller wrote it would read and write wherever the front's user
- * can, from an endpoint that asks for no authentication. Every path argument the
- * front knows is filled in by the front itself, and the question is what happens
- * to the one it does not know yet: an upstream bump adds a tool, its arguments
- * pass `validateArgs` because they are in the schema, and nothing else stands
- * between them and the daemon.
- *
- * The check is therefore against the two tables rather than against how an
- * argument is spelled — upstream names its path arguments `…Path` today, but
- * that is upstream's habit and not a property this fork may rest on. An argument
- * that is in neither table stops the front at startup, which is the loud failure
- * a merge is looked at again after; the alternative is a silent path escape at
- * the moment nobody is looking. Clearing it is one entry: into `FILE_ARGUMENTS`
- * when the argument carries a path, into `NON_PATH_ARGUMENTS` when it does not.
- */
-function assertArgumentsAccountedFor() {
-  const unaccounted = [];
-  for (const [command, schema] of COMMAND_SCHEMAS) {
-    for (const argument of Object.keys(schema)) {
-      if (
-        FILE_ARGUMENTS[command]?.[argument] ||
-        NON_PATH_ARGUMENTS.has(argument)
-      ) {
-        continue;
-      }
-      unaccounted.push(`${command}.${argument}`);
-    }
-  }
-  if (unaccounted.length > 0) {
-    throw new Error(
-      `unknown tool arguments, each has to be entered into FILE_ARGUMENTS or ` +
-        `into NON_PATH_ARGUMENTS before the front can serve them: ${unaccounted.join(', ')}`,
-    );
-  }
-}
-
-assertArgumentsAccountedFor();
-
-/**
- * Refuses to start while one ending a call can produce is unknown to the front.
- *
- * `FILE_EXTENSIONS` decides which names the file route hands out again and
- * `CONTENT_TYPE_BY_EXTENSION` what such a file is served as. A media type is
- * declared nowhere upstream, so that table stays one kept here, and the endings
- * a call can produce are held against it: the values of the argument a tool
- * names its output by, the fixed endings of every other path argument, the
- * reports taken out of an output directory and the ending a spilled result
- * carries.
- *
- * Left unchecked, a file with such an ending is written, named in the answer and
- * then refused by the front's own file route with 400, or handed over as a
- * stream of bytes — both only at the moment a caller fetches it, long after the
- * merge that brought it. Clearing it is one entry per table.
- */
-function assertExtensionsAccountedFor() {
-  const unknown = new Map();
-  const note = (extension, source) => {
-    if (
-      FILE_EXTENSIONS.includes(extension) &&
-      CONTENT_TYPE_BY_EXTENSION[extension] !== undefined
-    ) {
-      return;
-    }
-    unknown.set(extension, source);
-  };
-  for (const [command, specs] of Object.entries(FILE_ARGUMENTS)) {
-    for (const [argument, spec] of Object.entries(specs)) {
-      for (const extension of possibleExtensionsOf(command, spec)) {
-        note(extension, `${command}.${argument}`);
-      }
-      for (const report of Object.keys(spec.reports ?? {})) {
-        note(reportExtension(report), `${command}.${argument}`);
-      }
-    }
-  }
-  note(SPILL_EXTENSION, 'a spilled result');
-  if (unknown.size > 0) {
-    const named = [...unknown]
-      .map(([extension, source]) => `.${extension} (${source})`)
-      .join(', ');
-    throw new Error(
-      `unknown file endings, each has to be entered into FILE_EXTENSIONS and ` +
-        `into CONTENT_TYPE_BY_EXTENSION before the front can serve them: ${named}`,
-    );
-  }
-}
-
-assertExtensionsAccountedFor();
 
 /**
  * The caller-chosen output names in flight, each with the browser that took it
@@ -1745,20 +1253,6 @@ async function removeStagedInputs(plan) {
       await removeStagingDirectory(input.directoryPath);
     }
   }
-}
-
-/**
- * Where a file is to be found. Every file carries a fetch URL: the client is
- * bash and curl, so the share path presumes a mount it may not have while the
- * URL is reachable wherever the call itself was sent from.
- */
-function fileLocation(fileName, filePath, publicBase) {
-  return {
-    file: fileName,
-    path: filePath,
-    share_path: path.relative(SHARE_ROOT, filePath),
-    url: fileUrl(publicBase, fileName),
-  };
 }
 
 /**

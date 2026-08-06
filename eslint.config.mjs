@@ -35,6 +35,11 @@ export default defineConfig([
 
       parserOptions: {
         projectService: {
+          // The files below sit outside the TypeScript program and are linted
+          // through the default project, whose match count is capped. The
+          // chromectl front is several modules, so the cap is lifted above the
+          // number of files that reach it; the slower lint run is the price.
+          maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 16,
           allowDefaultProject: [
             '.prettierrc.cjs',
             'puppeteer.config.cjs',
