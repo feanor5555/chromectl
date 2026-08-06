@@ -2,9 +2,9 @@
  * chromectl HTTP front.
  *
  * Takes a target name plus a command, drives the chrome-devtools daemon that
- * belongs to that target and returns the result in one envelope. It runs
- * without any authentication; the local network and the private overlay network
- * are the access boundary.
+ * belongs to the browser behind that name and returns the result in one
+ * envelope. It runs without any authentication; the local network and the
+ * private overlay network are the access boundary.
  *
  * The front speaks to the daemon over its unix socket in process, through
  * upstream's own daemon client (`build/src/daemon/client.js`), instead of
@@ -65,12 +65,12 @@ const PORT = Number(process.env['CHROMECTL_PORT'] ?? 8091);
  * inspection.
  *
  * `select_page` decides which of the browser's tabs the following commands act
- * on. The selection lives in the daemon of that target — one MCP server process
- * per session id holds it — so it stays in force for every further call against
- * the same target until another `select_page`, until the selected tab is closed
- * (the daemon then falls back to the first page) or until the daemon is
- * replaced. Without it a caller could list the tabs but never leave the first
- * one.
+ * on. The selection lives in the daemon of that browser — one MCP server
+ * process per session id holds it — so it stays in force for every further call
+ * reaching the same browser, under whichever of its names, until another
+ * `select_page`, until the selected tab is closed (the daemon then falls back
+ * to the first page) or until the daemon is replaced. Without it a caller could
+ * list the tabs but never leave the first one.
  */
 const ALLOWED_COMMANDS = [
   'list_pages',
@@ -222,7 +222,7 @@ async function assertTargetReachable(browserUrl) {
 }
 
 /**
- * Which daemon the front last put in place for a target, counted up on every
+ * Which daemon the front last put in place for a browser, counted up on every
  * start. A request notes the generation it sent its command under, so a socket
  * that breaks under it can be told apart: an unchanged generation means the
  * daemon itself failed, a changed one means another request swapped the daemon
@@ -231,15 +231,15 @@ async function assertTargetReachable(browserUrl) {
 const daemonGenerations = new Map();
 
 /**
- * Daemon starts and replacements in flight, keyed by session id. Two requests
- * for the same target that both find no daemon must not spawn two of them — the
- * second one exits on the pid file the first one wrote, and the request that
- * started it would then wait for a daemon that is gone. The same guard covers a
- * replacement, so a target that fails several requests at once is replaced once
- * and the freshly started daemon is not torn down again by the next one in
- * line. Requests arriving during a start or a replacement wait for it; tool
- * calls themselves stay parallel and serialize inside the daemon on its
- * process-wide tool mutex.
+ * Daemon starts and replacements in flight, keyed by session id — that is, per
+ * browser, whatever the requests called it. Two requests for the same browser
+ * that both find no daemon must not spawn two of them — the second one exits on
+ * the pid file the first one wrote, and the request that started it would then
+ * wait for a daemon that is gone. The same guard covers a replacement, so a
+ * browser that fails several requests at once is replaced once and the freshly
+ * started daemon is not torn down again by the next one in line. Requests
+ * arriving during a start or a replacement wait for it; tool calls themselves
+ * stay parallel and serialize inside the daemon on its process-wide tool mutex.
  */
 const daemonOperations = new Map();
 
@@ -247,7 +247,7 @@ function daemonGeneration(sessionId) {
   return daemonGenerations.get(sessionId) ?? 0;
 }
 
-/** Runs one lifecycle operation per target at a time; joiners await that one. */
+/** Runs one lifecycle operation per browser at a time; joiners await that one. */
 function withDaemonLifecycle(sessionId, operation) {
   const running = daemonOperations.get(sessionId);
   if (running) {
@@ -260,7 +260,7 @@ function withDaemonLifecycle(sessionId, operation) {
   return started;
 }
 
-/** Starts the daemon of one target; a daemon that came up is a new generation. */
+/** Starts the daemon of one browser; a daemon that came up is a new generation. */
 async function startTargetDaemon({browserUrl, sessionId}) {
   try {
     await startDaemon(
@@ -277,7 +277,7 @@ async function startTargetDaemon({browserUrl, sessionId}) {
   daemonGenerations.set(sessionId, daemonGeneration(sessionId) + 1);
 }
 
-/** Waits until the daemon process of one target is gone. */
+/** Waits until the daemon process of one browser is gone. */
 async function waitForDaemonGone(sessionId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (isDaemonRunning(sessionId)) {
@@ -290,7 +290,7 @@ async function waitForDaemonGone(sessionId, timeoutMs) {
 }
 
 /**
- * Takes the daemon of one target down. Its own `stop` command goes first, but
+ * Takes the daemon of one browser down. Its own `stop` command goes first, but
  * the daemon being replaced is exactly the one that may no longer be able to
  * carry it out, so an unanswered stop is followed by SIGTERM and finally
  * SIGKILL: a replacement must not hang on the corpse it replaces. A daemon that
@@ -329,7 +329,7 @@ async function stopTargetDaemon(sessionId) {
 }
 
 /**
- * A daemon per target, started on first use and reused afterwards. It may have
+ * A daemon per browser, started on first use and reused afterwards. It may have
  * died between two calls, so its liveness is checked per call — the check is a
  * pid file read plus a signal 0, not a process start. Returns the generation
  * the caller's command runs under.
