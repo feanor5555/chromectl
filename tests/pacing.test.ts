@@ -10,6 +10,7 @@ import {describe, it} from 'node:test';
 import sinon from 'sinon';
 
 import {
+  CALL_OVERHEAD_MS,
   callBudgetMs,
   CHARACTER_MAX_MS,
   currentPace,
@@ -30,10 +31,13 @@ import {
   PACE_HUMAN,
   PACING_SKEW,
   pacedSleep,
+  pauseAfterScroll,
   pauseBeforeAction,
   queuedCallBudgetMs,
   PRE_ACTION_PAUSE_MAX_MS,
   PRE_ACTION_PAUSE_MIN_MS,
+  SCROLL_PAUSE_MAX_MS,
+  SCROLL_PAUSE_MIN_MS,
   selectPace,
   sleepKeyIntervalMs,
   sleepMs,
@@ -56,6 +60,7 @@ describe('pacing', () => {
         [KEY_HOLD_MIN_MS, KEY_HOLD_MAX_MS],
         [KEY_INTERVAL_MIN_MS, KEY_INTERVAL_MAX_MS],
         [PRE_ACTION_PAUSE_MIN_MS, PRE_ACTION_PAUSE_MAX_MS],
+        [SCROLL_PAUSE_MIN_MS, SCROLL_PAUSE_MAX_MS],
         [MOUSE_HOLD_MIN_MS, MOUSE_HOLD_MAX_MS],
       ]) {
         for (const value of draw(SAMPLE_COUNT, minMs, maxMs)) {
@@ -174,6 +179,44 @@ describe('pacing', () => {
     });
   });
 
+  describe('the pause after a jump', () => {
+    it('is paid only when the page actually moved', async () => {
+      const before = Date.now();
+      assert.strictEqual(await pauseAfterScroll(false), 0);
+      assert.ok(
+        Date.now() - before < 50,
+        'an element already in the viewport waited',
+      );
+
+      const waited = await pauseAfterScroll(true);
+      assert.ok(
+        waited >= SCROLL_PAUSE_MIN_MS && waited <= SCROLL_PAUSE_MAX_MS,
+        `${waited} outside ${SCROLL_PAUSE_MIN_MS}..${SCROLL_PAUSE_MAX_MS}`,
+      );
+      assert.ok(Date.now() - before >= waited - 1);
+    });
+
+    it('is longer than the pause before an action', () => {
+      assert.ok(SCROLL_PAUSE_MIN_MS > PRE_ACTION_PAUSE_MAX_MS);
+    });
+
+    it('waits nothing at full speed', async () => {
+      const restore = selectPace(true);
+      try {
+        const before = Date.now();
+        assert.strictEqual(await pauseAfterScroll(true), 0);
+        assert.ok(Date.now() - before < 50);
+      } finally {
+        restore();
+      }
+      assert.deepStrictEqual(PACE_FULL.scrollPauseMs, [0, 0]);
+      assert.deepStrictEqual(PACE_HUMAN.scrollPauseMs, [
+        SCROLL_PAUSE_MIN_MS,
+        SCROLL_PAUSE_MAX_MS,
+      ]);
+    });
+  });
+
   describe('the call budget', () => {
     it('covers the worst case of a braked fill', () => {
       const value = 'a'.repeat(150);
@@ -195,6 +238,26 @@ describe('pacing', () => {
         KEY_HOLD_MAX_MS;
 
       assert.ok(callBudgetMs('type_text', {text}) > worstCaseMs);
+    });
+
+    it('covers a form of many short fields that each make the page jump', () => {
+      const value = 'a'.repeat(5);
+      const elements = Array.from({length: 20}, () => ({value}));
+      // Every element pays the pause before it, the pause after the page jumped
+      // to it, the select-all that clears it and its own characters.
+      const selectAllMs = KEY_HOLD_MAX_MS + 2 * KEY_INTERVAL_MAX_MS;
+      const worstCaseMs =
+        CALL_OVERHEAD_MS +
+        elements.length *
+          (PRE_ACTION_PAUSE_MAX_MS +
+            SCROLL_PAUSE_MAX_MS +
+            selectAllMs +
+            value.length * CHARACTER_MAX_MS);
+
+      assert.ok(
+        callBudgetMs('fill_form', {elements}) > worstCaseMs,
+        `${callBudgetMs('fill_form', {elements})} does not cover ${worstCaseMs}`,
+      );
     });
 
     it('falls back to the floor at full speed', () => {

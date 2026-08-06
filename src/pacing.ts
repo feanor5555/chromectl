@@ -16,10 +16,11 @@
  *
  * The figures the brake works to: a key stays down 70–140 ms, the gap to the
  * next press is 15–80 ms, and every paced action is preceded by a 250–700 ms
- * pause. The 400–900 ms settle window after an action waits for the page rather
- * than imitating a person and is part of the fixed overhead. Every one of those
- * intervals is drawn afresh through `drawPacingMs`, which is the single place
- * the brake takes a value from.
+ * pause. A target the page had to jump to costs a further 1000–1200 ms before
+ * the action follows. The 400–900 ms settle window after an action waits for the
+ * page rather than imitating a person and is part of the fixed overhead. Every
+ * one of those intervals is drawn afresh through `drawPacingMs`, which is the
+ * single place the brake takes a value from.
  *
  * A call passes two ceilings, not one, because it can stand in line before it
  * does anything: the wait for the process-wide tool mutex is capped by
@@ -68,6 +69,16 @@ export const CHARACTER_MAX_MS = KEY_HOLD_MAX_MS + KEY_INTERVAL_MAX_MS;
  */
 export const PRE_ACTION_PAUSE_MIN_MS = 250;
 export const PRE_ACTION_PAUSE_MAX_MS = 700;
+
+/**
+ * Shortest and longest pause after the view has jumped to bring the target into
+ * it. The jump reaches the page in one step, so what is waited out is not the
+ * travel but the moment after it: a person takes the new view in and finds the
+ * target in it before acting. It is longer than the pre-action pause because the
+ * whole view changed, and it is paid only when the page actually moved.
+ */
+export const SCROLL_PAUSE_MIN_MS = 1_000;
+export const SCROLL_PAUSE_MAX_MS = 1_200;
 
 /**
  * Shortest and longest a mouse button stays down on a paced click. It is short
@@ -133,6 +144,8 @@ export interface PaceProfile {
   readonly keyIntervalMs: readonly [number, number];
   /** The pause taken before an action reaches the page. */
   readonly preActionPauseMs: readonly [number, number];
+  /** The pause taken after the view has jumped to the target. */
+  readonly scrollPauseMs: readonly [number, number];
   /** How long the mouse button stays down on a click. */
   readonly mouseHoldMs: readonly [number, number];
   /**
@@ -149,6 +162,7 @@ export const PACE_HUMAN: PaceProfile = {
   keyHoldMs: [KEY_HOLD_MIN_MS, KEY_HOLD_MAX_MS],
   keyIntervalMs: [KEY_INTERVAL_MIN_MS, KEY_INTERVAL_MAX_MS],
   preActionPauseMs: [PRE_ACTION_PAUSE_MIN_MS, PRE_ACTION_PAUSE_MAX_MS],
+  scrollPauseMs: [SCROLL_PAUSE_MIN_MS, SCROLL_PAUSE_MAX_MS],
   mouseHoldMs: [MOUSE_HOLD_MIN_MS, MOUSE_HOLD_MAX_MS],
   fillsInOneShot: false,
 };
@@ -159,6 +173,7 @@ export const PACE_FULL: PaceProfile = {
   keyHoldMs: [0, 0],
   keyIntervalMs: [0, 0],
   preActionPauseMs: [0, 0],
+  scrollPauseMs: [0, 0],
   mouseHoldMs: [0, 0],
   fillsInOneShot: true,
 };
@@ -277,6 +292,19 @@ export function pauseBeforeAction(): Promise<number> {
   return sleepAtPace(activePace.preActionPauseMs);
 }
 
+/**
+ * The pause after the view has jumped to the target, taken before the action
+ * that needed the target proceeds. `scrolled` says whether the page moved at
+ * all: an element that was inside the viewport already costs nothing, because
+ * nothing about the view changed for anyone watching it.
+ */
+export async function pauseAfterScroll(scrolled: boolean): Promise<number> {
+  if (!scrolled) {
+    return 0;
+  }
+  return await sleepAtPace(activePace.scrollPauseMs);
+}
+
 /** The arguments of one tool call, as they arrive over the daemon socket. */
 type ToolArguments = Record<string, unknown>;
 
@@ -289,7 +317,10 @@ interface FormElement {
 interface PacedWork {
   /** Characters typed one by one. */
   characters: number;
-  /** Paced actions, each paying its own pre-action pause. */
+  /**
+   * Paced actions, each paying its own pre-action pause and, if the page has to
+   * jump to reach its target, the pause after that jump.
+   */
   actions: number;
 }
 
@@ -342,7 +373,7 @@ export function callBudgetMs(
   const {characters, actions} = pacedWork(tool, args ?? {});
   const work =
     CALL_OVERHEAD_MS +
-    actions * PRE_ACTION_PAUSE_MAX_MS +
+    actions * (PRE_ACTION_PAUSE_MAX_MS + SCROLL_PAUSE_MAX_MS) +
     characters * CHARACTER_MAX_MS;
   return Math.max(MIN_CALL_BUDGET_MS, Math.ceil(work * BUDGET_SAFETY_FACTOR));
 }

@@ -10,6 +10,7 @@ import {
   currentPace,
   drawKeyHoldMs,
   drawMouseHoldMs,
+  pauseAfterScroll,
   pauseBeforeAction,
   sleepKeyIntervalMs,
   sleepMs,
@@ -151,8 +152,9 @@ function pressOptions(clickCount: number): Readonly<MouseOptions> {
 /**
  * Brings the pointer onto the element and presses the button, and hands the
  * release back. Everything a click needs before the page can act on it — the
- * scroll into view, the wait for a bounding box that stops moving, the travel
- * of the pointer and the span the button stays down — happens here, because
+ * scroll into view, the pause after a jump, the wait for a bounding box that
+ * stops moving, the travel of the pointer and the span the button stays down —
+ * happens here, because
  * the page sees a completed click only on the release and the release is what
  * the caller runs under the navigation expectation.
  *
@@ -167,7 +169,9 @@ async function pressPaced(
   mouse: Mouse,
   clickCount: number,
 ): Promise<() => Promise<void>> {
-  await handle.asLocator().hover();
+  await approachInViewport(handle, async () => {
+    await handle.asLocator().hover();
+  });
   for (let count = 1; count < clickCount; count++) {
     await mouse.down(pressOptions(count));
     await mouse.up(pressOptions(count));
@@ -243,6 +247,27 @@ class ElementNotReadyError extends Error {
 }
 
 /**
+ * Runs an approach that brings the element into the viewport and waits out the
+ * pause that follows a jump. The page moves in one step — the locator ends in
+ * `DOM.scrollIntoViewIfNeeded`, which produces no wheel events and no
+ * intermediate positions — so what is paced is not the travel but the moment
+ * after it, and only when the page moved at all.
+ *
+ * Whether it moved is the locator's own precondition, which it checks and keeps
+ * to itself, so the same check is read here beforehand: one intersection test
+ * against the viewport, taken in the prepare stage where the other preconditions
+ * are checked too.
+ */
+async function approachInViewport(
+  handle: ElementHandle<Element>,
+  approach: () => Promise<void>,
+): Promise<void> {
+  const wasInViewport = await handle.isIntersectingViewport({threshold: 0});
+  await approach();
+  await pauseAfterScroll(!wasInViewport);
+}
+
+/**
  * Scrolls the element into the viewport and waits until it is there. The wait
  * is the locator's own; `scroll` without offsets writes nothing to the element
  * and is only the action that carries the condition, which is why the other
@@ -252,7 +277,9 @@ async function waitUntilInViewport(
   handle: ElementHandle<Element>,
 ): Promise<void> {
   try {
-    await handle.asLocator().setWaitForStableBoundingBox(false).scroll();
+    await approachInViewport(handle, async () => {
+      await handle.asLocator().setWaitForStableBoundingBox(false).scroll();
+    });
   } catch (error) {
     throw new ElementNotReadyError(
       'The element did not scroll into the viewport',
