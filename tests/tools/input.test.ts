@@ -521,6 +521,34 @@ describe('input', () => {
       });
     });
 
+    it('dispatches no burst at a spot the pointer already stands on', async () => {
+      await withMcpContext(async (response, context) => {
+        const mcpPage = context.getSelectedMcpPage();
+        await mcpPage.pptrPage.setContent(recordingPage);
+        const spot = {x: 120, y: 140};
+
+        await clickAt.handler(
+          {params: {...spot}, page: mcpPage},
+          response,
+          context,
+        );
+        await mcpPage.pptrPage.evaluate('moves = []; pressedAfter = -1');
+        await clickAt.handler(
+          {params: {...spot}, page: mcpPage},
+          new McpResponse({} as ParsedArguments),
+          context,
+        );
+
+        // A pointer that does not move produces no event at all on real
+        // hardware; what is left is the one move that carries the press.
+        assert.strictEqual(
+          await mcpPage.pptrPage.evaluate('pressedAfter'),
+          1,
+          'a path was travelled to a spot the pointer already stood on',
+        );
+      });
+    });
+
     it('remembers where it left the pointer for the next call', async () => {
       await withMcpContext(async (response, context) => {
         const mcpPage = context.getSelectedMcpPage();
@@ -538,12 +566,19 @@ describe('input', () => {
         const pressedAfter = (await mcpPage.pptrPage.evaluate(
           'pressedAfter',
         )) as number;
-        // The move in front of the press is the locator's own, which puts the
-        // pointer on the element; the one before it is where the path ended.
-        const lastOfPath = moves[pressedAfter - 2];
-        assert.ok(lastOfPath, 'the path dispatched no move of its own');
-        assert.ok(Math.abs(kept.x - lastOfPath[0]) <= 1);
-        assert.ok(Math.abs(kept.y - lastOfPath[1]) <= 1);
+        // What is written down is where the pointer ended up, which is the
+        // move in front of the press: the locator's own, which puts it on the
+        // element.
+        const lastMove = moves[pressedAfter - 1];
+        assert.ok(lastMove, 'nothing moved the pointer onto the element');
+        assert.ok(
+          Math.abs(kept.x - lastMove[0]) <= 1,
+          `${kept.x} was kept, ${lastMove[0]} was moved to`,
+        );
+        assert.ok(
+          Math.abs(kept.y - lastMove[1]) <= 1,
+          `${kept.y} was kept, ${lastMove[1]} was moved to`,
+        );
       });
     });
   });

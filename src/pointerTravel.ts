@@ -87,7 +87,9 @@ async function pointerStart(page: ContextPage): Promise<PointerPoint> {
  * the longer of the two.
  *
  * The loop stops where it stands once the page it moves on has begun to leave
- * or has raised a dialog, like every other paced stream.
+ * or has raised a dialog, like every other paced stream. Where it runs to the
+ * end, the target is written down as the pointer's place: the move that carries
+ * the interaction follows immediately and is what puts it exactly there.
  */
 export async function travelPaced(
   page: ContextPage,
@@ -106,6 +108,7 @@ export async function travelPaced(
     page.setPointerPosition(point);
     await sleepMs(dueAtMs - Date.now());
   }
+  page.setPointerPosition(to);
 }
 
 /** The same to an element's own point, resolved after it has been scrolled to. */
@@ -113,6 +116,25 @@ export async function travelToElement(
   page: ContextPage,
   handle: ElementHandle<Element>,
 ): Promise<void> {
-  const target = await answerOrAbandon(handle.clickablePoint());
-  await travelPaced(page, target);
+  await travelPaced(page, await answerOrAbandon(handle.clickablePoint()));
+}
+
+/**
+ * Writes down that the pointer now stands on this element, for an interaction
+ * that left it somewhere other than where it travelled to — a drag ends on the
+ * element it dropped onto, not on the one it picked up.
+ *
+ * It is a belief and nothing depends on it, so a point that cannot be resolved
+ * any more leaves the previous one standing rather than ending the call that
+ * has already done its work.
+ */
+export async function recordPointerOn(
+  page: ContextPage,
+  handle: ElementHandle<Element>,
+): Promise<void> {
+  try {
+    page.setPointerPosition(await answerOrAbandon(handle.clickablePoint()));
+  } catch (error) {
+    logger?.('failed to resolve where the pointer was left', error);
+  }
 }

@@ -25,7 +25,11 @@ import {
   sleepMs,
   travelsPointer,
 } from '../pacing.js';
-import {travelPaced, travelToElement} from '../pointerTravel.js';
+import {
+  recordPointerOn,
+  travelPaced,
+  travelToElement,
+} from '../pointerTravel.js';
 import {_keyDefinitions, zod} from '../third_party/index.js';
 import type {
   ElementHandle,
@@ -1235,6 +1239,11 @@ export const drag = definePageTool({
       // the interaction addresses.
       {frame: toHandle.frame},
     );
+    if (travelsPointer()) {
+      // The drag left the pointer on the element it dropped onto, which is
+      // where the next path sets off from.
+      await recordPointerOn(request.page, toHandle);
+    }
     response.appendResponseLine(`Successfully dragged an element`);
     response.attachWaitForResult(result);
     if (request.params.includeSnapshot) {

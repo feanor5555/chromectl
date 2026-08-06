@@ -129,12 +129,9 @@ describe('the pointer travel', () => {
       moves.map(move => ({x: move.x, y: move.y})),
       expected.points.map(point => ({x: point.x, y: point.y})),
     );
-    // The pointer ends the travel believing it stands on the last point of the
-    // path; the move that follows it is the one that carries the interaction.
-    assert.deepStrictEqual(position(), {
-      x: expected.points.at(-1)?.x,
-      y: expected.points.at(-1)?.y,
-    });
+    // The pointer ends the travel on its target rather than on the last point
+    // of the path: the move that follows is the one that puts it there.
+    assert.deepStrictEqual(position(), to);
     assert.strictEqual(elapsedMs, expected.durationMs);
   });
 
