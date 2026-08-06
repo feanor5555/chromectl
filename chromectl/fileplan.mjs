@@ -183,8 +183,8 @@ export function releaseOutputName(file) {
  * of them: its file is written until the stopping call renames it, so the claim
  * stays with the entry and is given back when that entry is dropped.
  *
- * Such an entry is not in this plan. `describeCallFiles` in `fileresult.mjs`
- * takes it out when it parks it as the running recording of a browser, and
+ * Such an entry is not in this plan: `detachPlanFile` takes it out where
+ * `fileresult.mjs` parks it as the running recording of a browser, and
  * `forgetRecording` gives the name back through `releaseOutputName` and settles
  * what the recording left.
  */
@@ -192,6 +192,18 @@ export function releaseOutputNames(plan) {
   for (const file of plan.files) {
     releaseOutputName(file);
   }
+}
+
+/**
+ * Takes one file out of a plan, so that nothing which settles or releases the
+ * plan reaches it any more.
+ *
+ * The plan gets a new array rather than having the entry taken out of the one
+ * it holds: a caller may be walking that array, and an iteration begun over it
+ * keeps the array it started on.
+ */
+export function detachPlanFile(plan, file) {
+  plan.files = plan.files.filter(entry => entry !== file);
 }
 
 /**

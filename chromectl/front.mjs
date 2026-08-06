@@ -90,9 +90,9 @@ import {
   settleLeftoverFiles,
 } from './fileplan.mjs';
 import {
+  concludeCall,
   describeCallFiles,
   forgetRecording,
-  RECORDING_STOP_COMMAND,
   reclassifyFileFailure,
   spillIfTooLarge,
   withFinalPaths,
@@ -600,7 +600,7 @@ async function carryOutCall(
 
     let described;
     try {
-      described = await describeCallFiles(plan, resolved, command, publicBase);
+      described = await describeCallFiles(plan, resolved, publicBase);
     } catch (error) {
       // A tool that reported success without the file it was told to write
       // leaves the same half-written state a failed call does: the staging name
@@ -637,12 +637,9 @@ async function carryOutCall(
     // nothing, and so is the name it took.
     await removeStagedInputs(plan);
     releaseOutputNames(plan);
-    // A stop ends the recording whether the call succeeded or failed: the
-    // browser is not recording afterwards either way, and a plan kept beyond it
-    // would be described by the next stop as a file this one already took.
-    if (command === RECORDING_STOP_COMMAND) {
-      await forgetRecording(resolved.sessionId);
-    }
+    // Whatever the call leaves running is ended where that is known: the front
+    // hands the plan over and never learns what a recording is.
+    await concludeCall(plan, resolved);
   }
 }
 

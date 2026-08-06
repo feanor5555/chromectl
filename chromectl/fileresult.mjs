@@ -13,10 +13,12 @@
  * large to answer with is written out and named instead.
  *
  * This module owns `recordings`, the one piece of state that outlives the call
- * that created it: a screencast is written until a later call stops it. From
- * outside, that map is reached through `forgetRecording(sessionId)` and through
- * nothing else — the daemon lifecycle drops the plan of a recording that can no
- * longer be running by calling it, and never learns what a recording is.
+ * that created it: a screencast is written until a later call stops it. The map
+ * is written only by `describeCallFiles`, on the one entry of a plan marked
+ * `deferred`, and an entry is dropped only by `forgetRecording`. Neither way in
+ * from outside learns what a recording is: `concludeCall` ends what a finished
+ * call leaves running, and the daemon lifecycle drops the plan of a recording
+ * that can no longer be running.
  */
 
 import fs from 'node:fs/promises';
@@ -33,6 +35,7 @@ import {
   SPILL_EXTENSION,
 } from './filenames.mjs';
 import {
+  detachPlanFile,
   ensureOutputDir,
   releaseOutputName,
   removeStagingDirectory,
@@ -86,7 +89,19 @@ const SPILL_HEAD_CHARS = 2_048;
 const recordings = new Map();
 
 /** The command that finishes a recording. */
-export const RECORDING_STOP_COMMAND = 'screencast_stop';
+const RECORDING_STOP_COMMAND = 'screencast_stop';
+
+/**
+ * Ends what one finished call leaves running. A stop ends the recording whether
+ * the call succeeded or failed: the browser is not recording afterwards either
+ * way, and a plan kept beyond it would be described by the next stop as a file
+ * this one already took.
+ */
+export async function concludeCall(plan, resolved) {
+  if (plan.command === RECORDING_STOP_COMMAND) {
+    await forgetRecording(resolved.sessionId);
+  }
+}
 
 /**
  * Drops the plan of a recording that can no longer be running and settles what
@@ -279,18 +294,22 @@ async function collectDirectoryFiles(directory, publicBase) {
  * recording a refused start is told about, which is the one already running and
  * not the one this call planned.
  */
-export async function describeCallFiles(plan, resolved, command, publicBase) {
+export async function describeCallFiles(plan, resolved, publicBase) {
   const descriptors = {};
   const replacements = [];
-  const parked = [];
 
   for (const file of plan.files) {
     if (file.deferred) {
       const running = recordings.get(resolved.sessionId);
       const started = running ?? file;
       if (running === undefined) {
-        parked.push(file);
+        // An entry parked as a running recording leaves the plan of the call
+        // that planned it, in the same breath as it is parked. Its file is
+        // written past the end of that call and its name stays taken until
+        // `forgetRecording` gives both back, so nothing that settles or
+        // releases the plan may reach it.
         recordings.set(resolved.sessionId, file);
+        detachPlanFile(plan, file);
       }
       descriptors[file.kind] = {
         ...fileLocation(started.fileName, started.filePath, publicBase),
@@ -305,15 +324,6 @@ export async function describeCallFiles(plan, resolved, command, publicBase) {
     }
   }
 
-  // An entry parked as a running recording leaves the plan of the call that
-  // planned it. Its file is written past the end of that call and its name stays
-  // taken until `forgetRecording` gives both back, so nothing that settles or
-  // releases the plan may reach it. The plan gets a new array rather than having
-  // entries taken out of the one just walked.
-  if (parked.length > 0) {
-    plan.files = plan.files.filter(file => !parked.includes(file));
-  }
-
   if (plan.directory) {
     for (const collected of await collectDirectoryFiles(
       plan.directory,
@@ -324,7 +334,7 @@ export async function describeCallFiles(plan, resolved, command, publicBase) {
     }
   }
 
-  if (command === RECORDING_STOP_COMMAND) {
+  if (plan.command === RECORDING_STOP_COMMAND) {
     const recording = recordings.get(resolved.sessionId);
     if (recording) {
       // A recording the front promised and that is not on disk, or is on disk
@@ -338,7 +348,15 @@ export async function describeCallFiles(plan, resolved, command, publicBase) {
   }
 
   replacements.push(...stagingReplacements(plan, resolved.sessionId));
-  return {descriptors, replacements};
+  // One staging path can be named twice: the pair pushed for a deferred entry
+  // is the authoritative one, since it names the file this answer describes.
+  const authoritative = new Map();
+  for (const [writePath, filePath] of replacements) {
+    if (!authoritative.has(writePath)) {
+      authoritative.set(writePath, filePath);
+    }
+  }
+  return {descriptors, replacements: [...authoritative]};
 }
 
 /**

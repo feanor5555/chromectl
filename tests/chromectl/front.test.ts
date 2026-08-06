@@ -1252,8 +1252,20 @@ describe('chromectl front recordings', () => {
   it('names the recording already running to a second start', async () => {
     const started: string[] = [];
     daemonHandler = daemonCall => {
-      started.push(String(daemonCall.args?.['filePath']));
-      return toolSuccess();
+      const handed = String(daemonCall.args?.['filePath']);
+      started.push(handed);
+      // A tool names the path it was handed back in its own text, which is what
+      // shows which final path the front put in its place.
+      return {
+        success: true,
+        result: JSON.stringify({
+          content: [{type: 'text', text: `Recording to ${handed}`}],
+          structuredContent: {
+            textSnapshot: `recording to ${handed}`,
+            pages: [],
+          },
+        }),
+      };
     };
 
     const first = await call({
@@ -1279,7 +1291,34 @@ describe('chromectl front recordings', () => {
     assert.strictEqual(started.length, 2);
     assert.ok(!fs.existsSync(path.join(outputDir, 'second.mp4')));
 
+    // The refused start was handed a staging path of its own and is answered
+    // with the running recording's file, in whatever order the exchanges of a
+    // call were collected.
+    const answer = second.body.toString('utf8');
+    const result = payload(second)['result'] as Record<string, unknown>;
+    assert.strictEqual(
+      result['textSnapshot'],
+      `recording to ${path.join(outputDir, 'first.mp4')}`,
+    );
+    assert.ok(
+      !answer.includes(path.basename(started[1]!)),
+      `the answer named the staging file: ${answer}`,
+    );
+
     await endRecording();
+    assert.deepStrictEqual(stagingLeftovers(), []);
+
+    // The refused start gave the name it had taken back, which the other
+    // browser is the one that can tell: a name still held by the first browser
+    // refuses its call.
+    const other = await call({
+      target: 'other',
+      command: 'screencast_start',
+      args: {filePath: 'second.mp4'},
+    });
+    assert.strictEqual(other.status, 200, other.body.toString('utf8'));
+
+    await endRecording('other');
     assert.deepStrictEqual(stagingLeftovers(), []);
   });
 
