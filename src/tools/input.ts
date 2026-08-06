@@ -1362,6 +1362,18 @@ export const fillForm = definePageTool({
  * Chrome answers `Page.*` and `Input.*` commands from separate agents, so the
  * switch takes hold only once its own answer is back: a press dispatched before
  * that can reach the page ahead of it and open a chooser nobody intercepts.
+ *
+ * The flag belongs to the session it was set on, and puppeteer listens for
+ * `Page.fileChooserOpened` on the page's primary session, so the switch has to
+ * land on that same session: one set over a session opened for this call would
+ * never reach the listener that answers the chooser. That is why the primary
+ * client is taken as it is instead of a session of our own.
+ *
+ * Switching it off is page-wide: a second upload waiting for a chooser on the
+ * same page would lose it, and puppeteer does not switch it back on while a
+ * wait of its own is pending. The daemon's process-wide tool mutex serialises
+ * every call, so there is only ever one upload at a time on a page; the front
+ * deliberately leaves calls parallel, so this rests on the daemon alone.
  */
 async function interceptFileChooser(
   page: ContextPage,
@@ -1414,6 +1426,10 @@ export const uploadFile = definePageTool({
       // Set before the press, so a failure anywhere after it still releases
       // the button instead of leaving it down for every later interaction.
       let buttonIsDown = false;
+      // Set before the switch is dispatched, because an enable given up on may
+      // still reach the page: the reset has to run for the attempt, not for the
+      // answer.
+      let interceptionRequested = false;
       try {
         // Nothing wraps this press, so the pause in front of it is taken here:
         // its fixed part before the approach begins, the rest reserved for the
@@ -1428,8 +1444,12 @@ export const uploadFile = definePageTool({
         await pressPaced(request.page, handle, 1);
         // The interception is switched on and acknowledged before the release
         // is dispatched, so the chooser the page opens is held for the wait
-        // below instead of passing it by.
-        await abandonIfBlocked(interceptFileChooser(request.page, true));
+        // below instead of passing it by. The acknowledgement is what the rest
+        // of the path is built on, so an unanswered switch ends the interaction
+        // here rather than letting the release go out against an interception
+        // that may never have taken hold.
+        interceptionRequested = true;
+        await answerOrAbandon(interceptFileChooser(request.page, true));
         const [fileChooser] = await Promise.all([
           request.page.pptrPage.waitForFileChooser({timeout: 3000}),
           (async () => {
@@ -1439,15 +1459,6 @@ export const uploadFile = definePageTool({
         ]);
         await abandonIfBlocked(fileChooser.accept([filePath]));
       } catch (error) {
-        try {
-          // Nothing switches the interception off again once the upload has
-          // failed, and a page left with it on swallows every file chooser
-          // opened after this tool has returned.
-          await abandonIfBlocked(interceptFileChooser(request.page, false));
-        } catch {
-          // The failed upload is what the caller has to read, not a page that
-          // would not take the switch back.
-        }
         if (error instanceof InteractionInterruptedError) {
           // The page stopped the interaction, and that is what the caller has
           // to read: the element is not what failed and may well take a file.
@@ -1460,6 +1471,17 @@ export const uploadFile = definePageTool({
         // A reservation the press never travelled against belongs to no later
         // action, so it is dropped rather than left standing.
         takeLeadPause();
+        if (interceptionRequested) {
+          try {
+            // Nothing switches the interception off again on its own, and a
+            // page left with it on swallows every file chooser opened after
+            // this tool has returned, whether it took the file or not.
+            await abandonIfBlocked(interceptFileChooser(request.page, false));
+          } catch {
+            // What the upload did is what the caller has to read, not a page
+            // that would not take the switch back.
+          }
+        }
         // A press that never reached its release would leave the button down
         // for every later interaction with the page.
         if (buttonIsDown) {

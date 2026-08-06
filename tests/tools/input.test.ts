@@ -9,6 +9,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {describe, it} from 'node:test';
 
+import type {CDPSession} from 'puppeteer-core';
 import sinon from 'sinon';
 
 import type {ParsedArguments} from '../../src/bin/chrome-devtools-mcp-cli-options.js';
@@ -1475,6 +1476,37 @@ describe('input', () => {
           return input.files?.[0]?.name;
         });
         assert.strictEqual(uploadedFileName, 'test.txt');
+
+        // The upload leaves the page's file chooser interception off again:
+        // `Page.fileChooserOpened` is announced on the session only while it is
+        // on, so a chooser opened now has to go unannounced.
+        const client = (
+          page as unknown as {_client: () => CDPSession}
+        )._client();
+        let announced = 0;
+        client.on('Page.fileChooserOpened', () => {
+          announced++;
+        });
+        await page.setContent(
+          html`<input
+            type="file"
+            id="later-input"
+          />`,
+        );
+        await page.click('#later-input');
+        await new Promise(resolve => setTimeout(resolve, 200));
+        assert.strictEqual(announced, 0);
+        // The same click with the interception on is announced, so the count
+        // above reads the switch and not a click that opens nothing.
+        await client.send('Page.setInterceptFileChooserDialog', {
+          enabled: true,
+        });
+        await page.click('#later-input');
+        await new Promise(resolve => setTimeout(resolve, 200));
+        assert.strictEqual(announced, 1);
+        await client.send('Page.setInterceptFileChooserDialog', {
+          enabled: false,
+        });
 
         await fs.unlink(testFilePath);
       });
