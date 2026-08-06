@@ -275,7 +275,7 @@ const NON_PATH_COMMAND_ARGUMENTS = new Set([
  * Refuses to start while one argument of the command table is unaccounted for.
  *
  * The daemon runs with `--allowUnrestrictedPaths` (`DAEMON_ARGS` in
- * `front.mjs`), so a path that travelled through as the caller wrote it would
+ * `daemon.mjs`), so a path that travelled through as the caller wrote it would
  * read and write wherever the front's user can, from an endpoint that asks for
  * no authentication. Every path argument the front knows is filled in by the
  * front itself, and the question is what happens to the one it does not know
