@@ -20,12 +20,15 @@
  *
  * A screenshot is written to the network drive and the answer names its
  * location instead of carrying the image bytes. A snapshot may be written there
- * too, under a file name the caller picks; no file a call writes leaves that
- * one directory.
+ * too, under a file name the caller picks, and a result that outgrows
+ * `SPILL_BYTES` is written there as well instead of being answered inline. No
+ * file a call writes leaves that one directory, and every one of them is
+ * fetchable over `/files/`.
  *
  * Endpoints:
  *   GET  /health          liveness plus the registered target names and commands
- *   GET  /screenshots/<f> the PNG of an earlier take_screenshot call
+ *   GET  /files/<name>    a file an earlier call wrote: screenshot, snapshot or
+ *                         spilled result
  *   POST /budget          the same body as /call, answered with the deadline
  *                         that call is granted and the timeout a caller sets
  *   POST /call            {"target": "<name>", "command": "<tool>", "args": {…},
@@ -142,8 +145,8 @@ const OUTPUT_DIR =
 /** Root of the network drive, used to name the file share-relative. */
 const SHARE_ROOT = process.env['CHROMECTL_SHARE_ROOT'] ?? '/home/wu/share';
 
-/** Path prefix the front serves written screenshots under. */
-const SCREENSHOT_ROUTE = '/screenshots/';
+/** Path prefix the front serves the files of earlier calls under. */
+const FILE_ROUTE = '/files/';
 
 /**
  * The daemon writes with mode 0600 and creates directories under the front's
@@ -163,15 +166,42 @@ const OUTPUT_FILE_MODE = 0o644;
  */
 const OUTPUT_FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\.txt$/;
 
-/** File names the front hands out, and the only ones it serves back. */
-const SCREENSHOT_NAME_PATTERN =
-  /^chromectl-[A-Za-z0-9-]+-[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}\.(png|jpeg|webp)$/;
+/** The file names the front builds itself: screenshots and spilled results. */
+const GENERATED_FILE_NAME_PATTERN =
+  /^chromectl-[A-Za-z0-9-]+-[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}\.(png|jpeg|webp|json)$/;
 
-const CONTENT_TYPE_BY_FORMAT = {
+const CONTENT_TYPE_BY_EXTENSION = {
   png: 'image/png',
   jpeg: 'image/jpeg',
   webp: 'image/webp',
+  txt: 'text/plain; charset=utf-8',
+  json: 'application/json; charset=utf-8',
 };
+
+/**
+ * From how many bytes of rendered result on the answer names a file instead of
+ * carrying the result: an operator setting, like the pacing figures, not a
+ * measurement. It sits well above a routine snapshot, which is the caller's
+ * source of uids and has to arrive to be of any use, and bites where an inline
+ * answer has stopped being one — the page whose text runs into hundreds of
+ * kilobytes.
+ *
+ * The check is on the rendered result rather than on a per-tool argument
+ * because that is the only place every payload passes: `wait_for` and every
+ * input command called with `includeSnapshot` end in a snapshot and have no
+ * `filePath` argument at all.
+ */
+const SPILL_BYTES = Number(process.env['CHROMECTL_SPILL_BYTES'] ?? 131_072);
+if (!Number.isInteger(SPILL_BYTES) || SPILL_BYTES <= 0) {
+  // A typo here would read as "never spills", which is the failure the cap
+  // exists to prevent, so it is a startup fault.
+  throw new Error(
+    `CHROMECTL_SPILL_BYTES must be a positive whole number of bytes, got ${JSON.stringify(process.env['CHROMECTL_SPILL_BYTES'])}`,
+  );
+}
+
+/** How much of a spilled result the answer still carries, in characters. */
+const SPILL_HEAD_CHARS = 2_048;
 
 /** Upper bound for the CDP reachability probe. */
 const PROBE_TIMEOUT_MS = 5_000;
@@ -751,16 +781,26 @@ function validateArgs(command, args) {
 }
 
 /**
- * Builds the name of one screenshot file: the target it was taken on, the UTC
- * moment down to the millisecond and eight random hex characters. Two calls
+ * Builds the name of one file the front writes: the target the call ran on, the
+ * UTC moment down to the millisecond and eight random hex characters. Two calls
  * running at the same time therefore cannot land on the same file even within
  * one millisecond. The name carries no colons, so a Windows client reaching the
  * drive over Samba can open it.
  */
-function screenshotFileName(target, format) {
+function generatedFileName(target, extension) {
   const slug = target.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
   const stamp = new Date().toISOString().replace(/[-:.]/g, '');
-  return `chromectl-${slug}-${stamp}-${randomBytes(4).toString('hex')}.${format}`;
+  return `chromectl-${slug}-${stamp}-${randomBytes(4).toString('hex')}.${extension}`;
+}
+
+/**
+ * The address a written file is fetched under. Every name the front hands out
+ * is made of letters, digits, dot, underscore and hyphen, so the encoding
+ * changes nothing; it is applied so that the answer stays a URL whatever a name
+ * ever comes to carry.
+ */
+function fileUrl(publicBase, fileName) {
+  return `${publicBase}${FILE_ROUTE}${encodeURIComponent(fileName)}`;
 }
 
 /** Makes sure the output directory exists and this process can write into it. */
@@ -802,7 +842,7 @@ async function planScreenshot(target, toolArgs) {
   }
 
   const format = toolArgs.format ?? 'png';
-  const fileName = screenshotFileName(target, format);
+  const fileName = generatedFileName(target, format);
   await ensureOutputDir();
   return {
     kind: 'screenshot',
@@ -913,7 +953,9 @@ async function widenLeftoverFile(plan) {
  * Confirms the file the daemon was told to write really is there and makes it
  * readable for everyone reaching the drive, then describes it. A tool call that
  * reports success without a file on disk is a storage failure, not a result.
- * Only a screenshot carries a fetch URL: it is the one the front serves back.
+ * Every file carries a fetch URL: the client is bash and curl, so the share
+ * path presumes a mount it may not have while the URL is reachable wherever the
+ * call itself was sent from.
  */
 async function describeWrittenFile(plan, publicBase) {
   let stats;
@@ -935,9 +977,7 @@ async function describeWrittenFile(plan, publicBase) {
     file: plan.fileName,
     path: plan.filePath,
     share_path: path.relative(SHARE_ROOT, plan.filePath),
-    ...(plan.kind === 'screenshot'
-      ? {url: `${publicBase}${SCREENSHOT_ROUTE}${plan.fileName}`}
-      : {}),
+    url: fileUrl(publicBase, plan.fileName),
     bytes: stats.size,
   };
 }
@@ -962,6 +1002,56 @@ async function runCommand(resolved, command, toolArgs, fullSpeed) {
     throw new CallError('tool', `${command} failed`, parsed);
   }
   return {parsed, elapsedMs};
+}
+
+/**
+ * The opening of a spilled result, so the answer still says what was found.
+ * A slice must not end inside a surrogate pair: half a pair is not a character
+ * and would travel as a replacement.
+ */
+function spillHead(rendered) {
+  const head = rendered.slice(0, SPILL_HEAD_CHARS);
+  const last = head.charCodeAt(head.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? head.slice(0, -1) : head;
+}
+
+/**
+ * Writes a result that is too large to answer with and describes it in its
+ * place: path, share path, fetch URL, byte count and the first lines.
+ *
+ * The file is created exclusively: its name is the front's own and carries
+ * eight random hex characters, so an entry already sitting there is not this
+ * call's file and is never written through — a symlink someone dropped into the
+ * guest-writable share least of all.
+ */
+async function spillResult(target, rendered, publicBase) {
+  await ensureOutputDir();
+  const fileName = generatedFileName(target, 'json');
+  const filePath = path.join(OUTPUT_DIR, fileName);
+  try {
+    await fs.writeFile(filePath, rendered, {
+      flag: 'wx',
+      mode: OUTPUT_FILE_MODE,
+    });
+    // The write runs under this process's umask, so the mode is set again.
+    await fs.chmod(filePath, OUTPUT_FILE_MODE);
+  } catch (error) {
+    throw new CallError(
+      'storage',
+      `the result could not be written to ${filePath}`,
+      error.message,
+    );
+  }
+
+  return {
+    spilled: true,
+    file: fileName,
+    path: filePath,
+    share_path: path.relative(SHARE_ROOT, filePath),
+    url: fileUrl(publicBase, fileName),
+    bytes: Buffer.byteLength(rendered),
+    head: spillHead(rendered),
+  };
 }
 
 async function invoke(target, command, args, fullSpeed, publicBase, client) {
@@ -1036,6 +1126,15 @@ async function carryOutCall(
   }
   const {parsed, elapsedMs} = outcome;
 
+  // What the answer would carry, measured before it is sent: a result past the
+  // cap is written out and named instead, so no call can put hundreds of
+  // kilobytes into a caller's context that it cannot take back.
+  const rendered = JSON.stringify(parsed);
+  const spill =
+    Buffer.byteLength(rendered) > SPILL_BYTES
+      ? await spillResult(resolved.target, rendered, publicBase)
+      : undefined;
+
   return {
     ok: true,
     target: resolved.target,
@@ -1048,7 +1147,7 @@ async function carryOutCall(
     elapsed_ms: elapsedMs,
     title: parsed.pages?.find(page => page.selected)?.title,
     ...(plan ? {[plan.kind]: await describeWrittenFile(plan, publicBase)} : {}),
-    result: parsed,
+    result: spill ?? parsed,
   };
 }
 
@@ -1091,28 +1190,56 @@ function send(response, status, body) {
 }
 
 /**
- * Serves a written screenshot back, for a caller that does not have the network
- * drive mounted. Only names the front itself hands out are accepted, so the
- * route cannot be walked out of the screenshot directory.
+ * Serves a file an earlier call left behind — screenshot, snapshot or spilled
+ * result — for a caller that does not have the network drive mounted. The
+ * client is bash and curl by design, so this route, not the share path, is what
+ * a caller on another machine actually reaches the file through.
+ *
+ * The front is unauthenticated, so this is a read path into `OUTPUT_DIR` and
+ * must be nothing beyond it. Three things hold that, and the last two hold it
+ * without relying on the first: the name has to be one the front hands out or
+ * one it accepted as a snapshot file name, both of which are made of letters,
+ * digits, dot, underscore and hyphen and can therefore carry neither a
+ * directory separator nor a leading dot nor a `..`; the path built from it must
+ * still lie directly in `OUTPUT_DIR`; and the file is opened `O_NOFOLLOW`, so a
+ * symlink placed in the guest-writable share cannot carry the read out of the
+ * directory. Only a regular file is answered.
  */
-async function sendScreenshot(response, url) {
-  const fileName = decodeURIComponent(url.slice(SCREENSHOT_ROUTE.length));
-  if (!SCREENSHOT_NAME_PATTERN.test(fileName)) {
-    throw new CallError(
-      'usage',
-      `not a chromectl screenshot name: ${fileName}`,
-    );
+async function sendFile(response, url) {
+  const fileName = decodeURIComponent(url.slice(FILE_ROUTE.length));
+  if (
+    !GENERATED_FILE_NAME_PATTERN.test(fileName) &&
+    !OUTPUT_FILE_NAME_PATTERN.test(fileName)
+  ) {
+    throw new CallError('usage', `not a chromectl file name: ${fileName}`);
   }
+  const filePath = path.resolve(OUTPUT_DIR, fileName);
+  if (path.dirname(filePath) !== path.resolve(OUTPUT_DIR)) {
+    throw new CallError('usage', `not a file of ${OUTPUT_DIR}: ${fileName}`);
+  }
+
   let data;
+  let handle;
   try {
-    data = await fs.readFile(path.join(OUTPUT_DIR, fileName));
+    handle = await fs.open(
+      filePath,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+    );
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      throw new Error('not a regular file');
+    }
+    data = await handle.readFile();
   } catch (error) {
-    throw new CallError('storage', `no screenshot ${fileName}`, error.message);
+    throw new CallError('storage', `no file ${fileName}`, error.message);
+  } finally {
+    await handle?.close();
   }
-  const format = path.extname(fileName).slice(1);
+
+  const extension = path.extname(fileName).slice(1);
   response.writeHead(200, {
     'content-type':
-      CONTENT_TYPE_BY_FORMAT[format] ?? 'application/octet-stream',
+      CONTENT_TYPE_BY_EXTENSION[extension] ?? 'application/octet-stream',
     'content-length': data.length,
   });
   response.end(data);
@@ -1153,8 +1280,8 @@ const server = http.createServer(async (request, response) => {
       });
       return;
     }
-    if (request.method === 'GET' && request.url.startsWith(SCREENSHOT_ROUTE)) {
-      await sendScreenshot(response, request.url);
+    if (request.method === 'GET' && request.url.startsWith(FILE_ROUTE)) {
+      await sendFile(response, request.url);
       return;
     }
     if (
