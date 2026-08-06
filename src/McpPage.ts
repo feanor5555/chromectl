@@ -523,12 +523,18 @@ export class McpPage implements ContextPage {
    *
    * Anything else the action raises is left standing: every other dialog type
    * is the caller's to handle, and the tools report it as an open dialog.
+   *
+   * `dialogHandled` reports only an answer that actually went through. An
+   * answer that failed leaves the dialog standing, and the caller of this wait
+   * clears its own record of the dialog on the strength of that flag — a
+   * `true` for a failed answer would drop the one dialog the tools still have
+   * to report.
    */
   async #answeringBeforeUnload(
     answer: 'accept' | 'dismiss',
     run: () => Promise<WaitForEventsResult>,
   ): Promise<WaitForEventsResult> {
-    const answers: Array<Promise<void>> = [];
+    const answers: Array<Promise<boolean>> = [];
     const onDialog = (dialog: Dialog): void => {
       if (dialog.type() !== 'beforeunload') {
         return;
@@ -538,8 +544,10 @@ export class McpPage implements ContextPage {
           await pauseForDialogRead();
           try {
             await (answer === 'dismiss' ? dialog.dismiss() : dialog.accept());
+            return true;
           } catch (error) {
             logger?.('the beforeunload dialog could not be answered', error);
+            return false;
           }
         })(),
       );
@@ -547,8 +555,8 @@ export class McpPage implements ContextPage {
     this.pptrPage.on('dialog', onDialog);
     try {
       const result = await run();
-      await Promise.all(answers);
-      return answers.length > 0 ? {...result, dialogHandled: true} : result;
+      const answered = await Promise.all(answers);
+      return answered.some(Boolean) ? {...result, dialogHandled: true} : result;
     } finally {
       this.pptrPage.off('dialog', onDialog);
     }
