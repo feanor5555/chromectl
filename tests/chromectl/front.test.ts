@@ -46,6 +46,22 @@ const SNAPSHOT_TEXT = 'uid=1_0 page\n';
 /** The content of a file a caller hands in for a page to receive. */
 const UPLOAD_TEXT = 'handed in from another machine\n';
 
+/** What the fake daemon leaves behind for a recording it was told to make. */
+const RECORDING_BYTES = 'not a video, and long enough to be a file\n';
+
+/** What the fake daemon writes into the directory it is handed for a report. */
+const REPORT_JSON = '{"categories": {"seo": {"score": 1}}}';
+const REPORT_HTML = '<!doctype html><title>report</title>\n';
+
+/**
+ * From how many bytes on the front writes a result out instead of answering
+ * with it. The front takes the figure from its environment, and the harness
+ * sets it far below the default so a test can drive a result past it without
+ * sending a hundred kilobytes over the wire; every other test's result stays
+ * well under it.
+ */
+const SPILL_LIMIT_BYTES = 4096;
+
 /** How long the front is given to come up. */
 const START_TIMEOUT_MS = 20_000;
 
@@ -467,6 +483,7 @@ before(async () => {
       CHROMECTL_TARGETS: registryFile,
       CHROMECTL_SCREENSHOT_DIR: outputDir,
       CHROMECTL_SHARE_ROOT: tmpRoot,
+      CHROMECTL_SPILL_BYTES: String(SPILL_LIMIT_BYTES),
       XDG_RUNTIME_DIR: runtimeDir,
     },
   });
@@ -1178,6 +1195,310 @@ describe('chromectl front output name claims', () => {
 
     assert.deepStrictEqual(stagingLeftovers(), []);
     fs.rmSync(path.join(outputDir, 'shared.txt'));
+  });
+});
+
+describe('chromectl front recordings', () => {
+  /**
+   * Ends whatever recording a browser has running, written or not: the plan of
+   * a recording outlives the call that started it, and a test that leaves one
+   * standing leaves the next one a file that is still being written.
+   */
+  async function endRecording(target = 'fake'): Promise<Answer> {
+    daemonHandler = () => toolSuccess();
+    return await call({target, command: 'screencast_stop'});
+  }
+
+  it('names the file a recording will be under before it is there', async () => {
+    let handed = '';
+    daemonHandler = daemonCall => {
+      handed = String(daemonCall.args?.['filePath']);
+      return toolSuccess();
+    };
+
+    const answer = await call({
+      target: 'fake',
+      command: 'screencast_start',
+      args: {filePath: 'clip.mp4'},
+    });
+
+    assert.strictEqual(answer.status, 200, answer.body.toString('utf8'));
+    const recording = payload(answer)['recording'] as Record<string, unknown>;
+    assert.strictEqual(recording['file'], 'clip.mp4');
+    assert.strictEqual(recording['path'], path.join(outputDir, 'clip.mp4'));
+    assert.strictEqual(
+      recording['url'],
+      `http://127.0.0.1:${frontPort}/files/clip.mp4`,
+    );
+    // The file is announced, not described: it is written until the stopping
+    // call, and no byte count of it exists while it is being written.
+    assert.strictEqual(recording['pending'], true);
+    assert.strictEqual(recording['bytes'], undefined);
+    assert.ok(!fs.existsSync(path.join(outputDir, 'clip.mp4')));
+
+    // What is being written meanwhile is a name of the front's own, and no
+    // answer carries it.
+    assert.strictEqual(path.dirname(handed), outputDir);
+    assert.match(path.basename(handed), /^chromectl-fake-.*\.mp4$/);
+    assert.ok(
+      !answer.body.toString('utf8').includes(path.basename(handed)),
+      `the answer named the staging file: ${answer.body.toString('utf8')}`,
+    );
+
+    await endRecording();
+    assert.deepStrictEqual(stagingLeftovers(), []);
+  });
+
+  it('names the recording already running to a second start', async () => {
+    const started: string[] = [];
+    daemonHandler = daemonCall => {
+      started.push(String(daemonCall.args?.['filePath']));
+      return toolSuccess();
+    };
+
+    const first = await call({
+      target: 'fake',
+      command: 'screencast_start',
+      args: {filePath: 'first.mp4'},
+    });
+    assert.strictEqual(first.status, 200, first.body.toString('utf8'));
+
+    // A daemon that is already recording refuses the second start as a result
+    // rather than as a failure, and nothing is written to what this call
+    // planned: the file the caller will get is the one already running.
+    const second = await call({
+      target: 'fake',
+      command: 'screencast_start',
+      args: {filePath: 'second.mp4'},
+    });
+
+    assert.strictEqual(second.status, 200, second.body.toString('utf8'));
+    const recording = payload(second)['recording'] as Record<string, unknown>;
+    assert.strictEqual(recording['file'], 'first.mp4');
+    assert.strictEqual(recording['pending'], true);
+    assert.strictEqual(started.length, 2);
+    assert.ok(!fs.existsSync(path.join(outputDir, 'second.mp4')));
+
+    await endRecording();
+    assert.deepStrictEqual(stagingLeftovers(), []);
+  });
+
+  it('puts the recording under the name the start announced', async () => {
+    let handed = '';
+    daemonHandler = daemonCall => {
+      if (daemonCall.tool === 'screencast_start') {
+        handed = String(daemonCall.args?.['filePath']);
+        return toolSuccess();
+      }
+      // The stop carries no path of its own: what was recorded sits under the
+      // name the starting call was handed, and the front is what remembers it.
+      fs.writeFileSync(handed, RECORDING_BYTES);
+      return toolSuccess();
+    };
+
+    const started = await call({
+      target: 'fake',
+      command: 'screencast_start',
+      args: {filePath: 'clip.webm'},
+    });
+    assert.strictEqual(started.status, 200, started.body.toString('utf8'));
+
+    const stopped = await call({target: 'fake', command: 'screencast_stop'});
+
+    assert.strictEqual(stopped.status, 200, stopped.body.toString('utf8'));
+    const recording = payload(stopped)['recording'] as Record<string, unknown>;
+    assert.strictEqual(recording['file'], 'clip.webm');
+    assert.strictEqual(recording['bytes'], Buffer.byteLength(RECORDING_BYTES));
+    assert.strictEqual(recording['pending'], undefined);
+    assert.ok(
+      !stopped.body.toString('utf8').includes(path.basename(handed)),
+      `the answer named the staging file: ${stopped.body.toString('utf8')}`,
+    );
+
+    const served = await send('/files/clip.webm');
+    assert.strictEqual(served.status, 200, served.body.toString('utf8'));
+    assert.strictEqual(served.headers['content-type'], 'video/webm');
+    assert.strictEqual(served.body.toString('utf8'), RECORDING_BYTES);
+
+    assert.deepStrictEqual(stagingLeftovers(), []);
+    fs.rmSync(path.join(outputDir, 'clip.webm'));
+  });
+
+  it('fails the stop when the recording it promised is not there', async () => {
+    daemonHandler = () => toolSuccess();
+
+    const started = await call({
+      target: 'fake',
+      command: 'screencast_start',
+      args: {filePath: 'gone.mp4'},
+    });
+    assert.strictEqual(started.status, 200, started.body.toString('utf8'));
+
+    // The caller asked for that file, so an answer reporting a success for a
+    // name leading nowhere is the one thing the stop must not give.
+    const stopped = await call({target: 'fake', command: 'screencast_stop'});
+
+    assert.strictEqual(stopped.status, 500, stopped.body.toString('utf8'));
+    const body = payload(stopped);
+    assert.strictEqual(body['kind'], 'storage');
+    assert.match(String(body['error']), /gone\.mp4/);
+    assert.ok(!fs.existsSync(path.join(outputDir, 'gone.mp4')));
+    assert.deepStrictEqual(stagingLeftovers(), []);
+
+    // The plan is gone with the stop and so is the name it held, which the
+    // other browser is the one that can tell: a name still claimed by the first
+    // browser refuses its call.
+    const other = await call({
+      target: 'other',
+      command: 'screencast_start',
+      args: {filePath: 'gone.mp4'},
+    });
+    assert.strictEqual(other.status, 200, other.body.toString('utf8'));
+
+    await endRecording('other');
+    assert.deepStrictEqual(stagingLeftovers(), []);
+  });
+});
+
+describe('chromectl front large results', () => {
+  it('writes a result past the cap out and names it instead', async () => {
+    const text = 'p'.repeat(SPILL_LIMIT_BYTES * 2);
+    const structured = {textSnapshot: text, pages: []};
+    const rendered = JSON.stringify(structured);
+    daemonHandler = () => ({
+      success: true,
+      result: JSON.stringify({
+        content: [{type: 'text', text: 'ok'}],
+        structuredContent: structured,
+      }),
+    });
+
+    const answer = await call({target: 'fake', command: 'take_snapshot'});
+
+    assert.strictEqual(answer.status, 200, answer.body.toString('utf8'));
+    const result = payload(answer)['result'] as Record<string, unknown>;
+    assert.strictEqual(result['spilled'], true);
+    assert.strictEqual(result['bytes'], Buffer.byteLength(rendered));
+    // The answer still says what was found, and says it in a fraction of the
+    // size the result would have taken.
+    const head = String(result['head']);
+    assert.ok(rendered.startsWith(head), "the head is not the result's own");
+    assert.ok(
+      head.length < rendered.length,
+      'the answer carried the whole result it was to spill',
+    );
+
+    const fileName = String(result['file']);
+    assert.match(fileName, /^chromectl-fake-.*\.spill\.json$/);
+    const served = await send(`/files/${fileName}`);
+    assert.strictEqual(served.status, 200, served.body.toString('utf8'));
+    assert.strictEqual(
+      served.headers['content-type'],
+      'application/json; charset=utf-8',
+    );
+    assert.strictEqual(served.body.toString('utf8'), rendered);
+
+    fs.rmSync(path.join(outputDir, fileName));
+    assert.deepStrictEqual(stagingLeftovers(), []);
+  });
+});
+
+describe('chromectl front result paths', () => {
+  it('names the path the caller ends up with and never its own', async () => {
+    let handed = '';
+    daemonHandler = daemonCall => {
+      handed = String(daemonCall.args?.['filePath']);
+      fs.writeFileSync(handed, SNAPSHOT_TEXT);
+      // A tool names the path it was handed back to its caller, in a line of
+      // its own text as well as in a structured field.
+      return {
+        success: true,
+        result: JSON.stringify({
+          content: [{type: 'text', text: `Saved to ${handed}`}],
+          structuredContent: {
+            textSnapshot: `saved to ${handed}`,
+            savedTo: handed,
+            pages: [],
+          },
+        }),
+      };
+    };
+
+    const answer = await call({
+      target: 'fake',
+      command: 'take_snapshot',
+      args: {filePath: 'echoed.txt'},
+    });
+
+    assert.strictEqual(answer.status, 200, answer.body.toString('utf8'));
+    const filePath = path.join(outputDir, 'echoed.txt');
+    const result = payload(answer)['result'] as Record<string, unknown>;
+    assert.strictEqual(result['savedTo'], filePath);
+    assert.strictEqual(result['textSnapshot'], `saved to ${filePath}`);
+    // The staging name is this process's business: it is gone a moment later
+    // and names nothing a caller can fetch, so no part of the answer quotes it.
+    assert.ok(
+      !answer.body.toString('utf8').includes(path.basename(handed)),
+      `the answer named the staging file: ${answer.body.toString('utf8')}`,
+    );
+
+    fs.rmSync(filePath);
+    assert.deepStrictEqual(stagingLeftovers(), []);
+  });
+});
+
+describe('chromectl front report directories', () => {
+  it('takes the reports out of the directory it handed the tool', async () => {
+    let handedDir = '';
+    daemonHandler = daemonCall => {
+      handedDir = String(daemonCall.args?.['outputDirPath']);
+      fs.writeFileSync(path.join(handedDir, 'report.json'), REPORT_JSON);
+      fs.writeFileSync(path.join(handedDir, 'report.html'), REPORT_HTML);
+      return toolSuccess();
+    };
+
+    const answer = await call({target: 'fake', command: 'lighthouse_audit'});
+
+    assert.strictEqual(answer.status, 200, answer.body.toString('utf8'));
+    const body = payload(answer);
+    const reports = [
+      {
+        kind: 'report_json',
+        content: REPORT_JSON,
+        name: /^chromectl-fake-.*\.json$/,
+        type: 'application/json; charset=utf-8',
+      },
+      {
+        kind: 'report_html',
+        content: REPORT_HTML,
+        name: /^chromectl-fake-.*\.html$/,
+        type: 'text/html; charset=utf-8',
+      },
+    ];
+
+    for (const {kind, content, name, type} of reports) {
+      const descriptor = body[kind] as Record<string, unknown>;
+      assert.ok(descriptor, `${kind} is not in the answer`);
+      // The names inside the directory are the tool's own; what the answer
+      // carries is a name of the front's that its fetch route serves.
+      const fileName = String(descriptor['file']);
+      assert.match(fileName, name);
+      assert.strictEqual(descriptor['path'], path.join(outputDir, fileName));
+      assert.strictEqual(descriptor['bytes'], Buffer.byteLength(content));
+
+      const served = await send(`/files/${fileName}`);
+      assert.strictEqual(served.status, 200, `${kind}: ${served.status}`);
+      assert.strictEqual(served.headers['content-type'], type, kind);
+      assert.strictEqual(served.body.toString('utf8'), content, kind);
+
+      fs.rmSync(path.join(outputDir, fileName));
+    }
+
+    // The directory was the call's own and outlives it by nothing.
+    assert.strictEqual(path.dirname(handedDir), outputDir);
+    assert.match(path.basename(handedDir), /^chromectl-fake-/);
+    assert.ok(!fs.existsSync(handedDir), `${handedDir} is still there`);
+    assert.deepStrictEqual(stagingLeftovers(), []);
   });
 });
 
