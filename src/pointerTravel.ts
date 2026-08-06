@@ -32,7 +32,7 @@ import {
   sleepMs,
   takeLeadPause,
 } from './pacing.js';
-import type {CdpPage, ElementHandle} from './third_party/index.js';
+import type {ElementHandle} from './third_party/index.js';
 import type {ContextPage} from './tools/ToolDefinition.js';
 import {logger} from './utils/logger.js';
 
@@ -176,19 +176,33 @@ const FALLBACK_VIEWPORT = {width: 1280, height: 800} as const;
 
 /**
  * How large the page's layout viewport is, in the CSS pixels the pointer is
- * moved in. It is read off the page's own session, and the two fallbacks behind
- * it exist so that a pointer with nowhere to start from still starts somewhere:
- * the emulated viewport, and a common window size.
+ * moved in. It is read over a session of the page's own target, which is what
+ * the browser is launched with (`defaultViewport: null`) makes necessary: no
+ * viewport is emulated then, so the window's own size is only to be had from
+ * the browser. The session is opened for this one read and detached again,
+ * because a page is asked at most once — from the second travel on, the pointer
+ * has a place of its own.
+ *
+ * The two fallbacks behind it exist so that a pointer with nowhere to start
+ * from still starts somewhere: the emulated viewport, and a common window size.
  */
 async function layoutViewportSize(
   page: ContextPage,
 ): Promise<{width: number; height: number}> {
   try {
-    const client = (page.pptrPage as unknown as CdpPage)._client();
-    const metrics = await answerOrAbandon(client.send('Page.getLayoutMetrics'));
-    const {clientWidth, clientHeight} = metrics.cssLayoutViewport;
-    if (clientWidth > 0 && clientHeight > 0) {
-      return {width: clientWidth, height: clientHeight};
+    const client = await answerOrAbandon(page.pptrPage.createCDPSession());
+    try {
+      const metrics = await answerOrAbandon(
+        client.send('Page.getLayoutMetrics'),
+      );
+      const {clientWidth, clientHeight} = metrics.cssLayoutViewport;
+      if (clientWidth > 0 && clientHeight > 0) {
+        return {width: clientWidth, height: clientHeight};
+      }
+    } finally {
+      void client.detach().catch(error => {
+        logger?.('failed to close the layout viewport session', error);
+      });
     }
   } catch (error) {
     logger?.('failed to read the layout viewport', error);

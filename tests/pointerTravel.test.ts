@@ -60,8 +60,8 @@ function stubPage(
         },
       },
       viewport: () => options.viewport ?? null,
-      _client: () => {
-        return {
+      createCDPSession: () => {
+        return Promise.resolve({
           send: () => {
             if (options.layoutMetricsFail) {
               return Promise.reject(new Error('no metrics'));
@@ -73,7 +73,8 @@ function stubPage(
               },
             });
           },
-        };
+          detach: () => Promise.resolve(),
+        });
       },
     },
   } as unknown as ContextPage;
