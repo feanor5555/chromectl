@@ -208,28 +208,44 @@ export function reclassifyFileFailure(error, plan, sessionId) {
 }
 
 /**
- * Confirms the file the daemon was told to write really is there and makes it
- * readable for everyone reaching the drive, puts it under the name the answer
- * carries and describes it. A tool call that reports success without a file on
- * disk is a storage failure, not a result — unless the tool writes that file
- * only when the page had the content for it, in which case its absence is
- * reported as no file at all.
+ * Takes one written file where the answer points and describes it: the file is
+ * confirmed to be there, made readable for everyone reaching the drive and put
+ * under its final name.
  *
- * The rename is what a caller-named file arrives through, and it is the last
- * step: an entry someone put under that name meanwhile is replaced, since
+ * The rename is what a name the answer carries arrives through, and it is the
+ * last step: an entry someone put under that name meanwhile is replaced, since
  * `rename` acts on the name and not on what it points at.
+ *
+ * Which entry is worth taking, and what a step that fails means, is the
+ * caller's: `accept` sees the entry as it was found and refuses it by throwing,
+ * and every failure travels on as it was raised.
+ */
+async function promoteFile(file, publicBase, accept) {
+  const stats = await fs.stat(file.writePath);
+  accept?.(stats);
+  await fs.chmod(file.writePath, OUTPUT_FILE_MODE);
+  if (file.writePath !== file.filePath) {
+    await fs.rename(file.writePath, file.filePath);
+  }
+  return {
+    ...fileLocation(file.fileName, file.filePath, publicBase),
+    bytes: stats.size,
+  };
+}
+
+/**
+ * Describes the file the daemon was told to write. A tool call that reports
+ * success without a file on disk is a storage failure, not a result — unless the
+ * tool writes that file only when the page had the content for it, in which case
+ * its absence is reported as no file at all.
  */
 async function describeWrittenFile(file, publicBase) {
-  let stats;
   try {
-    stats = await fs.stat(file.writePath);
-    if (!stats.isFile() || stats.size === 0) {
-      throw new Error(`${stats.size} bytes`);
-    }
-    await fs.chmod(file.writePath, OUTPUT_FILE_MODE);
-    if (file.writePath !== file.filePath) {
-      await fs.rename(file.writePath, file.filePath);
-    }
+    return await promoteFile(file, publicBase, stats => {
+      if (!stats.isFile() || stats.size === 0) {
+        throw new Error(`${stats.size} bytes`);
+      }
+    });
   } catch (error) {
     if (file.optional) {
       await settleLeftoverFile(file);
@@ -243,17 +259,17 @@ async function describeWrittenFile(file, publicBase) {
       withFinalPaths(String(error.message), [[file.writePath, file.filePath]]),
     );
   }
-
-  return {
-    ...fileLocation(file.fileName, file.filePath, publicBase),
-    bytes: stats.size,
-  };
 }
 
 /**
  * Takes the files a call left in its own directory out of it, under names the
- * fetch route serves, and removes the directory. A report the tool did not write
- * is not one the answer names.
+ * fetch route serves, and removes the directory.
+ *
+ * A report that is not there is one the tool had nothing to write, and the
+ * answer simply does not name it. Every other reason a report cannot be taken
+ * out fails the call: the directory goes a moment later, so a report that was
+ * written and stays behind is lost, and an answer reporting a success for it
+ * would be the only trace it ever existed.
  */
 async function collectDirectoryFiles(directory, publicBase) {
   const collected = [];
@@ -261,22 +277,25 @@ async function collectDirectoryFiles(directory, publicBase) {
     const source = path.join(directory.path, name);
     const fileName = generatedFileName(directory.target, reportExtension(name));
     const filePath = path.join(OUTPUT_DIR, fileName);
-    let stats;
+    let descriptor;
     try {
-      stats = await fs.stat(source);
-      await fs.chmod(source, OUTPUT_FILE_MODE);
-      await fs.rename(source, filePath);
-    } catch {
-      continue;
+      descriptor = await promoteFile(
+        {writePath: source, fileName, filePath},
+        publicBase,
+      );
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        continue;
+      }
+      throw new CallError(
+        'storage',
+        `${kind} could not be moved to ${filePath}`,
+        // The directory of the call is this process's business and is gone a
+        // moment later, so it does not travel out in the reason either.
+        withFinalPaths(String(error.message), [[source, filePath]]),
+      );
     }
-    collected.push({
-      kind,
-      source,
-      descriptor: {
-        ...fileLocation(fileName, filePath, publicBase),
-        bytes: stats.size,
-      },
-    });
+    collected.push({kind, source, descriptor});
   }
   await removeStagingDirectory(directory.path);
   return collected;

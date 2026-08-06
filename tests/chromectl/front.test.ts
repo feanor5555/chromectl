@@ -1539,6 +1539,32 @@ describe('chromectl front report directories', () => {
     assert.ok(!fs.existsSync(handedDir), `${handedDir} is still there`);
     assert.deepStrictEqual(stagingLeftovers(), []);
   });
+
+  it('names the reports that are there and not the ones that are not', async () => {
+    let handedDir = '';
+    daemonHandler = daemonCall => {
+      handedDir = String(daemonCall.args?.['outputDirPath']);
+      // An audit writes the report the caller asked for; a report the tool had
+      // nothing to write is simply not in the directory afterwards.
+      fs.writeFileSync(path.join(handedDir, 'report.json'), REPORT_JSON);
+      return toolSuccess();
+    };
+
+    const answer = await call({target: 'fake', command: 'lighthouse_audit'});
+
+    // A report the tool never wrote is no failure of the call: it is named in
+    // no answer, and the rest of the call is answered as it stands.
+    assert.strictEqual(answer.status, 200, answer.body.toString('utf8'));
+    const body = payload(answer);
+    const descriptor = body['report_json'] as Record<string, unknown>;
+    assert.ok(descriptor, 'report_json is not in the answer');
+    assert.strictEqual(descriptor['bytes'], Buffer.byteLength(REPORT_JSON));
+    assert.strictEqual(body['report_html'], undefined);
+
+    fs.rmSync(path.join(outputDir, String(descriptor['file'])));
+    assert.ok(!fs.existsSync(handedDir), `${handedDir} is still there`);
+    assert.deepStrictEqual(stagingLeftovers(), []);
+  });
 });
 
 describe('chromectl front expiry', () => {
