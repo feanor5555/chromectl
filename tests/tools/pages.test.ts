@@ -251,31 +251,59 @@ describe('pages', () => {
       });
     });
     it('create a page in the background', async () => {
-      await withMcpContext(async (response, context) => {
-        const originalPage = context.getPageById(1);
-        assert.strictEqual(originalPage, context.getSelectedMcpPage());
-        // Ensure original page has focus
-        await originalPage.pptrPage.bringToFront();
-        assert.strictEqual(
-          await originalPage.pptrPage.evaluate(() => document.hasFocus()),
-          true,
-        );
-        await newPage().handler(
-          {params: {url: 'data:text/html,<html></html>', background: true}},
-          response,
-          context,
-        );
-        // New page should be selected but original should retain focus
-        assert.strictEqual(
-          context.getPageById(2),
-          context.getSelectedMcpPage(),
-        );
-        assert.strictEqual(
-          await originalPage.pptrPage.evaluate(() => document.hasFocus()),
-          true,
-        );
-        assert.ok(response.includePages);
-      });
+      await withMcpContext(
+        async (response, context) => {
+          const originalPage = context.getPageById(1);
+          assert.strictEqual(originalPage, context.getSelectedMcpPage());
+          // Ensure original page has focus
+          await originalPage.pptrPage.bringToFront();
+          assert.strictEqual(
+            await originalPage.pptrPage.evaluate(() => document.hasFocus()),
+            true,
+          );
+          await newPage().handler(
+            {params: {url: 'data:text/html,<html></html>', background: true}},
+            response,
+            context,
+          );
+          // New page should be selected but original should retain focus
+          assert.strictEqual(
+            context.getPageById(2),
+            context.getSelectedMcpPage(),
+          );
+          assert.strictEqual(
+            await originalPage.pptrPage.evaluate(() => document.hasFocus()),
+            true,
+          );
+          assert.ok(response.includePages);
+        },
+        {emulateFocusedPages: true},
+      );
+    });
+    it('create a page in the background without focus emulation', async () => {
+      await withMcpContext(
+        async (response, context) => {
+          const originalPage = context.getPageById(1);
+          await originalPage.pptrPage.bringToFront();
+          await newPage().handler(
+            {params: {url: 'data:text/html,<html></html>', background: true}},
+            response,
+            context,
+          );
+          const backgroundPage = context.getPageById(2);
+          assert.strictEqual(backgroundPage, context.getSelectedMcpPage());
+          // Without the emulation the background page reports what it is.
+          assert.strictEqual(
+            await backgroundPage.pptrPage.evaluate(() => document.hasFocus()),
+            false,
+          );
+          assert.strictEqual(
+            await originalPage.pptrPage.evaluate(() => document.hasFocus()),
+            true,
+          );
+        },
+        {emulateFocusedPages: false},
+      );
     });
   });
   describe('new_page with isolatedContext', () => {
@@ -565,85 +593,91 @@ describe('pages', () => {
       });
     });
     it('selects a page and keeps it focused in the background', async () => {
-      await withMcpContext(async (response, context) => {
-        await context.newPage();
-        assert.strictEqual(
-          context.getPageById(2),
-          context.getSelectedMcpPage(),
-        );
-        assert.strictEqual(
-          await context
-            .getPageById(1)
-            .pptrPage.evaluate(() => document.hasFocus()),
-          true,
-        );
-        await selectPage.handler({params: {pageId: 1}}, response, context);
-        assert.strictEqual(
-          context.getPageById(1),
-          context.getSelectedMcpPage(),
-        );
-        assert.strictEqual(
-          await context
-            .getPageById(1)
-            .pptrPage.evaluate(() => document.hasFocus()),
-          true,
-        );
-        assert.ok(response.includePages);
-      });
+      await withMcpContext(
+        async (response, context) => {
+          await context.newPage();
+          assert.strictEqual(
+            context.getPageById(2),
+            context.getSelectedMcpPage(),
+          );
+          assert.strictEqual(
+            await context
+              .getPageById(1)
+              .pptrPage.evaluate(() => document.hasFocus()),
+            true,
+          );
+          await selectPage.handler({params: {pageId: 1}}, response, context);
+          assert.strictEqual(
+            context.getPageById(1),
+            context.getSelectedMcpPage(),
+          );
+          assert.strictEqual(
+            await context
+              .getPageById(1)
+              .pptrPage.evaluate(() => document.hasFocus()),
+            true,
+          );
+          assert.ok(response.includePages);
+        },
+        {emulateFocusedPages: true},
+      );
     });
     it('preserves focus across different browser contexts', async () => {
-      await withMcpContext(async (response, context) => {
-        // Create pages in separate isolated contexts.
-        await newPage().handler(
-          {
-            params: {
-              url: 'data:text/html,<html></html>',
-              isolatedContext: 'ctx-a',
+      await withMcpContext(
+        async (response, context) => {
+          // Create pages in separate isolated contexts.
+          await newPage().handler(
+            {
+              params: {
+                url: 'data:text/html,<html></html>',
+                isolatedContext: 'ctx-a',
+              },
             },
-          },
-          response,
-          context,
-        );
-        const pageA = context.getSelectedMcpPage().pptrPage;
-        const pageAId = context.getSelectedMcpPage().id;
+            response,
+            context,
+          );
+          const pageA = context.getSelectedMcpPage().pptrPage;
+          const pageAId = context.getSelectedMcpPage().id;
 
-        await newPage().handler(
-          {
-            params: {
-              url: 'data:text/html,<html></html>',
-              isolatedContext: 'ctx-b',
+          await newPage().handler(
+            {
+              params: {
+                url: 'data:text/html,<html></html>',
+                isolatedContext: 'ctx-b',
+              },
             },
-          },
-          response,
-          context,
-        );
-        const pageB = context.getSelectedMcpPage().pptrPage;
+            response,
+            context,
+          );
+          const pageB = context.getSelectedMcpPage().pptrPage;
 
-        // Selecting pageB (ctx-b) should not defocus pageA (ctx-a).
-        assert.strictEqual(
-          await pageA.evaluate(() => document.hasFocus()),
-          true,
-        );
-        assert.strictEqual(
-          await pageB.evaluate(() => document.hasFocus()),
-          true,
-        );
+          // Selecting pageB (ctx-b) should not defocus pageA (ctx-a).
+          assert.strictEqual(
+            await pageA.evaluate(() => document.hasFocus()),
+            true,
+          );
+          assert.strictEqual(
+            await pageB.evaluate(() => document.hasFocus()),
+            true,
+          );
 
-        // Switching back to pageA should preserve pageB's focus.
-        await selectPage.handler(
-          {params: {pageId: pageAId}},
-          response,
-          context,
-        );
-        assert.strictEqual(
-          await pageA.evaluate(() => document.hasFocus()),
-          true,
-        );
-        assert.strictEqual(
-          await pageB.evaluate(() => document.hasFocus()),
-          true,
-        );
-      });
+          // Switching back to pageA should preserve pageB's focus.
+          await selectPage.handler(
+            {params: {pageId: pageAId}},
+            response,
+            context,
+          );
+          assert.strictEqual(
+            await pageA.evaluate(() => document.hasFocus()),
+            true,
+          );
+          assert.strictEqual(
+            await pageB.evaluate(() => document.hasFocus()),
+            true,
+          );
+        },
+        {emulateFocusedPages: true},
+      );
     });
 
     it('when dialog is open', async t => {

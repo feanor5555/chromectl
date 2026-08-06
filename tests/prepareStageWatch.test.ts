@@ -64,6 +64,7 @@ function createFakePage(url = PAGE_URL): {
   });
 
   const mcpPage = new McpPage(page as unknown as Page, 1, {
+    emulateFocusedPage: true,
     hasNetworkBlockOrAllowlist: false,
     locatorClass: Locator,
   });
