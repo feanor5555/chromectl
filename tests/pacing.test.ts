@@ -46,6 +46,7 @@ import {
   POINTER_PATH_MAX_MS,
   POINTER_POINTS_MAX,
   POINTER_POINTS_MIN,
+  POINTER_SHORTEST_STEP_PX,
   POINTER_STEP_GAP_MAX_MS,
   POINTER_STEP_GAP_MIN_MS,
   queuedCallBudgetMs,
@@ -328,7 +329,7 @@ describe('pacing', () => {
 
       assert.deepStrictEqual(counts, [8, 13, POINTER_POINTS_MAX]);
       for (const seed of [1, 2, 3, 4, 5]) {
-        for (const distance of [0, 30, 500, 10_000]) {
+        for (const distance of [30, 500, 10_000]) {
           const {points} = pathBetween(seededRandom(seed), {
             x: from.x + distance,
             y: from.y + distance,
@@ -340,6 +341,50 @@ describe('pacing', () => {
           );
         }
       }
+    });
+
+    it('draws nothing at all for a spot the pointer already stands on', () => {
+      for (const seed of [41, 42, 43]) {
+        for (const to of [
+          from,
+          {x: from.x + 1, y: from.y},
+          {x: from.x, y: from.y - 2},
+          {x: from.x + 2, y: from.y + 2},
+        ]) {
+          const path = pathBetween(seededRandom(seed), to);
+
+          assert.deepStrictEqual(
+            path.points,
+            [],
+            `(${to.x}, ${to.y}) was travelled to from (${from.x}, ${from.y})`,
+          );
+          assert.strictEqual(path.durationMs, 0);
+        }
+      }
+    });
+
+    it('takes no more points than the distance can carry', () => {
+      for (const seed of [44, 45, 46]) {
+        for (const distance of [POINTER_SHORTEST_STEP_PX, 10, 20, 44]) {
+          const {points} = pathBetween(seededRandom(seed), {
+            x: from.x + distance,
+            y: from.y,
+          });
+
+          assert.ok(points.length >= 1, `${distance} px went in one jump`);
+          assert.ok(
+            points.length <= Math.floor(distance / POINTER_SHORTEST_STEP_PX),
+            `${points.length} points over ${distance} px`,
+          );
+        }
+      }
+      // The floor of eight points would have made this hop a crawl of eight
+      // events over up to 360 ms.
+      const {points} = pathBetween(seededRandom(47), {
+        x: from.x + 10,
+        y: from.y,
+      });
+      assert.ok(points.length < POINTER_POINTS_MIN);
     });
 
     it('leaves both endpoints out', () => {

@@ -18,8 +18,8 @@
  * The figures the brake works to: a key stays down 70–140 ms, the gap to the
  * next press is 15–80 ms, and every paced action is preceded by a 250–700 ms
  * pause. A target the page had to jump to costs a further 1000–1200 ms before
- * the action follows. The pointer reaches that target along a drawn path of
- * 8–20 points with 8–45 ms between them, and the pause in front of the action
+ * the action follows. The pointer reaches that target along a drawn path of at
+ * most 20 points with 8–45 ms between them, and the pause in front of the action
  * pays for it: what is left of it once the path's own duration is known is what
  * is waited out. A 400–900 ms settle window follows the action, charged per
  * action like the pauses, because the wrapper that waits it out is entered once
@@ -127,10 +127,23 @@ export const SETTLE_MAX_MS = 900;
 /**
  * Fewest and most points one pointer path is sampled at. The floor keeps a
  * short hop from being a single jump, the ceiling keeps a path across a wide
- * window from becoming a stream of hundreds of events.
+ * window from becoming a stream of hundreds of events. The floor holds only as
+ * far as the distance carries it (`POINTER_SHORTEST_STEP_PX`).
  */
 export const POINTER_POINTS_MIN = 8;
 export const POINTER_POINTS_MAX = 20;
+
+/**
+ * Shortest hop one point of a path may stand for. A hand moves a pointer at a
+ * finite speed and the device reports at a finite rate, so how many events a
+ * movement can produce is bounded by how far it goes: a path is given the floor
+ * of points only where there is that much distance to spread over them, and a
+ * distance below this is not travelled at all. A pointer that does not move
+ * emits nothing on any real input stack, so a burst of events at coordinates it
+ * already stands on is a shape no hardware produces; the move that carries the
+ * interaction's own conditions is what puts it on the target.
+ */
+export const POINTER_SHORTEST_STEP_PX = 4;
 
 /**
  * Shortest and longest stride between two points of a path. The distance
@@ -537,6 +550,10 @@ function smoothstep(u: number): number {
  * at the drawn curvature, sampled at as many points as the distance and the
  * drawn stride call for.
  *
+ * How many points that is stays within what the distance can plausibly carry:
+ * the floor is granted only as far as `POINTER_SHORTEST_STEP_PX` allows, and a
+ * target the pointer already stands on is not travelled to at all.
+ *
  * Both endpoints are excluded. The first is where the pointer already stands,
  * and the last is dispatched by the move that carries the interaction's own
  * conditions, which re-resolves the target rather than trusting the point this
@@ -551,10 +568,17 @@ export function drawPointerPath(
   const dx = to.x - from.x;
   const dy = to.y - from.y;
   const distance = Math.hypot(dx, dy);
+  if (distance < POINTER_SHORTEST_STEP_PX) {
+    return {points: [], durationMs: 0};
+  }
   const stride = drawSkewed(POINTER_STRIDE_MIN_PX, POINTER_STRIDE_MAX_PX);
+  const fewest = Math.min(
+    POINTER_POINTS_MIN,
+    Math.floor(distance / POINTER_SHORTEST_STEP_PX),
+  );
   const count = Math.min(
     POINTER_POINTS_MAX,
-    Math.max(POINTER_POINTS_MIN, Math.round(distance / stride)),
+    Math.max(fewest, Math.round(distance / stride)),
   );
   const curvature = drawSkewed(POINTER_CURVATURE_MIN, POINTER_CURVATURE_MAX);
   // The offset is the distance times the curvature along the unit
