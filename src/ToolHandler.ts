@@ -211,6 +211,44 @@ let lastNavigationEndedAtMs: number | undefined;
 type ToolMutexGuard = Awaited<ReturnType<Mutex['acquire']>>;
 
 /**
+ * The one tool that must not queue behind the call it exists to rescue.
+ *
+ * The tool mutex is there so that two calls cannot drive one page at the same
+ * time. `handle_dialog` drives nothing: it reads no page state, writes no file,
+ * and its only contact with the page is `Page.handleJavaScriptDialog`, a
+ * browser-level command that a renderer paused by a dialog does answer. Behind
+ * the mutex it would wait out the very call the dialog is holding, which is the
+ * whole ceiling of that call — measured at 50 s in a case whose only way out is
+ * this tool.
+ *
+ * What it frees is the dialog, not the queue. The moment it is cleared the
+ * renderer resumes and the CDP command that ran into the dialog is answered, so
+ * that one keystroke or that one mouse release still lands on the page; the
+ * blocked call then finishes on its own and only then hands the tool mutex on.
+ * A caller waiting behind it is therefore released by the call ahead ending, not
+ * by this one returning.
+ */
+const DIALOG_LATCH_TOOL = 'handle_dialog';
+
+/**
+ * What lets `handle_dialog` past the queue: a mutex of its own, so two of them
+ * still serialize against each other, and the way to ask whether a browser
+ * exists already.
+ *
+ * Both are needed together. Without a context the call would have to build the
+ * browser first, which is process-wide work that must not run beside another
+ * call doing the same, so a `handle_dialog` that arrives before any browser
+ * exists takes the normal path — there is no dialog to clear on a browser that
+ * was never started.
+ */
+export interface DialogLatch {
+  /** The latch `handle_dialog` takes instead of the tool mutex. */
+  readonly mutex: Mutex;
+  /** Whether a browser and its context are already there. */
+  readonly hasContext: () => boolean;
+}
+
+/**
  * Waits for the process-wide tool mutex and gives up after
  * `MUTEX_WAIT_CEILING_MS`, so a call queued behind a braked fill that holds the
  * browser for minutes ends with a statement instead of standing in line
@@ -251,6 +289,7 @@ export class ToolHandler {
     private readonly serverArgs: ReturnType<typeof parseArguments>,
     private readonly getContext: () => Promise<McpContext>,
     private readonly toolMutex: Mutex,
+    private readonly dialogLatch?: DialogLatch,
   ) {
     const {disabled, reason} = getToolStatusInfo(tool, serverArgs);
     this.disabledReason = reason;
@@ -264,6 +303,20 @@ export class ToolHandler {
         ? {...pageIdSchema, ...tool.schema}
         : tool.schema;
     this.registeredInputSchema = zod.object(this.inputSchema).passthrough();
+  }
+
+  /**
+   * Whether this call takes the dialog latch rather than the tool mutex. The
+   * daemon must not depend on a caller keeping the same exemption on its own
+   * side, so the decision is made here, from the tool name and the state of the
+   * browser.
+   */
+  private dialogLatchMutex(): Mutex | undefined {
+    if (this.tool.name !== DIALOG_LATCH_TOOL) {
+      return undefined;
+    }
+    const latch = this.dialogLatch;
+    return latch?.hasContext() ? latch.mutex : undefined;
   }
 
   unknownArgumentNames(params: Record<string, unknown>): string[] {
@@ -319,13 +372,22 @@ export class ToolHandler {
     // the browser late: a throw on the way to the work below would otherwise
     // leave the process-wide mutex held and every later call would wait out
     // `MUTEX_WAIT_CEILING_MS` and fail.
-    using guard = await acquireWithinCeiling(this.toolMutex);
+    //
+    // Which mutex is waited for is the one thing that differs per call:
+    // `handle_dialog` takes the dialog latch, so the call that can free a
+    // wedged browser does not stand in line behind it (`DIALOG_LATCH_TOOL`).
+    // The ceiling applies to either, so no call waits for a mutex forever.
+    const dialogLatch = this.dialogLatchMutex();
+    using guard = await acquireWithinCeiling(dialogLatch ?? this.toolMutex);
     if (!guard) {
+      const holder = dialogLatch
+        ? 'another dialog call was still being handled'
+        : 'another call was still holding it';
       return {
         content: [
           {
             type: 'text',
-            text: `Waited ${MUTEX_WAIT_CEILING_MS} ms for the browser and gave up: another call was still holding it. Nothing of this call reached the page — the ceiling hit is the wait for the browser, not the work budget, which had not started.`,
+            text: `Waited ${MUTEX_WAIT_CEILING_MS} ms for the browser and gave up: ${holder}. Nothing of this call reached the page — the ceiling hit is the wait for the browser, not the work budget, which had not started.`,
           },
         ],
         isError: true,

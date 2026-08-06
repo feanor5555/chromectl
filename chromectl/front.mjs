@@ -343,9 +343,30 @@ const daemonOperations = new Map();
  *
  * Several live callers on one browser stay legitimate — the daemon's mutex
  * serializes them — so the entries are a set per browser and only an abandoned
- * one bars the next call.
+ * one bars the next call, and it does not bar
+ * `ABANDONMENT_EXEMPT_COMMAND`.
  */
 const callsInFlight = new Map();
+
+/**
+ * The one command a browser takes while it is still carrying out an abandoned
+ * call.
+ *
+ * A standing dialog blocks input and inspection alike, and it is the usual
+ * reason a call was abandoned: the caller's own timeout fired while the call sat
+ * behind the prompt. `handle_dialog` is the only command that clears it, so
+ * refusing it as well would lock the door on the key and leave the browser
+ * wedged for the whole budget of a call nobody waits for any more.
+ *
+ * The exemption is one named command, never a category, and it opens nothing
+ * else: `handle_dialog` is admitted only after the name has been checked against
+ * the allow-list and its arguments against upstream's schema, it carries nothing
+ * but `accept`/`dismiss` and a prompt text, it reads no page state and it writes
+ * no file — `planWrittenFile` knows it not. Nor is it a second way onto the
+ * page: while one exempt call is in flight the next is refused, so at most one
+ * caller ever clears the dialog and none drives the page beside it.
+ */
+const ABANDONMENT_EXEMPT_COMMAND = 'handle_dialog';
 
 /** The abandoned call of one browser, or nothing while every client is there. */
 function abandonedCall(sessionId) {
@@ -357,25 +378,30 @@ function abandonedCall(sessionId) {
   return undefined;
 }
 
-/**
- * Refuses a call against a browser that is still carrying out one nobody waits
- * for any more. The message names the command, its age and the rest of its
- * budget, because the only sound answer to it is to wait that long: the work
- * cannot be stopped, and what it has already typed stays typed.
- */
-function assertNoAbandonedCall(resolved) {
-  const entry = abandonedCall(resolved.sessionId);
-  if (!entry) {
-    return;
+/** The exempt call of one browser, or nothing while none is running. */
+function exemptCall(sessionId) {
+  for (const entry of callsInFlight.get(sessionId) ?? []) {
+    if (entry.command === ABANDONMENT_EXEMPT_COMMAND) {
+      return entry;
+    }
   }
+  return undefined;
+}
+
+/**
+ * Refuses a call and names the one that stands in its way, its age and the rest
+ * of its budget, because the only sound answer to such a refusal is to wait that
+ * long: the work cannot be stopped, and what it has already typed stays typed.
+ */
+function refuseBehind(resolved, entry, standing, reason) {
   const runningMs = Date.now() - entry.startedAtMs;
   const remainingMs = Math.max(0, entry.budgetMs - runningMs);
   throw new CallError(
     'busy',
-    `${resolved.target} is still carrying out an abandoned ${entry.command}, ` +
+    `${resolved.target} ${standing}, ` +
       `started ${Math.round(runningMs / 1000)} s ago, ` +
       `up to ${Math.round(remainingMs / 1000)} s of its budget left — ` +
-      'nothing can stop it, so this call is refused instead of queueing behind it',
+      reason,
     {
       running_command: entry.command,
       running_ms: runningMs,
@@ -383,6 +409,39 @@ function assertNoAbandonedCall(resolved) {
       remaining_ms: remainingMs,
     },
   );
+}
+
+/**
+ * Decides whether one call is let through to the browser at all.
+ *
+ * A browser still carrying out a call nobody waits for any more takes no second
+ * one; the exempt command is the single exception and is bounded by one of its
+ * own kind at a time.
+ */
+function assertAdmissible(resolved, command) {
+  if (command === ABANDONMENT_EXEMPT_COMMAND) {
+    const running = exemptCall(resolved.sessionId);
+    if (running) {
+      refuseBehind(
+        resolved,
+        running,
+        `is already clearing a dialog with a ${running.command}`,
+        'a second one would drive the page beside it, so this call is refused',
+      );
+    }
+    return;
+  }
+  const entry = abandonedCall(resolved.sessionId);
+  if (entry) {
+    refuseBehind(
+      resolved,
+      entry,
+      `is still carrying out an abandoned ${entry.command}`,
+      'nothing can stop it, so this call is refused instead of queueing behind ' +
+        `it; ${ABANDONMENT_EXEMPT_COMMAND} is admitted meanwhile and is the way ` +
+        'out when a dialog is what it sits behind',
+    );
+  }
 }
 
 /** Notes one call as running and hands back the note to end it with. */
@@ -1073,8 +1132,8 @@ async function invoke(target, command, args, fullSpeed, publicBase, client) {
   }
 
   // Before anything is planned, written or sent: a browser still carrying out a
-  // call nobody waits for takes no second one.
-  assertNoAbandonedCall(resolved);
+  // call nobody waits for takes no second one, bar the one that clears a dialog.
+  assertAdmissible(resolved, command);
   const entry = registerCall(
     resolved,
     command,

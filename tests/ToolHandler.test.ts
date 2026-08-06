@@ -433,6 +433,134 @@ describe('ToolHandler', () => {
     });
   });
 
+  describe('the latch that clears a dialog', () => {
+    function latchedTool(options: {
+      name: string;
+      toolMutex: Mutex;
+      dialogMutex: Mutex;
+      hasContext: boolean;
+    }) {
+      let handlerCalled = false;
+      const tool: ToolDefinition = {
+        name: options.name,
+        description: 'A tool that may or may not take the dialog latch',
+        annotations: {
+          category: ToolCategory.INPUT,
+          readOnlyHint: false,
+        },
+        schema: {},
+        blockedByDialog: false,
+        verifyFilesSchema: [],
+        handler: async () => {
+          handlerCalled = true;
+        },
+      };
+
+      const serverArgs = parseArguments('1.0.0', ['node', 'script.js'], {
+        CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: 'true',
+      });
+      const handler = new ToolHandler(
+        tool,
+        serverArgs,
+        async () => sinon.createStubInstance(McpContext),
+        options.toolMutex,
+        {
+          mutex: options.dialogMutex,
+          hasContext: () => options.hasContext,
+        },
+      );
+      return {handler, wasCalled: () => handlerCalled};
+    }
+
+    /**
+     * Runs one call while the given mutex is held and reports whether it got
+     * through without that mutex being released. It is released either way, so
+     * a call that did queue behind it still ends.
+     */
+    async function completesWhileHeld(
+      handler: ToolHandler,
+      mutex: Mutex,
+    ): Promise<boolean> {
+      const held = await mutex.acquire();
+      const pending = handler.handle({});
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const gotThrough = await Promise.race([
+        pending.then(() => true),
+        new Promise<boolean>(resolve => {
+          timer = setTimeout(() => {
+            resolve(false);
+          }, 500);
+        }),
+      ]);
+      clearTimeout(timer);
+      held[Symbol.dispose]();
+      await pending;
+      return gotThrough;
+    }
+
+    it('lets handle_dialog past the call that is holding the browser', async () => {
+      const toolMutex = new Mutex();
+      const {handler, wasCalled} = latchedTool({
+        name: 'handle_dialog',
+        toolMutex,
+        dialogMutex: new Mutex(),
+        hasContext: true,
+      });
+
+      assert.strictEqual(await completesWhileHeld(handler, toolMutex), true);
+      assert.strictEqual(wasCalled(), true);
+    });
+
+    it('holds every other tool at the tool mutex', async () => {
+      const toolMutex = new Mutex();
+      const {handler} = latchedTool({
+        name: 'click',
+        toolMutex,
+        dialogMutex: new Mutex(),
+        hasContext: true,
+      });
+
+      assert.strictEqual(await completesWhileHeld(handler, toolMutex), false);
+    });
+
+    it('holds handle_dialog at the tool mutex while no browser exists yet', async () => {
+      const toolMutex = new Mutex();
+      const {handler} = latchedTool({
+        name: 'handle_dialog',
+        toolMutex,
+        dialogMutex: new Mutex(),
+        hasContext: false,
+      });
+
+      assert.strictEqual(await completesWhileHeld(handler, toolMutex), false);
+    });
+
+    it('serializes two dialog calls against each other', async () => {
+      const dialogMutex = new Mutex();
+      const {handler} = latchedTool({
+        name: 'handle_dialog',
+        toolMutex: new Mutex(),
+        dialogMutex,
+        hasContext: true,
+      });
+
+      assert.strictEqual(await completesWhileHeld(handler, dialogMutex), false);
+    });
+
+    it('does not hold an ordinary tool at the dialog latch', async () => {
+      const dialogMutex = new Mutex();
+      const {handler, wasCalled} = latchedTool({
+        name: 'click',
+        toolMutex: new Mutex(),
+        dialogMutex,
+        hasContext: true,
+      });
+
+      assert.strictEqual(await completesWhileHeld(handler, dialogMutex), true);
+      assert.strictEqual(wasCalled(), true);
+    });
+  });
+
   it('sets shouldRegister to false and returns disabled reason when category is disabled', async () => {
     let handlerCalled = false;
     const tool: ToolDefinition = {

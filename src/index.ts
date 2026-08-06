@@ -20,6 +20,7 @@ import {
   ListRootsResultSchema,
   RootsListChangedNotificationSchema,
 } from './third_party/index.js';
+import type {DialogLatch} from './ToolHandler.js';
 import {ToolHandler} from './ToolHandler.js';
 import type {DefinedPageTool, ToolDefinition} from './tools/ToolDefinition.js';
 import {createTools} from './tools/tools.js';
@@ -164,6 +165,13 @@ export async function createMcpServer(
   }
 
   const toolMutex = new Mutex();
+  // The latch `handle_dialog` takes instead of the tool mutex, so the one call
+  // that can clear a dialog does not queue behind the call the dialog is
+  // holding. It is a mutex of its own, so two dialog calls still serialize.
+  const dialogLatch: DialogLatch = {
+    mutex: new Mutex(),
+    hasContext: () => context !== undefined,
+  };
 
   function registerTool(tool: ToolDefinition | DefinedPageTool): void {
     const toolHandler = new ToolHandler(
@@ -171,6 +179,7 @@ export async function createMcpServer(
       serverArgs,
       getContext,
       toolMutex,
+      dialogLatch,
     );
 
     if (!toolHandler.shouldRegister) {
