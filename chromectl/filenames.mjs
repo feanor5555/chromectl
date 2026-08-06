@@ -210,7 +210,7 @@ export function generatedName(target) {
 }
 
 /** The same name with the ending the file it stands for carries. */
-export function generatedFileName(target, extension) {
+function generatedFileName(target, extension) {
   return `${generatedName(target)}.${extension}`;
 }
 

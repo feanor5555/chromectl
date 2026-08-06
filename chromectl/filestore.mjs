@@ -12,6 +12,10 @@
  * entry it acts on and holds nothing of its own: which names are taken, what a
  * call planned and which file belongs to which call stays with `fileplan.mjs`
  * and `fileresult.mjs`, and both reach the drive through here.
+ *
+ * One thing about a plan entry is known here: `settleLeftoverFile` reads a file
+ * record's `writePath` and `filePath` to tell a file written straight under the
+ * name the answer carries from one written under a name of the front's own.
  */
 
 import fs from 'node:fs/promises';

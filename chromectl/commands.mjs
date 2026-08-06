@@ -52,8 +52,8 @@ export function enumeratedArgument(command, argument) {
   const definition = COMMAND_SCHEMAS.get(command)?.[argument];
   if (definition?.enum === undefined) {
     throw new Error(
-      `${command}.${argument} carries no fixed set of values in the command ` +
-        `table, so the endings of ${command} cannot be taken from it`,
+      `chromectl: ${command}.${argument} carries no fixed set of values in the ` +
+        `command table, so the endings of ${command} cannot be taken from it`,
     );
   }
   return {

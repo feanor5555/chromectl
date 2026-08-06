@@ -37,8 +37,12 @@ export default defineConfig([
         projectService: {
           // The files below sit outside the TypeScript program and are linted
           // through the default project, whose match count is capped. The
-          // chromectl front is several modules, so the cap is lifted above the
+          // chromectl front is several modules, so the cap is lifted to the
           // number of files that reach it; the slower lint run is the price.
+          // The count is the four named files plus the eleven modules in
+          // `chromectl/` plus `compare_snapshots.js`, so a twelfth module there
+          // needs the cap raised with it — otherwise the lint run fails with a
+          // message about a TypeScript project cap and no word of the new file.
           maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 16,
           allowDefaultProject: [
             '.prettierrc.cjs',
