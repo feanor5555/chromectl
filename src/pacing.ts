@@ -88,7 +88,27 @@ export const SCROLL_PAUSE_MAX_MS = 1_200;
 export const MOUSE_HOLD_MIN_MS = 150;
 export const MOUSE_HOLD_MAX_MS = 195;
 
-/** Longest settle window after an action has run. */
+/**
+ * Shortest and longest gap between the release of one click and the press of
+ * the next one within a double click. Both are operator settings, not measured
+ * values: no peer-reviewed figure for the interval inside a human double click
+ * exists. The upper end is chosen so that the whole distance from the first
+ * press to the second — one hold plus this gap, at most 375 ms — stays below
+ * the shortest double-click threshold a desktop uses, while the lower end stays
+ * far enough above zero to be a hand rather than a dispatch loop. Like the hold
+ * it is short enough that the budget covers it out of its safety margin.
+ */
+export const MOUSE_CLICK_GAP_MIN_MS = 90;
+export const MOUSE_CLICK_GAP_MAX_MS = 180;
+
+/**
+ * Shortest and longest settle window after an action has run, drawn like every
+ * other interval. It is the one interval that imitates nobody: it waits for the
+ * page instead of for a person, which is why it is not part of a pace profile
+ * and is never shortened — a call at full speed waits it out as well, and the
+ * fixed overhead of every call carries it.
+ */
+export const SETTLE_MIN_MS = 400;
 export const SETTLE_MAX_MS = 900;
 
 /** Longest gap held open before a call is allowed to navigate. */
@@ -149,6 +169,11 @@ export interface PaceProfile {
   /** How long the mouse button stays down on a click. */
   readonly mouseHoldMs: readonly [number, number];
   /**
+   * The gap between the release of one click and the press of the next inside a
+   * double click.
+   */
+  readonly mouseClickGapMs: readonly [number, number];
+  /**
    * Whether a text field takes its value in one shot instead of keystroke by
    * keystroke. Nothing about a value set directly can be paced, which is why
    * this belongs to the profile rather than to the field.
@@ -164,6 +189,7 @@ export const PACE_HUMAN: PaceProfile = {
   preActionPauseMs: [PRE_ACTION_PAUSE_MIN_MS, PRE_ACTION_PAUSE_MAX_MS],
   scrollPauseMs: [SCROLL_PAUSE_MIN_MS, SCROLL_PAUSE_MAX_MS],
   mouseHoldMs: [MOUSE_HOLD_MIN_MS, MOUSE_HOLD_MAX_MS],
+  mouseClickGapMs: [MOUSE_CLICK_GAP_MIN_MS, MOUSE_CLICK_GAP_MAX_MS],
   fillsInOneShot: false,
 };
 
@@ -175,6 +201,7 @@ export const PACE_FULL: PaceProfile = {
   preActionPauseMs: [0, 0],
   scrollPauseMs: [0, 0],
   mouseHoldMs: [0, 0],
+  mouseClickGapMs: [0, 0],
   fillsInOneShot: true,
 };
 
@@ -285,6 +312,14 @@ export function drawMouseHoldMs(): number {
 }
 
 /**
+ * The gap between two clicks of one double click, waited out between the
+ * release of the first and the press of the second.
+ */
+export function sleepMouseClickGapMs(): Promise<number> {
+  return sleepAtPace(activePace.mouseClickGapMs);
+}
+
+/**
  * The pause a person spends before acting: reaching the next field, looking at
  * it, moving there. It is taken before the action begins, not after it.
  */
@@ -303,6 +338,39 @@ export async function pauseAfterScroll(scrolled: boolean): Promise<number> {
     return 0;
   }
   return await sleepAtPace(activePace.scrollPauseMs);
+}
+
+/**
+ * The window that follows an action, waited out on top of the helper's own wait
+ * for a navigation and for a DOM that stops mutating. Those two end the moment
+ * the page goes quiet, which puts the next call a fixed ~100 ms after the last
+ * mutation every time; this window is what a person spends taking in what the
+ * page now shows. It belongs to no profile, so it is waited out at full speed
+ * as well.
+ */
+export function settleAfterAction(): Promise<number> {
+  return pacedSleep(SETTLE_MIN_MS, SETTLE_MAX_MS);
+}
+
+/**
+ * Holds the minimum gap open between two navigations of the same target: the
+ * remainder of `NAVIGATION_GAP_MAX_MS` since the previous one ended, or nothing
+ * when that long has passed already or nothing has navigated yet. A fast page
+ * load is not suspicious, a fast sequence of them is, and the sequence is the
+ * one signal a site gets without running any script.
+ */
+export async function holdNavigationGap(
+  previousNavigationEndedAtMs: number | undefined,
+): Promise<number> {
+  if (previousNavigationEndedAtMs === undefined) {
+    return 0;
+  }
+  const remainingMs = Math.max(
+    0,
+    NAVIGATION_GAP_MAX_MS - (Date.now() - previousNavigationEndedAtMs),
+  );
+  await sleepMs(remainingMs);
+  return remainingMs;
 }
 
 /** The arguments of one tool call, as they arrive over the daemon socket. */

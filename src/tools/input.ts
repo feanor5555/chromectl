@@ -13,6 +13,7 @@ import {
   pauseAfterScroll,
   pauseBeforeAction,
   sleepKeyIntervalMs,
+  sleepMouseClickGapMs,
   sleepMs,
 } from '../pacing.js';
 import {_keyDefinitions, zod} from '../third_party/index.js';
@@ -160,8 +161,12 @@ function pressOptions(clickCount: number): Readonly<MouseOptions> {
  * The approach stays with `Locator.hover`, so the locator's viewport and
  * stability conditions still run; only the press and the release are taken
  * from the mouse directly, because `Locator.click` cannot hand its release
- * back. A double click is two presses with the hold on the last of them, which
- * is where `mouse.click` puts it as well.
+ * back. A double click is two complete clicks: every press of it holds the
+ * button for its own drawn span and a drawn gap separates one click from the
+ * next, so neither half is a zero-length press and the two are not sent in the
+ * same instant. `mouse.click` reaches neither of those — its single `delay` is
+ * the dwell of the last press and it leaves the earlier ones and the gap
+ * between them at zero.
  */
 async function pressPaced(
   handle: ElementHandle<Element>,
@@ -173,7 +178,9 @@ async function pressPaced(
   });
   for (let count = 1; count < clickCount; count++) {
     await mouse.down(pressOptions(count));
+    await sleepMs(drawMouseHoldMs());
     await mouse.up(pressOptions(count));
+    await sleepMouseClickGapMs();
   }
   await mouse.down(pressOptions(clickCount));
   await sleepMs(drawMouseHoldMs());
@@ -200,15 +207,48 @@ async function selectAllPaced(keyboard: Keyboard): Promise<void> {
 }
 
 /**
- * Whether the element takes a keystroke stream, and whether it already holds
- * something to type over. The classification matches the one inside
+ * What the field is and what it already holds, measured against the value it is
+ * to end up with.
+ */
+interface TypeableField {
+  /** Whether the element takes a keystroke stream at all. */
+  typeable: boolean;
+  /** Whether it holds anything that would have to be typed over. */
+  hasContent: boolean;
+  /** Whether it already holds exactly the value, so nothing is to be typed. */
+  alreadyEqual: boolean;
+  /**
+   * How much of what it holds is a leading part of the value and can stay: the
+   * length of the current content when the value continues it, otherwise 0.
+   */
+  keptPrefixLength: number;
+}
+
+/**
+ * Reads that classification off the element. It matches the one inside
  * `Locator.fill`, so everything that would have been set in one shot — a
- * `<select>`, a date, colour or range input — keeps taking that route.
+ * `<select>`, a date, colour or range input — keeps taking that route, and the
+ * three cases `Locator.fill` distinguishes for a field it types into survive on
+ * the paced path: leave it alone, continue it, or type over it. The comparison
+ * is made in the page so the field's current content, a password among them,
+ * does not have to be carried out of it.
  */
 async function readTypeableField(
   handle: ElementHandle<Element>,
-): Promise<{typeable: boolean; hasContent: boolean}> {
-  return await handle.evaluate(element => {
+  value: string,
+): Promise<TypeableField> {
+  return await handle.evaluate((element, target): TypeableField => {
+    const classify = (typeable: boolean, current: string): TypeableField => {
+      const alreadyEqual = current === target;
+      const continues =
+        !alreadyEqual && current.length > 0 && target.startsWith(current);
+      return {
+        typeable,
+        hasContent: current.length > 0,
+        alreadyEqual,
+        keptPrefixLength: continues ? current.length : 0,
+      };
+    };
     if (element instanceof HTMLInputElement) {
       const typeableTypes = [
         'text',
@@ -219,18 +259,47 @@ async function readTypeableField(
         'number',
         'email',
       ];
-      return {
-        typeable: typeableTypes.includes(element.type),
-        hasContent: element.value.length > 0,
-      };
+      return classify(typeableTypes.includes(element.type), element.value);
     }
     if (element instanceof HTMLTextAreaElement) {
-      return {typeable: true, hasContent: element.value.length > 0};
+      return classify(true, element.value);
     }
     if (element instanceof HTMLElement && element.isContentEditable) {
-      return {typeable: true, hasContent: element.innerText.length > 0};
+      return classify(true, element.innerText);
     }
-    return {typeable: false, hasContent: false};
+    return {
+      typeable: false,
+      hasContent: false,
+      alreadyEqual: false,
+      keptPrefixLength: 0,
+    };
+  }, value);
+}
+
+/**
+ * Puts the text entry cursor behind what the field already holds, so the
+ * keystrokes that follow continue that text instead of landing in front of it.
+ * Nothing about the content changes and no input event is emitted: a native
+ * field takes the cursor from the assignment of the value it already has, and
+ * an editable element takes it from a collapsed range over its own content.
+ */
+async function placeCaretAtEnd(handle: ElementHandle<Element>): Promise<void> {
+  await handle.evaluate(element => {
+    if (
+      element instanceof HTMLInputElement ||
+      element instanceof HTMLTextAreaElement
+    ) {
+      const current = element.value;
+      element.value = '';
+      element.value = current;
+      return;
+    }
+    const range = element.ownerDocument.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    const selection = element.ownerDocument.defaultView?.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
   });
 }
 
@@ -605,11 +674,20 @@ function hasOptionChildren(aXNode: TextSnapshotNode) {
 }
 
 /**
+ * The interaction of a fill that has nothing to change. The caller waits for
+ * one, and an element already holding its value is reached by not touching it.
+ */
+async function changeNothing(): Promise<void> {
+  return;
+}
+
+/**
  * Decides how the element takes its value and runs everything that leads up to
- * the change: the pause before the field, the focus, the select-all over what
- * the field already holds and every keystroke but the last. What comes back is
- * the interaction that changes the element — the last keystroke, or the
- * one-shot set for a field that takes no keystrokes at all.
+ * the change: the focus, whatever has to happen to what the field already holds
+ * and every keystroke but the last. What comes back is the interaction that
+ * changes the element — the last keystroke, the one-shot set for a field that
+ * takes no keystrokes at all, or nothing when the field already holds the
+ * value.
  */
 async function buildFillAction(
   handle: ElementHandle<Element>,
@@ -617,10 +695,10 @@ async function buildFillAction(
   value: string,
   page: ContextPage,
 ): Promise<() => Promise<void>> {
-  // The pause belongs at the transition to this field: reaching it, looking
-  // at it. `fill_form` enters here once per element, so every field pays it
-  // once, before anything of its own runs.
-  await pauseBeforeAction();
+  // The pause at the transition to this field — reaching it, looking at it —
+  // is taken by the wrapper this runs inside. `fill_form` enters that wrapper
+  // once per element, so every field pays it once, before anything of its own
+  // runs.
   const aXNode = page.getAXNodeByUid(uid);
   // We assume that combobox needs to be handled as select if it has
   // role='combobox' and option children.
@@ -649,7 +727,7 @@ async function buildFillAction(
     };
   }
 
-  const field = await readTypeableField(handle);
+  const field = await readTypeableField(handle, value);
   if (!field.typeable || currentPace().fillsInOneShot) {
     // Two cases take the one-shot route: a field that has no keystroke stream
     // to pace — a `<select>`, a date, a colour, a range — and every field at
@@ -674,11 +752,24 @@ async function buildFillAction(
 
   const keyboard = page.pptrPage.keyboard;
   await waitUntilReadyForTyping(handle);
+  if (field.alreadyEqual) {
+    // The field already reads as it is meant to read. Typing it again would
+    // clear a filled-out form field and rebuild it keystroke by keystroke in
+    // front of anyone watching, for no change at all.
+    return changeNothing;
+  }
   await handle.focus();
-  if (field.hasContent) {
+  let text = value;
+  if (field.keptPrefixLength > 0) {
+    // What stands there is the beginning of what is wanted, so it stays and
+    // only the rest is typed. Cutting by the length of the field's own content
+    // cannot fall inside a surrogate pair: the value continues that content.
+    await placeCaretAtEnd(handle);
+    text = value.slice(field.keptPrefixLength);
+  } else if (field.hasContent) {
     await selectAllPaced(keyboard);
   }
-  const {lead, last} = splitLastKeystroke(value);
+  const {lead, last} = splitLastKeystroke(text);
   await typePaced(keyboard, lead);
   return async () => {
     await typePaced(keyboard, last, {continuesStream: lead.length > 0});

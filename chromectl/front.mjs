@@ -663,6 +663,26 @@ function reclassifyScreenshotFailure(error, plan) {
 }
 
 /**
+ * Widens a screenshot a failed call left behind. A call that hits its deadline
+ * or fails after the picture was written still leaves the daemon's 0600 file on
+ * the drive, and a file only the front's uid can read is of no use to an NFS
+ * client arriving under its own. It is therefore made readable exactly like the
+ * file of a successful call.
+ *
+ * Best effort by design: a call that failed before the write leaves nothing to
+ * widen, and a chmod that fails here must not displace the failure being
+ * reported to the caller.
+ */
+async function widenLeftoverScreenshot(plan) {
+  try {
+    await fs.chmod(plan.filePath, SCREENSHOT_FILE_MODE);
+  } catch {
+    // No file written, or one this process cannot chmod: the call's own
+    // failure is what the caller gets.
+  }
+}
+
+/**
  * Confirms the file the daemon was told to write really is there and makes it
  * readable for everyone reaching the drive, then describes it. A tool call that
  * reports success without a file on disk is a storage failure, not a result.
@@ -755,7 +775,11 @@ async function invoke(target, command, args, fullSpeed, publicBase) {
   try {
     outcome = await runCommand(resolved, command, toolArgs, atFullSpeed);
   } catch (error) {
-    throw plan ? reclassifyScreenshotFailure(error, plan) : error;
+    if (!plan) {
+      throw error;
+    }
+    await widenLeftoverScreenshot(plan);
+    throw reclassifyScreenshotFailure(error, plan);
   }
   const {parsed, elapsedMs} = outcome;
 

@@ -61,6 +61,7 @@ import {
   createTargetUniverse,
   type TargetUniverse,
 } from './devtools/DevtoolsUtils.js';
+import {pauseBeforeAction, settleAfterAction} from './pacing.js';
 import {
   ConsoleCollector,
   NetworkCollector,
@@ -412,7 +413,28 @@ export class McpPage implements ContextPage {
     return new WaitForHelper(this.pptrPage, cpuMultiplier, networkMultiplier);
   }
 
-  waitForEventsAfterAction(
+  /**
+   * Runs one action and waits for what it set off. Everything that wraps an
+   * action passes through here, which makes it the single place for the pause
+   * before the action and the settle window after it — the pause covers every
+   * wrapped tool at once, and neither of the two is inside `WaitForHelper`,
+   * whose navigation expectation is armed the moment it is entered and would
+   * count a sleep placed in front of the action against that window.
+   */
+  async waitForEventsAfterAction(
+    action: () => Promise<unknown>,
+    options?: {
+      timeout?: number;
+      handleDialog?:
+        DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
+    },
+  ): Promise<WaitForEventsResult> {
+    await pauseBeforeAction();
+    return await this.#waitForEvents(action, options);
+  }
+
+  /** The helper's own wait, with the settle window behind it. */
+  async #waitForEvents(
     action: () => Promise<unknown>,
     options?: {
       timeout?: number;
@@ -424,7 +446,9 @@ export class McpPage implements ContextPage {
       this.cpuThrottlingRate,
       getNetworkMultiplierFromString(this.networkConditions),
     );
-    return helper.waitForEventsAfterAction(action, options);
+    const result = await helper.waitForEventsAfterAction(action, options);
+    await settleAfterAction();
+    return result;
   }
 
   /**
@@ -440,6 +464,12 @@ export class McpPage implements ContextPage {
    * window before the page began to navigate, and the call would return a page
    * that is still on its way. Splitting the action moves that work in front of
    * the window instead of widening the window to fit it.
+   *
+   * The pause before the action belongs in front of `prepare`, not in front of
+   * the interaction it hands back: what the caller prepares is the approach to
+   * the element and the keystrokes leading up to the last one, so a pause taken
+   * after that would fall between the second-to-last and the last keystroke of
+   * a stream, or between a press and its release.
    */
   async waitForEventsAfterTrigger(
     prepare: () => Promise<() => Promise<unknown>>,
@@ -449,8 +479,9 @@ export class McpPage implements ContextPage {
         DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
     },
   ): Promise<WaitForEventsResult> {
+    await pauseBeforeAction();
     const trigger = await prepare();
-    return await this.waitForEventsAfterAction(trigger, options);
+    return await this.#waitForEvents(trigger, options);
   }
 
   dispose(): void {

@@ -10,6 +10,7 @@ import type {McpPage} from './McpPage.js';
 import type {DataFormat} from './McpResponse.js';
 import {McpResponse} from './McpResponse.js';
 import {
+  holdNavigationGap,
   isFullSpeedRequest,
   MUTEX_WAIT_CEILING_MS,
   selectPace,
@@ -19,11 +20,8 @@ import {ClearcutLogger} from './telemetry/ClearcutLogger.js';
 import {bucketizeLatency, buildContext} from './telemetry/transformation.js';
 import type {CallToolResult} from './third_party/index.js';
 import {zod} from './third_party/index.js';
-import {
-  labels,
-  OFF_BY_DEFAULT_CATEGORIES,
-  ToolCategory,
-} from './tools/categories.js';
+import type {ToolCategory} from './tools/categories.js';
+import {labels, OFF_BY_DEFAULT_CATEGORIES} from './tools/categories.js';
 import type {
   DefinedPageTool,
   DevToolsData,
@@ -156,6 +154,25 @@ function buildUnknownArgumentsMessage(
   return `Unknown ${unknownLabel} for tool "${toolName}": ${formatArgumentNames(unknownArgumentNames)}. ${expectedArguments} ${correction} and retry.`;
 }
 
+/**
+ * The tools that take the browser to another page. The gap between two of them
+ * is held open by name rather than by `ToolCategory.NAVIGATION`, because that
+ * category also carries pure reads — listing, selecting, closing and resizing a
+ * page — which navigate nothing and would be gapped for no reason.
+ */
+const NAVIGATING_TOOLS: ReadonlySet<string> = new Set([
+  'navigate_page',
+  'new_page',
+]);
+
+/**
+ * When the last navigating call of this process finished. One daemon serves one
+ * target, so module state here is per target, which is the granularity the gap
+ * is defined at. It survives across calls and is deliberately not per page: two
+ * tabs of one browser are one browsing session to anyone watching it.
+ */
+let lastNavigationEndedAtMs: number | undefined;
+
 /** The guard the tool mutex hands out. */
 type ToolMutexGuard = Awaited<ReturnType<Mutex['acquire']>>;
 
@@ -277,12 +294,18 @@ export class ToolHandler {
     }
     // The pace is put in place here because this is the one funnel every call
     // passes and it holds the process-wide mutex, so the profile of the call in
-    // flight cannot be read by another. Only input tools draw a paced value, so
-    // the switch reaches nothing outside that category.
-    const restorePace = selectPace(
-      this.tool.annotations.category === ToolCategory.INPUT &&
-        isFullSpeedRequest(meta),
-    );
+    // flight cannot be read by another. It is not narrowed to one category: the
+    // pause before an action is taken by every wrapped tool, a navigation among
+    // them, so a switch that only reached the input category would leave a
+    // paced value standing at full speed.
+    const fullSpeed = isFullSpeedRequest(meta);
+    const restorePace = selectPace(fullSpeed);
+    const navigates = NAVIGATING_TOOLS.has(this.tool.name);
+    if (navigates && !fullSpeed) {
+      // Held under the mutex, like every other paced wait: a gap the next call
+      // could walk through is no gap.
+      await holdNavigationGap(lastNavigationEndedAtMs);
+    }
     const startTime = Date.now();
     let success = false;
     let devToolsData: DevToolsData | undefined;
@@ -397,6 +420,11 @@ export class ToolHandler {
         latencyMs: bucketizeLatency(Date.now() - startTime),
         context,
       });
+      if (navigates) {
+        // Recorded whatever the profile was: a navigation at full speed is
+        // still the one the next braked navigation has to keep its gap from.
+        lastNavigationEndedAtMs = Date.now();
+      }
       restorePace();
       guard[Symbol.dispose]();
     }

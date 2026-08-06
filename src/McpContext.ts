@@ -69,6 +69,20 @@ interface McpContextOptions {
 // page of the reconnected browser.
 let nextPageId = 1;
 
+// Default mode for files written by tools: read/write for the owner only.
+const PRIVATE_FILE_MODE = 0o600;
+
+// Mode for saved image files. A screenshot is fetched from the drive by a
+// reader running under another uid, so it is created readable for everyone
+// right away instead of being widened after the fact.
+const IMAGE_FILE_MODE = 0o644;
+
+const IMAGE_EXTENSIONS: ReadonlySet<string> = new Set([
+  '.png',
+  '.jpeg',
+  '.webp',
+]);
+
 export class McpContext implements Context {
   browser: Browser;
   logger: Logger;
@@ -598,6 +612,7 @@ export class McpContext implements Context {
   async #writeFile(
     filepath: string,
     data: Uint8Array<ArrayBufferLike>,
+    mode: number = PRIVATE_FILE_MODE,
   ): Promise<void> {
     await this.validatePath(filepath);
 
@@ -608,14 +623,15 @@ export class McpContext implements Context {
       // - O_CREAT: Create if it doesn't exist
       // - O_TRUNC: Truncate to zero length if it exists
       // - O_NOFOLLOW: DO NOT follow symlinks.
-      // - 0o600: Permissions: read/write for owner, no permissions for others.
+      // The mode is carried by the same open call, so the file never exists
+      // with permissions other than the ones asked for.
       await fs.writeFile(filepath, data, {
         flag:
           fs.constants.O_WRONLY |
           fs.constants.O_CREAT |
           fs.constants.O_TRUNC |
           fs.constants.O_NOFOLLOW,
-        mode: 0o600,
+        mode,
       });
     } catch (err) {
       throw new Error(`Could not write ${filepath}`, {cause: err});
@@ -640,7 +656,11 @@ export class McpContext implements Context {
       clientProvidedFilePath,
       extension,
     );
-    await this.#writeFile(filePath, data);
+    await this.#writeFile(
+      filePath,
+      data,
+      IMAGE_EXTENSIONS.has(extension) ? IMAGE_FILE_MODE : PRIVATE_FILE_MODE,
+    );
     return {filename: filePath};
   }
 
