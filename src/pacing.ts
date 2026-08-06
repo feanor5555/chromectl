@@ -21,10 +21,18 @@
  * intervals is drawn afresh through `drawPacingMs`, which is the single place
  * the brake takes a value from.
  *
+ * A call passes two ceilings, not one, because it can stand in line before it
+ * does anything: the wait for the process-wide tool mutex is capped by
+ * `MUTEX_WAIT_CEILING_MS`, and `callBudgetMs` applies to the work that begins
+ * once the mutex is held. Both are hard maximums, and neither can be spent by
+ * the other.
+ *
  * Every layer one call passes through takes its deadline from here — the front,
  * the daemon socket and the MCP request inside the daemon — so the three cannot
- * drift apart. The inner layers add `INNER_BUDGET_SLACK_MS` on top, so the
- * outermost layer is the one whose timer fires first and reports.
+ * drift apart. None of them sees the moment the mutex is acquired, so each of
+ * them grants `queuedCallBudgetMs`, the sum of the two ceilings. The inner
+ * layers add `INNER_BUDGET_SLACK_MS` on top, so the outermost layer is the one
+ * whose timer fires first and reports.
  *
  * Human pacing is what every call gets unless it says otherwise. The way out is
  * `PACE_FULL`, selected per call by the full-speed switch, and it exists for our
@@ -94,6 +102,15 @@ export const BUDGET_SAFETY_FACTOR = 1.5;
  * ceiling it has always had, and a daemon that hangs still ends.
  */
 export const MIN_CALL_BUDGET_MS = 60_000;
+
+/**
+ * Longest a call may wait for the browser to become free before it gives up.
+ * Waiting is not work: a braked fill holds the browser for minutes, and a call
+ * queued behind it must not spend its work budget standing in line. The ceiling
+ * is fixed rather than derived, because what a call waits out is the call ahead
+ * of it and has nothing to do with what it is going to type itself.
+ */
+export const MUTEX_WAIT_CEILING_MS = 180_000;
 
 /**
  * How much wider every inner ceiling is than the outer one it sits under. The
@@ -328,6 +345,24 @@ export function callBudgetMs(
     actions * PRE_ACTION_PAUSE_MAX_MS +
     characters * CHARACTER_MAX_MS;
   return Math.max(MIN_CALL_BUDGET_MS, Math.ceil(work * BUDGET_SAFETY_FACTOR));
+}
+
+/**
+ * What a layer outside the mutex has to grant: the wait for the browser plus
+ * the work that follows it. Such a layer cannot see the moment the mutex is
+ * acquired, so it has to cover both.
+ *
+ * The sum stays honest about which ceiling was hit. The wait is cut off at
+ * `MUTEX_WAIT_CEILING_MS` by the funnel that holds the mutex, which reports
+ * that case itself, so a call that runs out here has been working for the whole
+ * budget and it is the work that ran over.
+ */
+export function queuedCallBudgetMs(
+  tool?: string,
+  args?: ToolArguments,
+  fullSpeed = false,
+): number {
+  return MUTEX_WAIT_CEILING_MS + callBudgetMs(tool, args, fullSpeed);
 }
 
 /** The same budget for a layer that sits inside the one holding `outerMs`. */

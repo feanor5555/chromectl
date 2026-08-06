@@ -9,7 +9,11 @@ import type {McpContext} from './McpContext.js';
 import type {McpPage} from './McpPage.js';
 import type {DataFormat} from './McpResponse.js';
 import {McpResponse} from './McpResponse.js';
-import {isFullSpeedRequest, selectPace} from './pacing.js';
+import {
+  isFullSpeedRequest,
+  MUTEX_WAIT_CEILING_MS,
+  selectPace,
+} from './pacing.js';
 import {SlimMcpResponse} from './SlimMcpResponse.js';
 import {ClearcutLogger} from './telemetry/ClearcutLogger.js';
 import {bucketizeLatency, buildContext} from './telemetry/transformation.js';
@@ -152,6 +156,39 @@ function buildUnknownArgumentsMessage(
   return `Unknown ${unknownLabel} for tool "${toolName}": ${formatArgumentNames(unknownArgumentNames)}. ${expectedArguments} ${correction} and retry.`;
 }
 
+/** The guard the tool mutex hands out. */
+type ToolMutexGuard = Awaited<ReturnType<Mutex['acquire']>>;
+
+/**
+ * Waits for the process-wide tool mutex and gives up after
+ * `MUTEX_WAIT_CEILING_MS`, so a call queued behind a braked fill that holds the
+ * browser for minutes ends with a statement instead of standing in line
+ * forever.
+ *
+ * The queue is FIFO and offers no way out of it, so the place in it stays: the
+ * guard that arrives after the ceiling is released the moment it arrives,
+ * rather than being handed to nobody and locking the browser away for good.
+ */
+async function acquireWithinCeiling(
+  toolMutex: Mutex,
+): Promise<ToolMutexGuard | undefined> {
+  const acquired = toolMutex.acquire();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<undefined>(resolve => {
+    timer = setTimeout(() => {
+      resolve(undefined);
+    }, MUTEX_WAIT_CEILING_MS);
+  });
+  const guard = await Promise.race([acquired, expired]);
+  clearTimeout(timer);
+  if (!guard) {
+    void acquired.then(late => {
+      late[Symbol.dispose]();
+    });
+  }
+  return guard;
+}
+
 export class ToolHandler {
   readonly inputSchema: zod.ZodRawShape;
   readonly registeredInputSchema: zod.ZodTypeAny;
@@ -223,7 +260,21 @@ export class ToolHandler {
       };
     }
 
-    const guard = await this.toolMutex.acquire();
+    // The wait for the browser has its own ceiling, and the work budget the
+    // outer layers grant starts only here, once the mutex is held. A call that
+    // never got that far says so, so the caller can tell the two apart.
+    const guard = await acquireWithinCeiling(this.toolMutex);
+    if (!guard) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Waited ${MUTEX_WAIT_CEILING_MS} ms for the browser and gave up: another call was still holding it. Nothing of this call reached the page — the ceiling hit is the wait for the browser, not the work budget, which had not started.`,
+          },
+        ],
+        isError: true,
+      };
+    }
     // The pace is put in place here because this is the one funnel every call
     // passes and it holds the process-wide mutex, so the profile of the call in
     // flight cannot be read by another. Only input tools draw a paced value, so

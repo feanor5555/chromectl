@@ -17,7 +17,11 @@ import {
   PipeTransport,
   StdioClientTransport,
 } from '../third_party/index.js';
-import {callBudgetMs, FULL_SPEED_META_KEY, innerBudgetMs} from '../pacing.js';
+import {
+  FULL_SPEED_META_KEY,
+  innerBudgetMs,
+  queuedCallBudgetMs,
+} from '../pacing.js';
 import {logger} from '../utils/logger.js';
 import {VERSION} from '../version.js';
 
@@ -169,10 +173,11 @@ async function handleRequest(msg: DaemonMessage) {
 
       // Without an explicit timeout the MCP SDK applies its own 60 s default,
       // which would cut a paced keystroke stream off inside the daemon while
-      // the caller is still waiting. The request gets the budget the call is
-      // worth, widened by the slack that keeps every inner ceiling above the
-      // outer one, so the timer the caller set is the one that fires first. A
-      // call at full speed pays for no pacing and falls back to the floor.
+      // the caller is still waiting. The request gets what the call is worth —
+      // the wait for the browser it may be queued behind plus the work budget —
+      // widened by the slack that keeps every inner ceiling above the outer
+      // one, so the timer the caller set is the one that fires first. A call at
+      // full speed pays for no pacing and falls back to the floor.
       //
       // The switch itself goes on as request metadata rather than as an
       // argument, because no tool declares it.
@@ -183,7 +188,7 @@ async function handleRequest(msg: DaemonMessage) {
           ...(fullSpeed ? {_meta: {[FULL_SPEED_META_KEY]: true}} : {}),
         },
         undefined,
-        {timeout: innerBudgetMs(callBudgetMs(tool, args, fullSpeed))},
+        {timeout: innerBudgetMs(queuedCallBudgetMs(tool, args, fullSpeed))},
       )) as McpResult | McpContent[];
 
       return {

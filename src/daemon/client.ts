@@ -8,7 +8,11 @@ import {spawn} from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 
-import {callBudgetMs} from '../pacing.js';
+import {
+  callBudgetMs,
+  MUTEX_WAIT_CEILING_MS,
+  queuedCallBudgetMs,
+} from '../pacing.js';
 import type {CallToolResult} from '../third_party/index.js';
 import {PipeTransport} from '../third_party/index.js';
 import {getTempFilePath} from '../utils/files.js';
@@ -141,14 +145,39 @@ export async function startDaemon(mcpArgs: string[] = [], sessionId: string) {
 /**
  * How long the socket waits for the answer to one command. A tool call that
  * types character by character lasts as long as its text is long, so the
- * ceiling is derived from the command instead of being a constant; a control
- * message carries no such work and gets the floor, and so does a call at full
- * speed, which types nothing character by character either.
+ * ceiling is derived from the command instead of being a constant; a call at
+ * full speed types nothing character by character and gets the floor.
+ *
+ * A tool call is granted the wait for the browser on top of that work, because
+ * it can be queued behind another call before it does anything. A control
+ * message queues behind nothing and carries no work, so it gets the bare floor.
  */
-function defaultCommandTimeout(command: DaemonMessage): number {
+export function defaultCommandTimeout(command: DaemonMessage): number {
   return command.method === 'invoke_tool'
-    ? callBudgetMs(command.tool, command.args, command.fullSpeed)
+    ? queuedCallBudgetMs(command.tool, command.args, command.fullSpeed)
     : callBudgetMs();
+}
+
+/**
+ * What the caller is told when the socket gives up on a command.
+ *
+ * For a tool call granted the standard ceiling the message names which of the
+ * two limits was hit. It is the work: the wait for the browser ends at its own
+ * ceiling inside the daemon, which reports that case itself, so a call still
+ * running here has been working for the whole budget. A command granted
+ * anything else supports no such statement and gets the plain figure.
+ */
+export function commandTimeoutMessage(
+  command: DaemonMessage,
+  timeout: number,
+): string {
+  if (command.method === 'invoke_tool') {
+    const workMs = callBudgetMs(command.tool, command.args, command.fullSpeed);
+    if (timeout === MUTEX_WAIT_CEILING_MS + workMs) {
+      return `Timeout after ${timeout}ms: the work ran over its budget of ${workMs}ms. The wait for the browser is capped separately at ${MUTEX_WAIT_CEILING_MS}ms and is not counted against the work.`;
+    }
+  }
+  return `Timeout waiting for daemon response after ${timeout}ms granted for this command`;
 }
 
 /**
@@ -173,11 +202,7 @@ export async function sendCommand(
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       socket.destroy();
-      reject(
-        new Error(
-          `Timeout waiting for daemon response after ${timeout}ms granted for this command`,
-        ),
-      );
+      reject(new Error(commandTimeoutMessage(command, timeout)));
     }, timeout);
 
     const transport = new PipeTransport(socket, socket);

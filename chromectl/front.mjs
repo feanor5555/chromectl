@@ -41,7 +41,7 @@ import {
   startDaemon,
 } from '../build/src/daemon/client.js';
 import {getDaemonPid, isDaemonRunning} from '../build/src/daemon/utils.js';
-import {callBudgetMs} from '../build/src/pacing.js';
+import {queuedCallBudgetMs} from '../build/src/pacing.js';
 
 import {
   listTargets,
@@ -394,17 +394,24 @@ async function replaceDaemon(resolved, generation) {
  * The retry happens once. If the fresh daemon fails the same way, the failure
  * goes to the caller instead of starting another daemon.
  *
- * How long the call may take is derived from the call itself (`src/pacing.ts`):
- * a command that types character by character lasts as long as its text is
- * long, so a fixed ceiling would cut an honest input off in the middle of a
- * field. This is the outermost of the three deadlines one call passes through
- * and the shortest of them, so a timeout is reported here rather than by a
- * socket further in. At full speed nothing is typed character by character and
- * the ceiling falls back to the floor.
+ * How long the call may take is derived from the call itself (`src/pacing.ts`)
+ * and covers two separate ceilings. The work budget is derived because a
+ * command that types character by character lasts as long as its text is long,
+ * so a fixed ceiling would cut an honest input off in the middle of a field; at
+ * full speed nothing is typed character by character and it falls back to the
+ * floor. On top of it comes the fixed ceiling for the wait, because the daemon
+ * serializes on one browser and this call may be queued behind another before
+ * it does anything.
+ *
+ * This is the outermost of the three deadlines one call passes through and the
+ * shortest of them, so a timeout is reported here rather than by a socket
+ * further in. Which of the two ceilings was hit stays legible: the wait ends at
+ * its own ceiling inside the daemon and comes back as a failed call, so a
+ * timeout reported here is the work.
  */
 async function invokeTool(resolved, command, args, fullSpeed) {
   const message = {method: 'invoke_tool', tool: command, args, fullSpeed};
-  const budgetMs = callBudgetMs(command, args, fullSpeed);
+  const budgetMs = queuedCallBudgetMs(command, args, fullSpeed);
   let generation = await ensureDaemon(resolved);
 
   for (let attempt = 0; ; attempt++) {

@@ -11,12 +11,19 @@ import {dirname} from 'node:path';
 import {describe, it, afterEach, beforeEach} from 'node:test';
 
 import {
+  commandTimeoutMessage,
+  defaultCommandTimeout,
   handleResponse,
   startDaemon,
   stopDaemon,
   verifyDaemonVersion,
 } from '../../src/daemon/client.js';
 import {isDaemonRunning} from '../../src/daemon/utils.js';
+import {
+  callBudgetMs,
+  MUTEX_WAIT_CEILING_MS,
+  queuedCallBudgetMs,
+} from '../../src/pacing.js';
 import {VERSION} from '../../src/version.js';
 
 describe('daemon client', () => {
@@ -103,6 +110,67 @@ describe('daemon client', () => {
         undefined,
         'Should not return warning when daemon is stopped',
       );
+    });
+  });
+
+  describe('the ceilings one command is granted', () => {
+    const fill = {
+      method: 'invoke_tool' as const,
+      tool: 'fill',
+      args: {value: 'a'.repeat(600)},
+    };
+
+    it('grants a tool call the wait for the browser on top of its work', () => {
+      assert.strictEqual(
+        defaultCommandTimeout(fill),
+        MUTEX_WAIT_CEILING_MS + callBudgetMs(fill.tool, fill.args),
+      );
+      assert.strictEqual(
+        defaultCommandTimeout(fill),
+        queuedCallBudgetMs(fill.tool, fill.args),
+      );
+    });
+
+    it('grants a control message the floor, which queues behind nothing', () => {
+      assert.strictEqual(
+        defaultCommandTimeout({method: 'status'}),
+        callBudgetMs(),
+      );
+      assert.strictEqual(
+        defaultCommandTimeout({method: 'stop'}),
+        callBudgetMs(),
+      );
+    });
+
+    it('names the work when a tool call on the standard ceiling runs out', () => {
+      const message = commandTimeoutMessage(fill, defaultCommandTimeout(fill));
+
+      assert.match(
+        message,
+        new RegExp(
+          `the work ran over its budget of ${callBudgetMs(fill.tool, fill.args)}ms`,
+        ),
+      );
+      assert.match(
+        message,
+        new RegExp(`capped separately at ${MUTEX_WAIT_CEILING_MS}ms`),
+      );
+    });
+
+    it('claims nothing about the work when the ceiling was not the standard one', () => {
+      for (const [command, timeout] of [
+        [fill, 5_000],
+        [fill, callBudgetMs(fill.tool, fill.args)],
+        [
+          {method: 'status' as const},
+          defaultCommandTimeout({method: 'status'}),
+        ],
+      ] as Array<[Parameters<typeof commandTimeoutMessage>[0], number]>) {
+        assert.strictEqual(
+          commandTimeoutMessage(command, timeout),
+          `Timeout waiting for daemon response after ${timeout}ms granted for this command`,
+        );
+      }
     });
   });
 

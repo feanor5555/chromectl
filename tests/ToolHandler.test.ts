@@ -15,6 +15,7 @@ import {McpPage} from '../src/McpPage.js';
 import {
   currentPace,
   FULL_SPEED_META_KEY,
+  MUTEX_WAIT_CEILING_MS,
   PACE_FULL,
   PACE_HUMAN,
 } from '../src/pacing.js';
@@ -319,6 +320,114 @@ describe('ToolHandler', () => {
       await handler.handle({}, {[FULL_SPEED_META_KEY]: true});
 
       assert.strictEqual(currentPace(), PACE_HUMAN);
+    });
+  });
+
+  describe('the wait for the browser', () => {
+    function queuedTool(toolMutex: Mutex) {
+      let handlerCalled = false;
+      const tool: ToolDefinition = {
+        name: 'queued_tool',
+        description: 'A tool that has to wait its turn',
+        annotations: {
+          category: ToolCategory.INPUT,
+          readOnlyHint: false,
+        },
+        schema: {},
+        blockedByDialog: false,
+        verifyFilesSchema: [],
+        handler: async () => {
+          handlerCalled = true;
+        },
+      };
+
+      const serverArgs = parseArguments('1.0.0', ['node', 'script.js'], {
+        CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: 'true',
+      });
+      const handler = new ToolHandler(
+        tool,
+        serverArgs,
+        async () => sinon.createStubInstance(McpContext),
+        toolMutex,
+      );
+      return {handler, wasCalled: () => handlerCalled};
+    }
+
+    /** Runs one call while the mutex is held and lets the ceiling pass. */
+    async function callAndExhaustTheWait(handler: ToolHandler) {
+      const clock = sinon.useFakeTimers({
+        toFake: ['setTimeout', 'clearTimeout'],
+      });
+      try {
+        const pending = handler.handle({});
+        await clock.tickAsync(MUTEX_WAIT_CEILING_MS);
+        return await pending;
+      } finally {
+        clock.restore();
+      }
+    }
+
+    /** Whether the mutex can be taken within a grace period. */
+    async function acquiresWithin(
+      toolMutex: Mutex,
+      ms: number,
+    ): Promise<boolean> {
+      const acquired = toolMutex.acquire();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const taken = await Promise.race([
+        acquired.then(() => true),
+        new Promise<boolean>(resolve => {
+          timer = setTimeout(() => {
+            resolve(false);
+          }, ms);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (taken) {
+        (await acquired)[Symbol.dispose]();
+      }
+      return taken;
+    }
+
+    it('gives up after the ceiling and names the ceiling it hit', async () => {
+      const toolMutex = new Mutex();
+      const held = await toolMutex.acquire();
+      const {handler, wasCalled} = queuedTool(toolMutex);
+
+      const result = await callAndExhaustTheWait(handler);
+      held[Symbol.dispose]();
+
+      assert.strictEqual(result.isError, true);
+      const text =
+        result.content[0].type === 'text' ? result.content[0].text : '';
+      assert.match(text, /Waited 180000 ms for the browser/);
+      assert.match(text, /not the work budget/);
+      assert.strictEqual(wasCalled(), false);
+    });
+
+    it('does not wait at all while the browser is free', async () => {
+      const toolMutex = new Mutex();
+      const {handler, wasCalled} = queuedTool(toolMutex);
+
+      const result = await handler.handle({});
+
+      assert.strictEqual(result.isError, undefined);
+      assert.strictEqual(wasCalled(), true);
+      assert.strictEqual(await acquiresWithin(toolMutex, 500), true);
+    });
+
+    it('leaves the browser usable for the next call after it gave up', async () => {
+      const toolMutex = new Mutex();
+      const held = await toolMutex.acquire();
+      const {handler} = queuedTool(toolMutex);
+
+      const result = await callAndExhaustTheWait(handler);
+      assert.strictEqual(result.isError, true);
+
+      // The place in the FIFO queue stays after the call gave up, so the mutex
+      // is handed to it once more and has to come straight back.
+      held[Symbol.dispose]();
+      assert.strictEqual(await acquiresWithin(toolMutex, 500), true);
     });
   });
 

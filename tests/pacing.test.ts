@@ -25,11 +25,13 @@ import {
   MIN_CALL_BUDGET_MS,
   MOUSE_HOLD_MAX_MS,
   MOUSE_HOLD_MIN_MS,
+  MUTEX_WAIT_CEILING_MS,
   PACE_FULL,
   PACE_HUMAN,
   PACING_SKEW,
   pacedSleep,
   pauseBeforeAction,
+  queuedCallBudgetMs,
   PRE_ACTION_PAUSE_MAX_MS,
   PRE_ACTION_PAUSE_MIN_MS,
   selectPace,
@@ -215,6 +217,41 @@ describe('pacing', () => {
         ),
         MIN_CALL_BUDGET_MS,
       );
+    });
+  });
+
+  describe('the queued budget', () => {
+    it('adds the wait for the browser to the work budget', () => {
+      const value = 'a'.repeat(600);
+
+      for (const [tool, args] of [
+        [undefined, undefined],
+        ['click', {}],
+        ['fill', {value}],
+        ['type_text', {text: value}],
+      ] as Array<[string | undefined, Record<string, unknown> | undefined]>) {
+        assert.strictEqual(
+          queuedCallBudgetMs(tool, args),
+          MUTEX_WAIT_CEILING_MS + callBudgetMs(tool, args),
+        );
+      }
+    });
+
+    it('leaves the work budget itself untouched', () => {
+      const value = 'a'.repeat(600);
+
+      assert.strictEqual(
+        queuedCallBudgetMs('fill', {value}) - callBudgetMs('fill', {value}),
+        MUTEX_WAIT_CEILING_MS,
+      );
+      assert.strictEqual(
+        queuedCallBudgetMs('fill', {value}, true),
+        MUTEX_WAIT_CEILING_MS + MIN_CALL_BUDGET_MS,
+      );
+    });
+
+    it('caps the wait at three minutes, whatever the call types', () => {
+      assert.strictEqual(MUTEX_WAIT_CEILING_MS, 180_000);
     });
   });
 
