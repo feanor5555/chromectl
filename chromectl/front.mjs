@@ -139,12 +139,23 @@ const OUTPUT_FILE_MODE = 0o644;
 const STAGING_DIR_MODE = 0o700;
 
 /**
+ * The longest name a caller may pick. A filesystem takes 255 bytes, and this
+ * sits well under it, with room for the generated staging name that stands
+ * beside a caller's own. The bound is what keeps a mistyped name a mistyped
+ * name: without it such a name reaches the drive and comes back as
+ * `ENAMETOOLONG`, which is indistinguishable from a drive that is broken.
+ */
+const MAX_FILE_NAME_LENGTH = 128;
+
+/**
  * The only shape of file name a caller may name, for a file to be written as
  * well as for one to be read. It carries no directory separator and does not
  * start with a dot, so such a name can neither leave `OUTPUT_DIR` nor address
  * one of its parents, and `..` cannot be written at all.
  */
-const PLAIN_FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const PLAIN_FILE_NAME_PATTERN = new RegExp(
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,${MAX_FILE_NAME_LENGTH - 1}}$`,
+);
 
 /**
  * The endings a file of this service carries. Every tool that writes one
@@ -1411,7 +1422,8 @@ async function planOutputFile(command, argument, spec, resolved, toolArgs) {
   if (!PLAIN_FILE_NAME_PATTERN.test(requested) || extension === undefined) {
     throw new CallError(
       'usage',
-      `${command}: ${argument} must be a plain file name ending in ` +
+      `${command}: ${argument} must be a plain file name of at most ` +
+        `${MAX_FILE_NAME_LENGTH} characters ending in ` +
         `${extensions.map(candidate => `.${candidate}`).join(' or ')} — the ` +
         `front writes it to ${OUTPUT_DIR} and no path leaves that directory`,
     );
@@ -1518,7 +1530,8 @@ async function planInputFile(command, argument, spec, target, toolArgs) {
   ) {
     throw new CallError(
       'usage',
-      `${command}: ${argument} must be a plain name` +
+      `${command}: ${argument} must be a plain name of at most ` +
+        `${MAX_FILE_NAME_LENGTH} characters` +
         (endings.length > 0
           ? ` ending in ${endings.map(candidate => `.${candidate}`).join(' or ')}`
           : '') +
@@ -2170,12 +2183,18 @@ async function carryOutCall(
     }
     const {parsed, elapsedMs} = outcome;
 
-    const {descriptors, replacements} = await describeCallFiles(
-      plan,
-      resolved,
-      command,
-      publicBase,
-    );
+    let described;
+    try {
+      described = await describeCallFiles(plan, resolved, command, publicBase);
+    } catch (error) {
+      // A tool that reported success without the file it was told to write
+      // leaves the same half-written state a failed call does: the staging name
+      // is one no answer will ever carry and nothing prunes it, so it goes here
+      // together with the call's own directory.
+      await settleLeftoverFiles(plan);
+      throw error;
+    }
+    const {descriptors, replacements} = described;
 
     // What the answer would carry, measured before it is sent: a result past the
     // cap is written out and named instead, so no call can put hundreds of
@@ -2290,22 +2309,22 @@ async function sendFile(response, pathname) {
     throw new CallError('usage', `not a file of ${OUTPUT_DIR}: ${fileName}`);
   }
 
-  let data;
   let handle;
+  let stats;
   try {
     handle = await fs.open(
       filePath,
       fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
     );
-    const stats = await handle.stat();
+    stats = await handle.stat();
     if (!stats.isFile()) {
       throw new Error('not a regular file');
     }
     if (stats.nlink !== 1) {
       throw new Error('a hardlink, not a file of this directory');
     }
-    data = await handle.readFile();
   } catch (error) {
+    await handle?.close();
     // A name that is not on the drive is the caller's business, not a fault of
     // the front, and only that case is a 404: everything else the open can hit
     // — a symlink, a hardlink, an entry that is no regular file, a drive that
@@ -2318,21 +2337,36 @@ async function sendFile(response, pathname) {
         `${Math.round(SPILL_RETENTION_MS / 3_600_000)} h`,
       error.message,
     );
-  } finally {
-    await handle?.close();
   }
 
   // The directory is writable over a password-less share, so a file served here
   // may be one nobody of this service wrote. It is handed over as a download
   // with the ending it carries taken at face value, so nothing planted there is
   // ever rendered as a page in the fetching browser.
+  //
+  // The bytes go from the handle the checks were made on straight to the socket
+  // and are never held whole: a heap snapshot is hundreds of megabytes, and a
+  // single fetch of one would otherwise carry that much beside every daemon
+  // registration, call and recording plan this process keeps, all of which live
+  // in its memory alone. The length comes from the `stat` of that same handle,
+  // so it is the size of the file that was checked.
   response.writeHead(200, {
     'content-type': contentTypeFor(fileName),
-    'content-length': data.length,
+    'content-length': stats.size,
     'x-content-type-options': 'nosniff',
     'content-disposition': `attachment; filename="${fileName}"`,
   });
-  response.end(data);
+  try {
+    await pipeline(handle.createReadStream(), response);
+  } catch {
+    // The head is out, so nothing can be said on this socket any more: a caller
+    // that walked away mid-download and a read that stopped delivering both end
+    // as a transfer the fetching side sees break off against the announced
+    // length.
+    response.destroy();
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
