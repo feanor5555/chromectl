@@ -23,7 +23,8 @@
  * too, under a file name the caller picks, and a result that outgrows
  * `SPILL_BYTES` is written there as well instead of being answered inline. No
  * file a call writes leaves that one directory, and every one of them is
- * fetchable over `/files/`.
+ * fetchable over `/files/`. A spilled result is the one file nobody asked for,
+ * so it is also the one that expires: after `SPILL_RETENTION_MS` it is pruned.
  *
  * Endpoints:
  *   GET  /health          liveness plus the registered target names and commands
@@ -197,6 +198,27 @@ if (!Number.isInteger(SPILL_BYTES) || SPILL_BYTES <= 0) {
   // exists to prevent, so it is a startup fault.
   throw new Error(
     `CHROMECTL_SPILL_BYTES must be a positive whole number of bytes, got ${JSON.stringify(process.env['CHROMECTL_SPILL_BYTES'])}`,
+  );
+}
+
+/**
+ * How long a spilled result stays on the drive.
+ *
+ * A spilled file is the only one nobody asked for: the caller wanted the result
+ * in its answer, and the file exists because the answer could not carry it — the
+ * text of a permanently logged-in page among them, as a world-readable file on a
+ * password-less share. It therefore expires, while a screenshot and a
+ * caller-named snapshot are artifacts someone asked for and stay until someone
+ * removes them.
+ */
+const SPILL_RETENTION_MS = Number(
+  process.env['CHROMECTL_SPILL_RETENTION_MS'] ?? 86_400_000,
+);
+if (!Number.isInteger(SPILL_RETENTION_MS) || SPILL_RETENTION_MS <= 0) {
+  // A typo here would read as "keeps them forever", which is the exposure the
+  // retention exists to end, so it is a startup fault.
+  throw new Error(
+    `CHROMECTL_SPILL_RETENTION_MS must be a positive whole number of milliseconds, got ${JSON.stringify(process.env['CHROMECTL_SPILL_RETENTION_MS'])}`,
   );
 }
 
@@ -870,6 +892,47 @@ function fileUrl(publicBase, fileName) {
   return `${publicBase}${FILE_ROUTE}${encodeURIComponent(fileName)}`;
 }
 
+/**
+ * Removes the spilled results that have outlived `SPILL_RETENTION_MS`.
+ *
+ * Only spilled files are touched: the name has to be one the front built itself
+ * and to carry the `json` extension only a spill gets, so a screenshot, a
+ * caller-named snapshot and anything else lying in the directory are left where
+ * they are. `unlink` follows nothing, so an entry of that shape planted in the
+ * guest-writable share is merely removed, never followed out of the directory.
+ *
+ * Best effort throughout: this runs beside a caller's call, and neither an
+ * unreadable directory nor a file that vanished between the listing and the
+ * `lstat` is that caller's business.
+ *
+ * The residual is accepted rather than solved with a scheduler: a front nobody
+ * calls again prunes nothing and keeps its last spills, because the prune hangs
+ * off the next call rather than off a timer of its own.
+ */
+async function pruneSpilledFiles() {
+  const deadline = Date.now() - SPILL_RETENTION_MS;
+  let names;
+  try {
+    names = await fs.readdir(OUTPUT_DIR);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!GENERATED_FILE_NAME_PATTERN.test(name) || !name.endsWith('.json')) {
+      continue;
+    }
+    const filePath = path.join(OUTPUT_DIR, name);
+    try {
+      const stats = await fs.lstat(filePath);
+      if (stats.mtimeMs < deadline) {
+        await fs.unlink(filePath);
+      }
+    } catch {
+      // Gone already, or not this process's to remove.
+    }
+  }
+}
+
 /** Makes sure the output directory exists and this process can write into it. */
 async function ensureOutputDir() {
   try {
@@ -888,6 +951,9 @@ async function ensureOutputDir() {
       error.message,
     );
   }
+  // Every write passes here, which is the only moment the front is awake for
+  // sure: the expiry rides along with it instead of on a timer.
+  await pruneSpilledFiles();
 }
 
 /**
@@ -1369,7 +1435,15 @@ async function sendFile(response, pathname) {
     }
     data = await handle.readFile();
   } catch (error) {
-    throw new CallError('storage', `no file ${fileName}`, error.message);
+    // The retention is named here because it is the difference between a file
+    // that never existed and one that expired, and nothing else in the answer
+    // tells the two apart.
+    throw new CallError(
+      'storage',
+      `no file ${fileName} — spilled results are kept for ` +
+        `${Math.round(SPILL_RETENTION_MS / 3_600_000)} h`,
+      error.message,
+    );
   } finally {
     await handle?.close();
   }
