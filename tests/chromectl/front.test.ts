@@ -15,6 +15,8 @@ import process from 'node:process';
 import {after, before, describe, it} from 'node:test';
 import {pathToFileURL} from 'node:url';
 
+import {commands} from '../../src/bin/chrome-devtools-cli-options.js';
+
 /**
  * The front runs `chromectl/` as plain ESM straight from the source tree, and
  * this test drives that very file over the surface a caller reaches: it starts
@@ -45,8 +47,14 @@ const START_TIMEOUT_MS = 20_000;
 /** The size of the file the streaming route is measured on. */
 const LARGE_FILE_BYTES = 256 * 1024 * 1024;
 
-/** How much peak memory the front may gain over one large download. */
-const STREAMING_HEADROOM_KB = 64 * 1024;
+/**
+ * How much peak memory the front may gain over one large download. The bound
+ * sits halfway between the two outcomes it separates: a streaming run gains a
+ * fraction of the file size, a buffered read gains the file itself, so the
+ * margin to either side is about the same factor and normal machine load
+ * cannot reach across it.
+ */
+const STREAMING_HEADROOM_KB = 128 * 1024;
 
 interface Answer {
   status: number;
@@ -603,6 +611,46 @@ describe('chromectl front output names', () => {
     assert.deepStrictEqual(stagingLeftovers(), []);
 
     fs.rmSync(path.join(outputDir, fileName));
+  });
+
+  it('hands back a fetchable file for every screenshot format upstream declares', async () => {
+    const formats = commands['take_screenshot']?.args['format'];
+    const declared = (formats?.enum ?? []).map(String);
+    assert.ok(declared.length > 0, 'the command table declares no format');
+    daemonHandler = daemonCall => {
+      fs.writeFileSync(String(daemonCall.args?.['filePath']), 'image bytes');
+      return toolSuccess();
+    };
+
+    // A format the front does not know an ending or a media type for would be
+    // written, named in the answer and refused by the front's own file route.
+    for (const format of [...declared, undefined]) {
+      const answer = await call({
+        target: 'fake',
+        command: 'take_screenshot',
+        args: format === undefined ? {} : {format},
+      });
+
+      assert.strictEqual(answer.status, 200, answer.body.toString('utf8'));
+      const screenshot = payload(answer)['screenshot'] as Record<
+        string,
+        unknown
+      >;
+      const fileName = String(screenshot['file']);
+      // With no format named the ending is the one upstream defaults to.
+      const expected = format ?? String(formats?.default);
+      assert.ok(
+        fileName.endsWith(`.${expected}`),
+        `${String(format)}: ${fileName}`,
+      );
+
+      const served = await send(`/files/${fileName}`);
+      assert.strictEqual(served.status, 200, `${fileName}: ${served.status}`);
+      assert.match(String(served.headers['content-type']), /^image\//);
+
+      fs.rmSync(path.join(outputDir, fileName));
+    }
+    assert.deepStrictEqual(stagingLeftovers(), []);
   });
 });
 

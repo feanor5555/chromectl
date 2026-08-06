@@ -126,6 +126,28 @@ const COMMAND_SCHEMAS = new Map(
 const COMMANDS = [...COMMAND_SCHEMAS.keys()].sort();
 
 /**
+ * The values upstream declares for one argument of a fixed set, and the one it
+ * falls back to when a caller names none. A tool whose output carries the
+ * format it was asked for takes its endings from here rather than from a list
+ * kept beside it, so a format upstream adds arrives with the merge. An argument
+ * that no longer carries such a set stops the front at startup, the same way an
+ * unaccounted argument does.
+ */
+function enumeratedArgument(command, argument) {
+  const definition = COMMAND_SCHEMAS.get(command)?.[argument];
+  if (definition?.enum === undefined) {
+    throw new Error(
+      `${command}.${argument} carries no fixed set of values in the command ` +
+        `table, so the endings of ${command} cannot be taken from it`,
+    );
+  }
+  return {
+    values: definition.enum,
+    fallback: definition.default ?? definition.enum[0],
+  };
+}
+
+/**
  * Where every file a call writes lands: `/home/wu/share/screenshots` on the
  * host the front runs on (`CHROMECTL_SCREENSHOT_DIR`), a directory of the house
  * network drive that is served over Samba and exported over NFS, so every
@@ -183,11 +205,14 @@ const PLAIN_FILE_NAME_PATTERN = new RegExp(
  * replaces whatever extension arrives), so this is that set, plus the one a
  * spilled result gets. Demanding the ending on a name a caller picks keeps the
  * path in the answer the path that lands on disk.
+ *
+ * The screenshot endings are the formats upstream declares for `take_screenshot`
+ * rather than a copy of them. The rest a tool decides inside its own code, which
+ * is nowhere declared, so those stay a list — one `assertExtensionsAccountedFor`
+ * holds against what the tables can actually produce.
  */
 const FILE_EXTENSIONS = [
-  'png',
-  'jpeg',
-  'webp',
+  ...enumeratedArgument('take_screenshot', 'format').values,
   'txt',
   'json',
   'json.gz',
@@ -1121,6 +1146,12 @@ const HEAP_SNAPSHOT_INPUT = {direction: 'in', extensions: ['heapsnapshot']};
  * `deferred` marks the one whose file is finished by a later call; that one is
  * never optional, since the call finishing it is the call that promised it.
  *
+ * `extensions` are the endings a tool enforces, the first of them the one a name
+ * the front builds itself carries. `extensionsFrom` stands in its place where
+ * the ending is the format the caller asked for: it names the argument that
+ * carries it, and both the ending and the fallback come out of the command
+ * table instead of being written down here a second time.
+ *
  * `out-dir` is a directory a tool fills with files of its own naming. The front
  * hands it one of its own, takes the files named in `reports` out of it
  * afterwards and removes it.
@@ -1139,7 +1170,7 @@ const FILE_ARGUMENTS = {
       direction: 'out',
       kind: 'screenshot',
       always: true,
-      extensions: toolArgs => [toolArgs.format ?? 'png'],
+      extensionsFrom: 'format',
     },
   },
   take_snapshot: {
@@ -1214,6 +1245,32 @@ for (const command of COMMANDS) {
   if (command.startsWith('get_heapsnapshot_')) {
     FILE_ARGUMENTS[command] = {filePath: HEAP_SNAPSHOT_INPUT};
   }
+}
+
+/**
+ * The endings one path argument may carry in one call: the format the caller
+ * asked for where the tool names its output by one, the fixed set otherwise. The
+ * first is the ending a name the front builds itself gets.
+ */
+function extensionsOf(command, spec, toolArgs) {
+  if (spec.extensionsFrom === undefined) {
+    return spec.extensions ?? [];
+  }
+  const {fallback} = enumeratedArgument(command, spec.extensionsFrom);
+  return [toolArgs[spec.extensionsFrom] ?? fallback];
+}
+
+/** Every ending one path argument can carry, over all calls a caller can make. */
+function possibleExtensionsOf(command, spec) {
+  if (spec.extensionsFrom === undefined) {
+    return spec.extensions ?? [];
+  }
+  return enumeratedArgument(command, spec.extensionsFrom).values;
+}
+
+/** The ending a report of an output directory carries: `report.json` is a json. */
+function reportExtension(name) {
+  return name.slice(name.indexOf('.') + 1);
 }
 
 /**
@@ -1338,6 +1395,57 @@ function assertArgumentsAccountedFor() {
 assertArgumentsAccountedFor();
 
 /**
+ * Refuses to start while one ending a call can produce is unknown to the front.
+ *
+ * `FILE_EXTENSIONS` decides which names the file route hands out again and
+ * `CONTENT_TYPE_BY_EXTENSION` what such a file is served as. A media type is
+ * declared nowhere upstream, so that table stays one kept here, and the endings
+ * a call can produce are held against it: the values of the argument a tool
+ * names its output by, the fixed endings of every other path argument, the
+ * reports taken out of an output directory and the ending a spilled result
+ * carries.
+ *
+ * Left unchecked, a file with such an ending is written, named in the answer and
+ * then refused by the front's own file route with 400, or handed over as a
+ * stream of bytes — both only at the moment a caller fetches it, long after the
+ * merge that brought it. Clearing it is one entry per table.
+ */
+function assertExtensionsAccountedFor() {
+  const unknown = new Map();
+  const note = (extension, source) => {
+    if (
+      FILE_EXTENSIONS.includes(extension) &&
+      CONTENT_TYPE_BY_EXTENSION[extension] !== undefined
+    ) {
+      return;
+    }
+    unknown.set(extension, source);
+  };
+  for (const [command, specs] of Object.entries(FILE_ARGUMENTS)) {
+    for (const [argument, spec] of Object.entries(specs)) {
+      for (const extension of possibleExtensionsOf(command, spec)) {
+        note(extension, `${command}.${argument}`);
+      }
+      for (const report of Object.keys(spec.reports ?? {})) {
+        note(reportExtension(report), `${command}.${argument}`);
+      }
+    }
+  }
+  note(SPILL_EXTENSION, 'a spilled result');
+  if (unknown.size > 0) {
+    const named = [...unknown]
+      .map(([extension, source]) => `.${extension} (${source})`)
+      .join(', ');
+    throw new Error(
+      `unknown file endings, each has to be entered into FILE_EXTENSIONS and ` +
+        `into CONTENT_TYPE_BY_EXTENSION before the front can serve them: ${named}`,
+    );
+  }
+}
+
+assertExtensionsAccountedFor();
+
+/**
  * The caller-chosen output names in flight, each with the browser that took it
  * and how many of its calls hold it. `OUTPUT_DIR` is flat and its names carry no
  * target, so two browsers writing `page.txt` at the same time would both stage
@@ -1431,10 +1539,7 @@ function releaseOutputNames(plan) {
  * planted after them is replaced by the rename rather than refused.
  */
 async function planOutputFile(command, argument, spec, resolved, toolArgs) {
-  const extensions =
-    typeof spec.extensions === 'function'
-      ? spec.extensions(toolArgs)
-      : spec.extensions;
+  const extensions = extensionsOf(command, spec, toolArgs);
   const requested = toolArgs[argument];
 
   if (requested === undefined) {
@@ -1555,7 +1660,7 @@ async function planOutputDirectory(command, argument, spec, target, toolArgs) {
  */
 async function planInputFile(command, argument, spec, target, toolArgs) {
   const requested = toolArgs[argument];
-  const endings = spec.extensions ?? [];
+  const endings = extensionsOf(command, spec, toolArgs);
   if (
     !PLAIN_FILE_NAME_PATTERN.test(requested) ||
     (endings.length > 0 &&
@@ -1910,10 +2015,7 @@ async function collectDirectoryFiles(directory, publicBase) {
   const collected = [];
   for (const [name, kind] of Object.entries(directory.reports)) {
     const source = path.join(directory.path, name);
-    const fileName = generatedFileName(
-      directory.target,
-      name.slice(name.indexOf('.') + 1),
-    );
+    const fileName = generatedFileName(directory.target, reportExtension(name));
     const filePath = path.join(OUTPUT_DIR, fileName);
     let stats;
     try {
