@@ -1,4 +1,9 @@
 /**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
  * chromectl HTTP front.
  *
  * Takes a target name plus a command, drives the chrome-devtools daemon that

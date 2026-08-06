@@ -1,4 +1,9 @@
 /**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
  * Target registry for chromectl.
  *
  * A caller names a target in plain words. This module turns that name into the
@@ -64,13 +69,17 @@ export function loadRegistry() {
           '(shape: chromectl/targets.example.json)',
       );
     }
-    throw new RegistryError(`cannot read target registry ${path}: ${error.message}`);
+    throw new RegistryError(
+      `cannot read target registry ${path}: ${error.message}`,
+    );
   }
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    throw new RegistryError(`target registry ${path} is not valid JSON: ${error.message}`);
+    throw new RegistryError(
+      `target registry ${path} is not valid JSON: ${error.message}`,
+    );
   }
   return parsed.targets ?? {};
 }
