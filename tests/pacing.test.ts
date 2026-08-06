@@ -39,7 +39,9 @@ import {
   SCROLL_PAUSE_MAX_MS,
   SCROLL_PAUSE_MIN_MS,
   selectPace,
+  settleAfterAction,
   SETTLE_MAX_MS,
+  SETTLE_MIN_MS,
   sleepKeyIntervalMs,
   sleepMs,
   WAIT_FOR_HELPER_MAX_MS,
@@ -215,6 +217,33 @@ describe('pacing', () => {
       assert.deepStrictEqual(PACE_HUMAN.scrollPauseMs, [
         SCROLL_PAUSE_MIN_MS,
         SCROLL_PAUSE_MAX_MS,
+      ]);
+    });
+  });
+
+  describe('the settle window after an action', () => {
+    it('is drawn from the human interval', async () => {
+      const waited = await settleAfterAction();
+
+      assert.ok(
+        waited >= SETTLE_MIN_MS && waited <= SETTLE_MAX_MS,
+        `${waited} outside ${SETTLE_MIN_MS}..${SETTLE_MAX_MS}`,
+      );
+    });
+
+    it('waits nothing at full speed', async () => {
+      const restore = selectPace(true);
+      try {
+        const before = Date.now();
+        assert.strictEqual(await settleAfterAction(), 0);
+        assert.ok(Date.now() - before < 50);
+      } finally {
+        restore();
+      }
+      assert.deepStrictEqual(PACE_FULL.settleMs, [0, 0]);
+      assert.deepStrictEqual(PACE_HUMAN.settleMs, [
+        SETTLE_MIN_MS,
+        SETTLE_MAX_MS,
       ]);
     });
   });

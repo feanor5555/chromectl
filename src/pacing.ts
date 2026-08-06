@@ -17,12 +17,11 @@
  * The figures the brake works to: a key stays down 70–140 ms, the gap to the
  * next press is 15–80 ms, and every paced action is preceded by a 250–700 ms
  * pause. A target the page had to jump to costs a further 1000–1200 ms before
- * the action follows. The 400–900 ms settle window after an action waits for the
- * page rather than imitating a person; it is charged per action like the pauses,
- * because the wrapper that waits it out is entered once per action and a form of
- * many short fields is one call of many actions. Every one of those intervals is
- * drawn afresh through `drawPacingMs`, which is the single place the brake takes
- * a value from.
+ * the action follows. A 400–900 ms settle window follows the action, charged per
+ * action like the pauses, because the wrapper that waits it out is entered once
+ * per action and a form of many short fields is one call of many actions. Every
+ * one of those intervals is drawn afresh through `drawPacingMs`, which is the
+ * single place the brake takes a value from.
  *
  * A call passes two ceilings, not one, because it can stand in line before it
  * does anything: the wait for the process-wide tool mutex is capped by
@@ -105,10 +104,11 @@ export const MOUSE_CLICK_GAP_MAX_MS = 180;
 
 /**
  * Shortest and longest settle window after an action has run, drawn like every
- * other interval. It is the one interval that imitates nobody: it waits for the
- * page instead of for a person, which is why it is not part of a pace profile
- * and is never shortened — a call at full speed waits it out as well, and every
- * action of a call carries one.
+ * other interval: the moment a person spends taking in what the page now shows,
+ * waited out once per action of a call. It sits on top of the helper's own wait
+ * for the navigation and for a DOM that stops mutating, which is where the tool
+ * learns that the page is done, so nothing depends on this window and it belongs
+ * to a profile like every other interval the brake takes.
  */
 export const SETTLE_MIN_MS = 400;
 export const SETTLE_MAX_MS = 900;
@@ -188,6 +188,8 @@ export interface PaceProfile {
    * double click.
    */
   readonly mouseClickGapMs: readonly [number, number];
+  /** The window waited out after an action has run. */
+  readonly settleMs: readonly [number, number];
   /**
    * Whether a text field takes its value in one shot instead of keystroke by
    * keystroke. Nothing about a value set directly can be paced, which is why
@@ -205,6 +207,7 @@ export const PACE_HUMAN: PaceProfile = {
   scrollPauseMs: [SCROLL_PAUSE_MIN_MS, SCROLL_PAUSE_MAX_MS],
   mouseHoldMs: [MOUSE_HOLD_MIN_MS, MOUSE_HOLD_MAX_MS],
   mouseClickGapMs: [MOUSE_CLICK_GAP_MIN_MS, MOUSE_CLICK_GAP_MAX_MS],
+  settleMs: [SETTLE_MIN_MS, SETTLE_MAX_MS],
   fillsInOneShot: false,
 };
 
@@ -217,6 +220,7 @@ export const PACE_FULL: PaceProfile = {
   scrollPauseMs: [0, 0],
   mouseHoldMs: [0, 0],
   mouseClickGapMs: [0, 0],
+  settleMs: [0, 0],
   fillsInOneShot: true,
 };
 
@@ -360,11 +364,12 @@ export async function pauseAfterScroll(scrolled: boolean): Promise<number> {
  * for a navigation and for a DOM that stops mutating. Those two end the moment
  * the page goes quiet, which puts the next call a fixed ~100 ms after the last
  * mutation every time; this window is what a person spends taking in what the
- * page now shows. It belongs to no profile, so it is waited out at full speed
- * as well.
+ * page now shows. It is drawn from the profile of the call in flight, so at full
+ * speed nothing of it is left — what the helper waits out for the page is
+ * untouched by that and runs at every pace.
  */
 export function settleAfterAction(): Promise<number> {
-  return pacedSleep(SETTLE_MIN_MS, SETTLE_MAX_MS);
+  return sleepAtPace(activePace.settleMs);
 }
 
 /**

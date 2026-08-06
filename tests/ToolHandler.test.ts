@@ -306,12 +306,13 @@ describe('ToolHandler', () => {
       assert.deepStrictEqual(seen, [PACE_HUMAN, PACE_HUMAN, PACE_FULL]);
     });
 
-    it('leaves a tool that paces nothing at human pacing', async () => {
+    it('reaches a tool of any other category just the same', async () => {
       const {handler, seen} = paceReportingTool(ToolCategory.NAVIGATION);
 
+      await handler.handle({});
       await handler.handle({}, {[FULL_SPEED_META_KEY]: true});
 
-      assert.deepStrictEqual(seen, [PACE_HUMAN]);
+      assert.deepStrictEqual(seen, [PACE_HUMAN, PACE_FULL]);
     });
 
     it('does not outlive the call that set it', async () => {
