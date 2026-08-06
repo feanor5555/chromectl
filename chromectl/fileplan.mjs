@@ -181,12 +181,12 @@ export function releaseOutputName(file) {
 /**
  * Gives the names of one finished call back. The name of a recording is not one
  * of them: its file is written until the stopping call renames it, so the claim
- * stays with the plan and is given back when that plan is.
+ * stays with the entry and is given back when that entry is dropped.
  *
- * `retained` is the mark of such a plan entry. It is set on the entry that is
- * parked as the running recording of a browser, and cleared again by
- * `forgetRecording` in `front.mjs`, which then gives the name back through
- * `releaseOutputName` and settles what the recording left.
+ * Such an entry is not in this plan. `describeCallFiles` in `front.mjs` takes it
+ * out when it parks it as the running recording of a browser, and
+ * `forgetRecording` gives the name back through `releaseOutputName` and settles
+ * what the recording left.
  */
 export function releaseOutputNames(plan) {
   for (const file of plan.files) {

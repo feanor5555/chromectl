@@ -696,7 +696,6 @@ async function forgetRecording(sessionId) {
     return;
   }
   recordings.delete(sessionId);
-  recording.retained = false;
   releaseOutputName(recording);
   await settleLeftoverFile(recording);
 }
@@ -716,13 +715,14 @@ async function forgetRecording(sessionId) {
 async function describeCallFiles(plan, resolved, command, publicBase) {
   const descriptors = {};
   const replacements = [];
+  const parked = [];
 
   for (const file of plan.files) {
     if (file.deferred) {
       const running = recordings.get(resolved.sessionId);
       const started = running ?? file;
       if (running === undefined) {
-        file.retained = true;
+        parked.push(file);
         recordings.set(resolved.sessionId, file);
       }
       descriptors[file.kind] = {
@@ -736,6 +736,15 @@ async function describeCallFiles(plan, resolved, command, publicBase) {
     if (described) {
       descriptors[file.kind] = described;
     }
+  }
+
+  // An entry parked as a running recording leaves the plan of the call that
+  // planned it. Its file is written past the end of that call and its name stays
+  // taken until `forgetRecording` gives both back, so nothing that settles or
+  // releases the plan may reach it. The plan gets a new array rather than having
+  // entries taken out of the one just walked.
+  if (parked.length > 0) {
+    plan.files = plan.files.filter(file => !parked.includes(file));
   }
 
   if (plan.directory) {
