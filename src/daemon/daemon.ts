@@ -151,6 +151,19 @@ async function setupMCPClient() {
   );
   await mcpClient.connect(mcpTransport);
 
+  // The MCP server process is what the daemon exists for. Once it is gone --
+  // it crashed, it was killed -- every further call would only write into a
+  // closed pipe and come back as a connection error, for as long as the daemon
+  // lives. The daemon shuts itself down instead, which frees socket and pid
+  // file, so the next call starts a fresh daemon with a fresh server.
+  mcpClient.onclose = () => {
+    if (shuttingDown) {
+      return;
+    }
+    console.error('MCP server connection closed. Shutting the daemon down.');
+    void cleanup(1);
+  };
+
   console.log('MCP client connected');
 }
 
@@ -285,7 +298,13 @@ async function startSocketServer() {
   });
 }
 
+let shuttingDown = false;
+
 async function cleanup(exitCode = 0) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
   console.log('Cleaning up daemon...');
 
   try {

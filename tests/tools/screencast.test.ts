@@ -8,7 +8,7 @@ import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {describe, it, afterEach} from 'node:test';
+import {describe, it, before, after, afterEach} from 'node:test';
 
 import sinon from 'sinon';
 
@@ -22,7 +22,42 @@ function createMockRecorder() {
   };
 }
 
+/**
+ * Stand-ins for ffmpeg builds that do and do not know the mp4 muxer option the
+ * recorder passes, so the format check answers the same on every machine.
+ */
+let ffmpegStubDir: string;
+let capableFfmpeg: string;
+let incapableFfmpeg: string;
+
+async function writeFfmpegStub(
+  name: string,
+  muxerHelp: string,
+): Promise<string> {
+  const filePath = path.join(ffmpegStubDir, name);
+  await fs.writeFile(filePath, `#!/bin/sh\ncat <<'EOF'\n${muxerHelp}\nEOF\n`, {
+    mode: 0o755,
+  });
+  return filePath;
+}
+
 describe('screencast', () => {
+  before(async () => {
+    ffmpegStubDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ffmpeg-stub-'));
+    capableFfmpeg = await writeFfmpegStub(
+      'ffmpeg-hybrid-fragmented',
+      '  -movflags <flags> E.......... MOV muxer flags\n     hybrid_fragmented E.......... Write a hybrid fragmented file',
+    );
+    incapableFfmpeg = await writeFfmpegStub(
+      'ffmpeg-plain',
+      '  -movflags <flags> E.......... MOV muxer flags\n     frag_keyframe E.......... Fragment at video keyframes',
+    );
+  });
+
+  after(async () => {
+    await fs.rm(ffmpegStubDir, {recursive: true, force: true});
+  });
+
   afterEach(() => {
     sinon.restore();
   });
@@ -36,7 +71,9 @@ describe('screencast', () => {
           .stub(selectedPage, 'screencast')
           .resolves(mockRecorder as never);
 
-        await startScreencast().handler(
+        await startScreencast({
+          experimentalFfmpegPath: capableFfmpeg,
+        } as ParsedArguments).handler(
           {
             params: {filePath: path.join(os.tmpdir(), 'test-recording.mp4')},
             page: context.getSelectedMcpPage(),
@@ -55,6 +92,65 @@ describe('screencast', () => {
           response.responseLines
             .join('\n')
             .includes('Screencast recording started'),
+        );
+
+        await stopScreencast.handler(
+          {params: {}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
+      });
+    });
+
+    it('refuses mp4 if the ffmpeg cannot write a fragmented file', async () => {
+      await withMcpContext(async (response, context) => {
+        const selectedPage = context.getSelectedMcpPage().pptrPage;
+        const screencastStub = sinon.stub(selectedPage, 'screencast');
+
+        await assert.rejects(
+          startScreencast({
+            experimentalFfmpegPath: incapableFfmpeg,
+          } as ParsedArguments).handler(
+            {
+              params: {filePath: path.join(os.tmpdir(), 'test-recording.mp4')},
+              page: context.getSelectedMcpPage(),
+            },
+            response,
+            context,
+          ),
+          /cannot record mp4/,
+        );
+
+        sinon.assert.notCalled(screencastStub);
+        assert.strictEqual(context.getScreenRecorder(), null);
+      });
+    });
+
+    it('generates a WebM temp path if the ffmpeg cannot record mp4', async () => {
+      await withMcpContext(async (response, context) => {
+        const mockRecorder = createMockRecorder();
+        const selectedPage = context.getSelectedMcpPage().pptrPage;
+        const screencastStub = sinon
+          .stub(selectedPage, 'screencast')
+          .resolves(mockRecorder as never);
+
+        await startScreencast({
+          experimentalFfmpegPath: incapableFfmpeg,
+        } as ParsedArguments).handler(
+          {params: {}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
+
+        const callArgs = screencastStub.firstCall.args[0];
+        assert.ok(callArgs);
+        assert.strictEqual(callArgs.format, 'webm');
+        assert.ok(callArgs.path?.endsWith('.webm'));
+
+        await stopScreencast.handler(
+          {params: {}, page: context.getSelectedMcpPage()},
+          response,
+          context,
         );
       });
     });
@@ -81,6 +177,12 @@ describe('screencast', () => {
         assert.ok(callArgs);
         assert.strictEqual(callArgs.format, 'webm');
         assert.ok(callArgs.path?.endsWith('.webm'));
+
+        await stopScreencast.handler(
+          {params: {}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
       });
     });
 
@@ -114,7 +216,9 @@ describe('screencast', () => {
           .stub(selectedPage, 'screencast')
           .resolves(mockRecorder as never);
 
-        await startScreencast().handler(
+        await startScreencast({
+          experimentalFfmpegPath: capableFfmpeg,
+        } as ParsedArguments).handler(
           {params: {}, page: context.getSelectedMcpPage()},
           response,
           context,
@@ -125,6 +229,12 @@ describe('screencast', () => {
         assert.ok(callArgs);
         assert.ok(callArgs.path?.endsWith('.mp4'));
         assert.ok(context.getScreenRecorder() !== null);
+
+        await stopScreencast.handler(
+          {params: {}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
       });
     });
 
@@ -161,7 +271,9 @@ describe('screencast', () => {
         sinon.stub(selectedPage, 'screencast').rejects(error);
 
         await assert.rejects(
-          startScreencast().handler(
+          startScreencast({
+            experimentalFfmpegPath: capableFfmpeg,
+          } as ParsedArguments).handler(
             {
               params: {filePath: path.join(os.tmpdir(), 'test.mp4')},
               page: context.getSelectedMcpPage(),
@@ -184,7 +296,9 @@ describe('screencast', () => {
           .rejects(new Error('spawn ffmpeg ENOENT'));
 
         await assert.rejects(
-          startScreencast().handler(
+          startScreencast({
+            experimentalFfmpegPath: capableFfmpeg,
+          } as ParsedArguments).handler(
             {params: {}, page: context.getSelectedMcpPage()},
             response,
             context,
@@ -208,9 +322,8 @@ describe('screencast', () => {
           .stub(selectedPage, 'screencast')
           .resolves(mockRecorder as never);
 
-        const experimentalFfmpegPath = '/custom/path/to/ffmpeg';
         await startScreencast({
-          experimentalFfmpegPath,
+          experimentalFfmpegPath: capableFfmpeg,
         } as ParsedArguments).handler(
           {params: {}, page: context.getSelectedMcpPage()},
           response,
@@ -219,7 +332,37 @@ describe('screencast', () => {
 
         sinon.assert.calledOnce(screencastStub);
         const callArgs = screencastStub.firstCall.args[0];
-        assert.strictEqual(callArgs?.ffmpegPath, experimentalFfmpegPath);
+        assert.strictEqual(callArgs?.ffmpegPath, capableFfmpeg);
+
+        await stopScreencast.handler(
+          {params: {}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
+      });
+    });
+
+    it('reports a missing ffmpeg before a recording is started', async () => {
+      await withMcpContext(async (response, context) => {
+        const selectedPage = context.getSelectedMcpPage().pptrPage;
+        const screencastStub = sinon.stub(selectedPage, 'screencast');
+
+        await assert.rejects(
+          startScreencast({
+            experimentalFfmpegPath: path.join(ffmpegStubDir, 'does-not-exist'),
+          } as ParsedArguments).handler(
+            {
+              params: {filePath: path.join(os.tmpdir(), 'test.mp4')},
+              page: context.getSelectedMcpPage(),
+            },
+            response,
+            context,
+          ),
+          /ffmpeg is required for screencast recording/,
+        );
+
+        sinon.assert.notCalled(screencastStub);
+        assert.strictEqual(context.getScreenRecorder(), null);
       });
     });
   });
@@ -262,6 +405,28 @@ describe('screencast', () => {
           response.responseLines
             .join('\n')
             .includes(`stopped and saved to ${filePath}`),
+        );
+      });
+    });
+
+    it('says so if the recording file stayed empty', async () => {
+      await withMcpContext(async (response, context) => {
+        const mockRecorder = createMockRecorder();
+        const filePath = path.join(ffmpegStubDir, 'empty-recording.webm');
+        await fs.writeFile(filePath, '');
+        context.setScreenRecorder({
+          recorder: mockRecorder as never,
+          filePath,
+        });
+
+        await stopScreencast.handler(
+          {params: {}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
+
+        assert.ok(
+          response.responseLines.join('\n').includes('The file is empty'),
         );
       });
     });
