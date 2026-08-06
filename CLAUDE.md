@@ -15,3 +15,7 @@ This repository is a pinned fork of `chrome-devtools-mcp`. The MCP transport is 
   3. `full_speed`, the per-call opt-in for when bot detection does not matter and only speed does.
 - Bugs found in the template are fixed as a matter of course.
 - Nothing else is added and nothing is taken away.
+
+## Development Status
+
+chromectl is in development and has no users. The front, the daemons and the browsers they drive may be rebuilt, restarted and killed at any time without consideration: no checking for calls in flight, no waiting for other instances, no coordination.
