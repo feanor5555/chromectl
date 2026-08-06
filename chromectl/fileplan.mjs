@@ -183,16 +183,14 @@ export function releaseOutputName(file) {
  * of them: its file is written until the stopping call renames it, so the claim
  * stays with the entry and is given back when that entry is dropped.
  *
- * Such an entry is not in this plan. `describeCallFiles` in `front.mjs` takes it
- * out when it parks it as the running recording of a browser, and
+ * Such an entry is not in this plan. `describeCallFiles` in `fileresult.mjs`
+ * takes it out when it parks it as the running recording of a browser, and
  * `forgetRecording` gives the name back through `releaseOutputName` and settles
  * what the recording left.
  */
 export function releaseOutputNames(plan) {
   for (const file of plan.files) {
-    if (!file.retained) {
-      releaseOutputName(file);
-    }
+    releaseOutputName(file);
   }
 }
 
