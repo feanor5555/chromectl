@@ -654,6 +654,71 @@ describe('chromectl front output names', () => {
   });
 });
 
+describe('chromectl front command surface', () => {
+  it('offers exactly the commands of the upstream table', async () => {
+    const answer = await send('/health');
+
+    assert.strictEqual(answer.status, 200);
+    assert.deepStrictEqual(
+      payload(answer)['commands'],
+      Object.keys(commands).sort(),
+    );
+  });
+
+  it('brings a caller argument to the declared type', async () => {
+    // `/budget` runs the whole argument check and drives no browser, so the
+    // coercion is measured where it happens and nowhere else.
+    const accepted = [
+      // A caller that can only send text writes every value as one.
+      {command: 'wait_for', args: {text: 'ready'}, full_speed: 'true'},
+      {command: 'wait_for', args: {text: 'ready', timeout: '5'}},
+      {command: 'wait_for', args: {text: ['ready', 'done'], timeout: 5}},
+    ];
+    for (const body of accepted) {
+      const answer = await budget(body);
+      assert.strictEqual(
+        answer.status,
+        200,
+        `${JSON.stringify(body)}: ${answer.body.toString('utf8')}`,
+      );
+      assert.strictEqual(payload(answer)['command'], body.command);
+    }
+
+    const refused = [
+      // A boolean is the two written words and nothing beside them.
+      {
+        body: {command: 'wait_for', args: {text: 'ready'}, full_speed: 'yes'},
+        error: /full_speed must be a boolean/,
+      },
+      {
+        body: {command: 'wait_for', args: {text: 'ready', timeout: 'x'}},
+        error: /timeout must be a number/,
+      },
+      {
+        body: {command: 'wait_for', args: {timeout: 5}},
+        error: /required argument text is missing/,
+      },
+      {
+        body: {command: 'wait_for', args: {text: 'ready', timeout: 1.5}},
+        error: /timeout must be an integer/,
+      },
+      {
+        body: {command: 'take_screenshot', args: {format: 'bmp'}},
+        error: /format must be one of/,
+      },
+      {
+        body: {command: 'no_such_tool', args: {}},
+        error: /unknown command/,
+      },
+    ];
+    for (const {body, error} of refused) {
+      const answer = await budget(body);
+      assertUsage(answer, JSON.stringify(body));
+      assert.match(String(payload(answer)['error']), error);
+    }
+  });
+});
+
 describe('chromectl front argument and target lookups', () => {
   it('reads no argument off the prototype', async () => {
     for (const name of [
