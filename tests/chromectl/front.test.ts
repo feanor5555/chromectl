@@ -1565,6 +1565,32 @@ describe('chromectl front report directories', () => {
     assert.ok(!fs.existsSync(handedDir), `${handedDir} is still there`);
     assert.deepStrictEqual(stagingLeftovers(), []);
   });
+
+  it('takes back the report it moved when the next one cannot follow', async () => {
+    let handedDir = '';
+    daemonHandler = daemonCall => {
+      handedDir = String(daemonCall.args?.['outputDirPath']);
+      fs.writeFileSync(path.join(handedDir, 'report.json'), REPORT_JSON);
+      // An entry that is in the directory and leads nowhere: not the absence
+      // that is answered without it, so taking the reports out fails after the
+      // first one is already out.
+      fs.symlinkSync('report.html', path.join(handedDir, 'report.html'));
+      return toolSuccess();
+    };
+
+    const answer = await call({target: 'fake', command: 'lighthouse_audit'});
+
+    assert.strictEqual(answer.status, 500, answer.body.toString('utf8'));
+    const body = payload(answer);
+    assert.strictEqual(body['kind'], 'storage', answer.body.toString('utf8'));
+    assert.match(String(body['error']), /^report_html could not be moved to /);
+
+    // The report that was already out is named in no answer, and nothing prunes
+    // a generated name: it goes with the failure rather than staying on the
+    // share for good, and so does the directory it came from.
+    assert.deepStrictEqual(stagingLeftovers(), []);
+    assert.ok(!fs.existsSync(handedDir), `${handedDir} is still there`);
+  });
 });
 
 describe('chromectl front expiry', () => {

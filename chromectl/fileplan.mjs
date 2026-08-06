@@ -412,13 +412,22 @@ export async function planCall(command, resolved, toolArgs) {
     throw error;
   }
 
-  // The echoed argument is the path the caller ends up with; what the daemon is
-  // handed is the staging path beside it. The directory of a call is gone by the
-  // time the answer is written, so it is echoed to nobody.
-  for (const entry of [...plan.files, ...plan.inputs]) {
-    toolArgs[entry.argument] = entry.filePath;
-  }
   return plan;
+}
+
+/**
+ * The arguments one call is answered with: those the caller sent, with every
+ * path the plan filled in put in their place. The echoed path is the one the
+ * caller ends up with; what the daemon is handed is the staging path beside it,
+ * from `daemonPathArguments`. The directory of a call is gone by the time the
+ * answer is written, so it is echoed to nobody.
+ */
+export function echoedArguments(plan, toolArgs) {
+  const echoed = {...toolArgs};
+  for (const entry of [...plan.files, ...plan.inputs]) {
+    echoed[entry.argument] = entry.filePath;
+  }
+  return echoed;
 }
 
 /** The paths the daemon is handed in place of the echoed ones. */

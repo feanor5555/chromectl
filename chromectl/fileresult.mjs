@@ -269,6 +269,11 @@ async function describeWrittenFile(file, publicBase) {
  * out fails the call: the directory goes a moment later, so a report that was
  * written and stays behind is lost, and an answer reporting a success for it
  * would be the only trace it ever existed.
+ *
+ * A failure takes the reports already out of the directory with it. They sit
+ * under generated names in `OUTPUT_DIR`, no answer will carry them, and nothing
+ * prunes a name of that shape, so page content would otherwise stay on the share
+ * for good.
  */
 async function collectDirectoryFiles(directory, publicBase) {
   const collected = [];
@@ -287,6 +292,14 @@ async function collectDirectoryFiles(directory, publicBase) {
     } catch (error) {
       if (error.code === 'ENOENT') {
         continue;
+      }
+      for (const done of collected) {
+        try {
+          await fs.unlink(done.descriptor.path);
+        } catch {
+          // Gone already, or not this process's to remove: the failure the
+          // caller is told about is the one from the directory.
+        }
       }
       throw new CallError(
         'storage',

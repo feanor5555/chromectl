@@ -75,6 +75,7 @@ import {
 } from './filenames.mjs';
 import {
   daemonPathArguments,
+  echoedArguments,
   planCall,
   releaseOutputNames,
   removeStagedInputs,
@@ -191,10 +192,11 @@ async function carryOutCall(
 ) {
   // A written file takes the place of the payload upstream would attach, so the
   // answer stays small enough for a caller's shell, and a file to be read is
-  // looked up where every machine can put one. The echoed arguments are the
-  // paths the caller ends up with; what the daemon is handed are the staging
-  // paths beside them.
+  // looked up where every machine can put one.
   const plan = await planCall(command, resolved, toolArgs);
+  // What the answer says the call was given: the paths the caller ends up with.
+  // What the daemon is handed are the staging paths beside them.
+  const echoedArgs = echoedArguments(plan, toolArgs);
   try {
     let outcome;
     try {
@@ -241,7 +243,7 @@ async function carryOutCall(
       target: resolved.target,
       browser_url: resolved.browserUrl,
       command,
-      args: toolArgs,
+      args: echoedArgs,
       // Which profile ran, on every answer, so a log shows plainly whether the
       // brake was off.
       pace: atFullSpeed ? 'full' : 'human',
