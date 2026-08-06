@@ -340,9 +340,14 @@ const DAEMON_ARGS = [
   '--allowUnrestrictedPaths',
 ];
 
-/** HTTP status per failure kind, mirroring the client's exit codes. */
+/**
+ * HTTP status per failure kind, mirroring the client's exit codes. `notfound`
+ * belongs to the file route alone — a call never produces it, so it is the one
+ * status the client's mapping does not have to carry.
+ */
 const STATUS_BY_KIND = {
   usage: 400,
+  notfound: 404,
   config: 500,
   storage: 500,
   busy: 409,
@@ -2271,11 +2276,14 @@ async function sendFile(response, pathname) {
     }
     data = await handle.readFile();
   } catch (error) {
-    // The retention is named here because it is the difference between a file
-    // that never existed and one that expired, and nothing else in the answer
-    // tells the two apart.
+    // A name that is not on the drive is the caller's business, not a fault of
+    // the front, and only that case is a 404: everything else the open can hit
+    // — a symlink, a hardlink, an entry that is no regular file, a drive that
+    // does not answer — is the storage failure it looks like. The retention is
+    // named because it is the difference between a file that never existed and
+    // one that expired, and nothing else in the answer tells the two apart.
     throw new CallError(
-      'storage',
+      error.code === 'ENOENT' ? 'notfound' : 'storage',
       `no file ${fileName} — spilled results are kept for ` +
         `${Math.round(SPILL_RETENTION_MS / 3_600_000)} h`,
       error.message,
