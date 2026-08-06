@@ -35,14 +35,22 @@ interface Registry {
   sessionIdFor(browserUrl: string): string;
 }
 
+let registry: Registry;
+
 /** The content of a file that lies outside the served directory. */
 const SECRET = 'behind the boundary\n';
 
 /** What the fake daemon writes when it is told to produce a snapshot. */
 const SNAPSHOT_TEXT = 'uid=1_0 page\n';
 
+/** The content of a file a caller hands in for a page to receive. */
+const UPLOAD_TEXT = 'handed in from another machine\n';
+
 /** How long the front is given to come up. */
 const START_TIMEOUT_MS = 20_000;
+
+/** How long a test waits for a call it holds to show up or to be let go of. */
+const IN_FLIGHT_TIMEOUT_MS = 10_000;
 
 /** The size of the file the streaming route is measured on. */
 const LARGE_FILE_BYTES = 256 * 1024 * 1024;
@@ -81,7 +89,12 @@ interface DaemonReply {
   error?: string;
 }
 
-type DaemonHandler = (call: DaemonCall) => DaemonReply;
+/**
+ * The answer the fake daemon gives to one command. A handler may hand back a
+ * promise and settle it whenever it likes, which is how a test keeps a call in
+ * flight while it sends the next one.
+ */
+type DaemonHandler = (call: DaemonCall) => DaemonReply | Promise<DaemonReply>;
 
 let tmpRoot: string;
 let outputDir: string;
@@ -90,8 +103,8 @@ let frontProcess: ChildProcess;
 let frontPid: number;
 let frontPort: number;
 let frontErrors = '';
-let browserServer: http.Server;
-let daemonServer: net.Server;
+const browserServers = new Set<http.Server>();
+const daemonServers = new Set<net.Server>();
 const daemonSockets = new Set<net.Socket>();
 
 /** The answer the fake daemon gives, and what the front handed it, per test. */
@@ -193,6 +206,83 @@ async function call(body: unknown): Promise<Answer> {
   return await send('/call', {method: 'POST', body: JSON.stringify(body)});
 }
 
+/**
+ * One call sent without waiting for its answer, so a test can let it stand
+ * while it sends the next one — or walk away from it. A socket that breaks
+ * settles as a status of 0: an abandoned call has no answer, and a rejection
+ * nobody reads would end the test run rather than the call.
+ */
+function startCall(body: unknown): {
+  request: http.ClientRequest;
+  answer: Promise<Answer>;
+} {
+  const content = JSON.stringify(body);
+  let settle!: (answer: Answer) => void;
+  const answer = new Promise<Answer>(resolve => {
+    settle = resolve;
+  });
+  const request = http.request(
+    {
+      host: '127.0.0.1',
+      port: frontPort,
+      path: '/call',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(content),
+      },
+    },
+    response => {
+      const chunks: Buffer[] = [];
+      response.on('data', chunk => chunks.push(chunk as Buffer));
+      response.on('end', () => {
+        settle({
+          status: response.statusCode ?? 0,
+          headers: response.headers,
+          body: Buffer.concat(chunks),
+        });
+      });
+    },
+  );
+  request.on('error', () => {
+    settle({status: 0, headers: {}, body: Buffer.alloc(0)});
+  });
+  request.end(content);
+  return {request, answer};
+}
+
+/** Waits until the fake daemon has been handed one tool call. */
+async function waitForDaemonCall(tool: string): Promise<DaemonCall> {
+  const deadline = Date.now() + IN_FLIGHT_TIMEOUT_MS;
+  for (;;) {
+    const seen = daemonCalls.find(
+      entry => entry.method === 'invoke_tool' && entry.tool === tool,
+    );
+    if (seen) {
+      return seen;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`the daemon was never handed ${tool}`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+/**
+ * Repeats one call until the front answers it the way the test waits for. What
+ * a test cannot see is the moment the front takes note of a client that left or
+ * of a call that ended, so the state is read off the answers themselves.
+ */
+async function callUntil(body: unknown, status: number): Promise<Answer> {
+  const deadline = Date.now() + IN_FLIGHT_TIMEOUT_MS;
+  let answer = await call(body);
+  while (answer.status !== status && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+    answer = await call(body);
+  }
+  return answer;
+}
+
 async function budget(body: unknown): Promise<Answer> {
   return await send('/budget', {method: 'POST', body: JSON.stringify(body)});
 }
@@ -255,7 +345,7 @@ function toolSuccess(): DaemonReply {
 
 /** The unix socket the front's daemon client talks to, with no daemon behind it. */
 function startFakeDaemon(socketPath: string): Promise<void> {
-  daemonServer = net.createServer(socket => {
+  const daemonServer = net.createServer(socket => {
     daemonSockets.add(socket);
     socket.on('error', () => {
       // A front that walked away mid-command is the front's business.
@@ -270,12 +360,17 @@ function startFakeDaemon(socketPath: string): Promise<void> {
         pending = pending.subarray(end + 1);
         const parsed = JSON.parse(message) as DaemonCall;
         daemonCalls.push(parsed);
-        const reply = daemonHandler(parsed);
-        socket.write(`${JSON.stringify(reply)}\0`);
+        // The framing stays synchronous and the answer does not: one socket
+        // carries one command, so a handler that holds its reply holds that
+        // call alone and the next one arrives on a socket of its own.
+        void Promise.resolve(daemonHandler(parsed)).then(reply => {
+          socket.write(`${JSON.stringify(reply)}\0`);
+        });
         end = pending.indexOf(0);
       }
     });
   });
+  daemonServers.add(daemonServer);
   return new Promise(resolve => {
     daemonServer.listen(socketPath, resolve);
   });
@@ -283,7 +378,7 @@ function startFakeDaemon(socketPath: string): Promise<void> {
 
 /** The CDP endpoint the front probes before it involves the daemon. */
 function startFakeBrowser(): Promise<number> {
-  browserServer = http.createServer((request, response) => {
+  const browserServer = http.createServer((request, response) => {
     if (request.url === '/json/version') {
       response.writeHead(200, {'content-type': 'application/json'});
       response.end(JSON.stringify({Browser: 'Chrome/0.0.0.0'}));
@@ -291,11 +386,33 @@ function startFakeBrowser(): Promise<number> {
     }
     response.writeHead(404).end();
   });
+  browserServers.add(browserServer);
   return new Promise(resolve => {
     browserServer.listen(0, '127.0.0.1', () => {
       resolve((browserServer.address() as net.AddressInfo).port);
     });
   });
+}
+
+/**
+ * One browser the front can drive: the CDP endpoint it probes and the socket
+ * where that browser's daemon would answer. A second one is what gives a test
+ * two browsers — the session id, and with it the daemon and every per-browser
+ * bookkeeping of the front, is derived from the browser URL alone, so a second
+ * registry name for one URL would be one browser again.
+ */
+async function startFakeTarget(runtimeDir: string): Promise<string> {
+  const browserUrl = `http://127.0.0.1:${await startFakeBrowser()}`;
+  const daemonHome = path.join(
+    runtimeDir,
+    `chrome-devtools-mcp-${registry.sessionIdFor(browserUrl)}`,
+  );
+  fs.mkdirSync(daemonHome, {recursive: true});
+  // The front asks the pid file whether a daemon is there and signals that pid;
+  // this process is the one that is certainly alive and answers on the socket.
+  fs.writeFileSync(path.join(daemonHome, 'daemon.pid'), String(process.pid));
+  await startFakeDaemon(path.join(daemonHome, 'server.sock'));
+  return browserUrl;
 }
 
 async function waitForFront(): Promise<void> {
@@ -317,7 +434,7 @@ async function waitForFront(): Promise<void> {
 }
 
 before(async () => {
-  const registry = (await import(REGISTRY_MODULE)) as Registry;
+  registry = (await import(REGISTRY_MODULE)) as Registry;
 
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'chromectl-front-'));
   outputDir = path.join(tmpRoot, 'screenshots');
@@ -327,19 +444,15 @@ before(async () => {
   fs.mkdirSync(outsideDir);
   fs.writeFileSync(path.join(outsideDir, 'secret.txt'), SECRET);
 
-  const browserUrl = `http://127.0.0.1:${await startFakeBrowser()}`;
-  const sessionId = registry.sessionIdFor(browserUrl);
-  const daemonHome = path.join(runtimeDir, `chrome-devtools-mcp-${sessionId}`);
-  fs.mkdirSync(daemonHome, {recursive: true});
-  // The front asks the pid file whether a daemon is there and signals that pid;
-  // this process is the one that is certainly alive and answers on the socket.
-  fs.writeFileSync(path.join(daemonHome, 'daemon.pid'), String(process.pid));
-  await startFakeDaemon(path.join(daemonHome, 'server.sock'));
-
   const registryFile = path.join(tmpRoot, 'targets.json');
   fs.writeFileSync(
     registryFile,
-    JSON.stringify({targets: {fake: {browserUrl}}}),
+    JSON.stringify({
+      targets: {
+        fake: {browserUrl: await startFakeTarget(runtimeDir)},
+        other: {browserUrl: await startFakeTarget(runtimeDir)},
+      },
+    }),
     'utf8',
   );
 
@@ -369,8 +482,9 @@ after(async () => {
   for (const socket of daemonSockets) {
     socket.destroy();
   }
-  await new Promise(resolve => daemonServer.close(resolve));
-  await new Promise(resolve => browserServer.close(resolve));
+  for (const server of [...daemonServers, ...browserServers]) {
+    await new Promise(resolve => server.close(resolve));
+  }
   fs.rmSync(tmpRoot, {recursive: true, force: true});
 });
 
@@ -756,6 +870,99 @@ describe('chromectl front argument and target lookups', () => {
   });
 });
 
+describe('chromectl front call admission', () => {
+  it('takes no second call behind an abandoned one, bar the one that clears a dialog', async () => {
+    daemonCalls = [];
+    // Every command but the harmless one is held until this test lets it go, so
+    // a call stays in flight for exactly as long as the test needs it to.
+    const held = new Map<string, (reply: DaemonReply) => void>();
+    daemonHandler = daemonCall => {
+      if (daemonCall.tool === 'list_pages') {
+        return toolSuccess();
+      }
+      return new Promise<DaemonReply>(resolve => {
+        held.set(String(daemonCall.tool), resolve);
+      });
+    };
+    const releaseAll = (): void => {
+      for (const resolve of held.values()) {
+        resolve(toolSuccess());
+      }
+      held.clear();
+    };
+
+    try {
+      // A call whose client walked away runs on: nothing can stop it, and what
+      // it has already typed stays typed.
+      const abandoned = startCall({
+        target: 'fake',
+        command: 'wait_for',
+        args: {text: 'never'},
+      });
+      await waitForDaemonCall('wait_for');
+      abandoned.request.destroy();
+
+      const refused = await callUntil(
+        {target: 'fake', command: 'list_pages'},
+        409,
+      );
+      assert.strictEqual(
+        refused.status,
+        409,
+        `behind an abandoned call: ${refused.body.toString('utf8')}`,
+      );
+      const refusal = payload(refused);
+      assert.strictEqual(refusal['kind'], 'busy');
+      const detail = refusal['detail'] as Record<string, unknown>;
+      assert.strictEqual(detail['running_command'], 'wait_for');
+      assert.ok(
+        Number(detail['remaining_ms']) > 0,
+        `the refusal names no budget left: ${JSON.stringify(detail)}`,
+      );
+
+      // A standing dialog is the usual reason a call was abandoned, and the one
+      // command that clears it is admitted meanwhile.
+      const dialog = startCall({
+        target: 'fake',
+        command: 'handle_dialog',
+        args: {action: 'accept'},
+      });
+      await waitForDaemonCall('handle_dialog');
+
+      // One at a time, so no second caller drives the page beside it.
+      const second = await call({
+        target: 'fake',
+        command: 'handle_dialog',
+        args: {action: 'accept'},
+      });
+      assert.strictEqual(second.status, 409, second.body.toString('utf8'));
+      assert.strictEqual(
+        (payload(second)['detail'] as Record<string, unknown>)[
+          'running_command'
+        ],
+        'handle_dialog',
+      );
+
+      releaseAll();
+      const cleared = await dialog.answer;
+      assert.strictEqual(cleared.status, 200, cleared.body.toString('utf8'));
+
+      // With the abandoned call finished the browser takes calls again.
+      const admitted = await callUntil(
+        {target: 'fake', command: 'list_pages'},
+        200,
+      );
+      assert.strictEqual(
+        admitted.status,
+        200,
+        `after the abandoned call ended: ${admitted.body.toString('utf8')}`,
+      );
+    } finally {
+      releaseAll();
+    }
+  });
+});
+
 describe('chromectl front staging', () => {
   it('leaves no staging file when the file it was promised is empty', async () => {
     daemonHandler = daemonCall => {
@@ -810,5 +1017,226 @@ describe('chromectl front staging', () => {
     assert.deepStrictEqual(stagingLeftovers(), []);
 
     fs.rmSync(path.join(outputDir, 'promised.txt'));
+  });
+});
+
+describe('chromectl front input files', () => {
+  it('hands the daemon a copy and never the entry the caller named', async () => {
+    writeOutput('upload.txt', UPLOAD_TEXT);
+    daemonCalls = [];
+    let handedPath = '';
+    let handedContent = '';
+    daemonHandler = daemonCall => {
+      handedPath = String(daemonCall.args?.['filePath']);
+      handedContent = fs.readFileSync(handedPath, 'utf8');
+      return toolSuccess();
+    };
+
+    const answer = await call({
+      target: 'fake',
+      command: 'upload_file',
+      args: {uid: '1_0', filePath: 'upload.txt'},
+    });
+
+    assert.strictEqual(answer.status, 200, answer.body.toString('utf8'));
+    // The caller ends up with the path of the file it named.
+    const args = payload(answer)['args'] as Record<string, unknown>;
+    assert.strictEqual(args['filePath'], path.join(outputDir, 'upload.txt'));
+
+    // What the daemon was handed is a copy in a directory of that call's own,
+    // under the name the page receiving the upload is shown.
+    assert.strictEqual(path.basename(handedPath), 'upload.txt');
+    assert.strictEqual(handedContent, UPLOAD_TEXT);
+    assert.notStrictEqual(handedPath, path.join(outputDir, 'upload.txt'));
+    const stagingDir = path.dirname(handedPath);
+    assert.strictEqual(path.dirname(stagingDir), outputDir);
+    assert.match(path.basename(stagingDir), /^chromectl-fake-/);
+
+    // The copy is the call's own and outlives it by nothing.
+    assert.ok(!fs.existsSync(stagingDir), `${stagingDir} is still there`);
+    assert.deepStrictEqual(stagingLeftovers(), []);
+    assert.strictEqual(
+      fs.readFileSync(path.join(outputDir, 'upload.txt'), 'utf8'),
+      UPLOAD_TEXT,
+    );
+
+    fs.rmSync(path.join(outputDir, 'upload.txt'));
+  });
+
+  it('refuses an entry it may not read as the caller mistake it is', async () => {
+    fs.symlinkSync(
+      path.join(outsideDir, 'secret.txt'),
+      path.join(outputDir, 'linked.txt'),
+    );
+    fs.linkSync(
+      path.join(outsideDir, 'secret.txt'),
+      path.join(outputDir, 'twinned.txt'),
+    );
+    daemonCalls = [];
+
+    const refused = [
+      // A path of its own, in every spelling.
+      'sub/upload.txt',
+      '../upload.txt',
+      '/etc/passwd',
+      '.hidden.txt',
+      // A name of the directory that is not a file of it.
+      'gone.txt',
+      'linked.txt',
+      'twinned.txt',
+    ];
+    for (const fileName of refused) {
+      const answer = await call({
+        target: 'fake',
+        command: 'upload_file',
+        args: {uid: '1_0', filePath: fileName},
+      });
+      assertUsage(answer, fileName);
+      assert.ok(
+        !answer.body.toString('utf8').includes(SECRET.trim()),
+        `${fileName} answered with the file behind the boundary`,
+      );
+    }
+
+    // None of them was driven, and none left a copy behind.
+    assert.deepStrictEqual(daemonCalls, []);
+    assert.deepStrictEqual(stagingLeftovers(), []);
+
+    fs.rmSync(path.join(outputDir, 'linked.txt'));
+    fs.rmSync(path.join(outputDir, 'twinned.txt'));
+  });
+});
+
+describe('chromectl front output name claims', () => {
+  it('lets no second browser write the name a call is writing', async () => {
+    daemonCalls = [];
+    let release: (() => void) | undefined;
+    let holding = false;
+    daemonHandler = daemonCall =>
+      new Promise<DaemonReply>(resolve => {
+        if (holding) {
+          // The second call reaching the daemon at all is the failure this test
+          // is about, so it is answered rather than left to hang.
+          resolve({
+            success: false,
+            error: 'a second browser reached the daemon',
+          });
+          return;
+        }
+        holding = true;
+        release = () => {
+          release = undefined;
+          fs.writeFileSync(
+            String(daemonCall.args?.['filePath']),
+            SNAPSHOT_TEXT,
+          );
+          resolve(toolSuccess());
+        };
+      });
+
+    try {
+      const first = startCall({
+        target: 'fake',
+        command: 'take_snapshot',
+        args: {filePath: 'shared.txt'},
+      });
+      await waitForDaemonCall('take_snapshot');
+
+      // The directory is flat and its names carry no target, so the second
+      // browser would rename its own page onto the file this call is writing.
+      const second = await call({
+        target: 'other',
+        command: 'take_snapshot',
+        args: {filePath: 'shared.txt'},
+      });
+      assert.strictEqual(second.status, 409, second.body.toString('utf8'));
+      assert.strictEqual(payload(second)['kind'], 'busy');
+      assert.match(String(payload(second)['error']), /another browser/);
+
+      release?.();
+      const written = await first.answer;
+      assert.strictEqual(written.status, 200, written.body.toString('utf8'));
+
+      // The name is free again as soon as the call holding it has ended.
+      daemonHandler = daemonCall => {
+        fs.writeFileSync(String(daemonCall.args?.['filePath']), SNAPSHOT_TEXT);
+        return toolSuccess();
+      };
+      const afterwards = await call({
+        target: 'other',
+        command: 'take_snapshot',
+        args: {filePath: 'shared.txt'},
+      });
+      assert.strictEqual(
+        afterwards.status,
+        200,
+        afterwards.body.toString('utf8'),
+      );
+    } finally {
+      release?.();
+    }
+
+    assert.deepStrictEqual(stagingLeftovers(), []);
+    fs.rmSync(path.join(outputDir, 'shared.txt'));
+  });
+});
+
+describe('chromectl front expiry', () => {
+  it('removes what it left behind and nothing else', async () => {
+    const aged = Date.now() / 1000 - 2 * 24 * 3600;
+    const stem = 'chromectl-fake-20200101T000000000Z-';
+    const expired = [`${stem}aaaaaaa1.spill.json`, `${stem}aaaaaaa2`];
+    const kept = [
+      // A file a caller asked for, under a name of the front's own and under
+      // one of the caller's.
+      `${stem}aaaaaaa3.png`,
+      'asked-for.txt',
+      // An entry of the guest-writable share that only wears the shape.
+      `${stem}aaaaaaa4.spill.json`,
+      `${stem}aaaaaaa5`,
+    ];
+
+    writeOutput(expired[0]!, '{}');
+    fs.mkdirSync(path.join(outputDir, expired[1]!));
+    writeOutput(kept[0]!, 'image bytes');
+    writeOutput(kept[1]!, 'asked for\n');
+    fs.symlinkSync(
+      path.join(outsideDir, 'secret.txt'),
+      path.join(outputDir, kept[2]!),
+    );
+    fs.symlinkSync(outsideDir, path.join(outputDir, kept[3]!));
+    for (const name of [...expired, ...kept]) {
+      const entryPath = path.join(outputDir, name);
+      if (fs.lstatSync(entryPath).isSymbolicLink()) {
+        fs.lutimesSync(entryPath, aged, aged);
+      } else {
+        fs.utimesSync(entryPath, aged, aged);
+      }
+    }
+
+    // The expiry rides along with the next call that writes.
+    daemonHandler = daemonCall => {
+      fs.writeFileSync(String(daemonCall.args?.['filePath']), SNAPSHOT_TEXT);
+      return toolSuccess();
+    };
+    const answer = await call({
+      target: 'fake',
+      command: 'take_snapshot',
+      args: {filePath: 'pruned.txt'},
+    });
+    assert.strictEqual(answer.status, 200, answer.body.toString('utf8'));
+
+    const left = fs.readdirSync(outputDir);
+    for (const name of expired) {
+      assert.ok(!left.includes(name), `${name} was not swept`);
+    }
+    for (const name of kept) {
+      assert.ok(left.includes(name), `${name} was swept`);
+    }
+
+    for (const name of kept) {
+      fs.rmSync(path.join(outputDir, name));
+    }
+    fs.rmSync(path.join(outputDir, 'pruned.txt'));
   });
 });
