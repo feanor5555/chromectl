@@ -126,11 +126,6 @@ async function generateCli() {
       if (tool.name === 'fill_form') {
         return false;
       }
-      // Skipping wait_for because CLI does not handle array/JSON args well
-      // and shell scripts have many mechanisms for waiting.
-      if (tool.name === 'wait_for') {
-        return false;
-      }
       // Skipping get_tab_id as it is for internal integrations
       if (tool.name === 'get_tab_id') {
         return false;

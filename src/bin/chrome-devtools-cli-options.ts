@@ -1209,4 +1209,24 @@ export const commands: Commands = {
       },
     },
   },
+  wait_for: {
+    description: 'Wait for the specified text to appear on the selected page.',
+    category: 'Navigation automation',
+    args: {
+      text: {
+        name: 'text',
+        type: 'array',
+        description:
+          'Non-empty list of texts. Resolves when any value appears on the page.',
+        required: true,
+      },
+      timeout: {
+        name: 'timeout',
+        type: 'integer',
+        description:
+          'Maximum wait time in milliseconds. If set to 0, the default timeout will be used.',
+        required: false,
+      },
+    },
+  },
 } as const;

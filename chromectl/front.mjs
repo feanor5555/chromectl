@@ -68,6 +68,12 @@ const PORT = Number(process.env['CHROMECTL_PORT'] ?? 8091);
  * Commands a caller may invoke: page selection, page operation and page
  * inspection.
  *
+ * A command is on this list only if it grants no capability the list already
+ * grants, or clears a state the list cannot leave, and only if it neither
+ * executes caller-supplied code nor reads credential material out of a
+ * logged-in page. The front is unauthenticated, so everything here is reachable
+ * by anyone who reaches the port.
+ *
  * `select_page` decides which of the browser's tabs the following commands act
  * on. The selection lives in the daemon of that browser — one MCP server
  * process per session id holds it — so it stays in force for every further call
@@ -75,6 +81,21 @@ const PORT = Number(process.env['CHROMECTL_PORT'] ?? 8091);
  * `select_page`, until the selected tab is closed (the daemon then falls back
  * to the first page) or until the daemon is replaced. Without it a caller could
  * list the tabs but never leave the first one.
+ *
+ * `press_key` types into whatever currently has the focus, which is a strict
+ * subset of what `click` and `type_text` already reach, and it is the only way
+ * to send an ordinary Escape or Tab: `type_text`'s submit key covers a key
+ * pressed straight after typing and nothing else.
+ *
+ * `wait_for` reads page text that `take_snapshot` returns anyway, so it grants
+ * nothing new. Without it the only way to await a condition is a snapshot poll
+ * loop — a rapid-fire volley against the page, which the pace rule forbids, at
+ * the price of a full snapshot payload per poll.
+ *
+ * `handle_dialog` is the only way out of an open dialog. Both input and
+ * inspection are blocked while one stands, so a single `confirm()` wedges six
+ * of these eleven commands, and navigating away throws the page state the
+ * caller built up out without answering the prompt the page waits on.
  */
 const ALLOWED_COMMANDS = [
   'list_pages',
@@ -83,8 +104,11 @@ const ALLOWED_COMMANDS = [
   'click',
   'type_text',
   'fill',
+  'press_key',
   'take_snapshot',
   'take_screenshot',
+  'wait_for',
+  'handle_dialog',
 ];
 
 /**
@@ -531,6 +555,13 @@ function coerceArgument(command, definition, value) {
       }
       break;
     case 'array':
+      // A caller that can only send text cannot write a list at all, so a lone
+      // string counts as the one-element list — `wait_for --text "…"` is the
+      // whole of the exposed array surface, and without this the command is
+      // offered and uncallable from the bash client.
+      if (typeof coerced === 'string') {
+        coerced = [coerced];
+      }
       if (!Array.isArray(coerced)) {
         fail('an array');
       }
