@@ -2,6 +2,8 @@
  * @license
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Modified by the chromectl fork.
  */
 
 import process from 'node:process';
@@ -151,12 +153,13 @@ function pressOptions(clickCount: number): Readonly<MouseOptions> {
 }
 
 /**
- * Brings the pointer onto the element and presses the button, and hands the
- * release back. Everything a click needs before the page can act on it — the
- * scroll into view, the pause after a jump, the wait for a bounding box that
- * stops moving, the travel of the pointer and the span the button stays down —
- * happens here, because the page sees a completed click only on the release
- * and the release is what the caller runs under the navigation expectation.
+ * Brings the pointer onto the element and presses the button, and leaves it
+ * down for the caller to release. Everything a click needs before the page can
+ * act on it — the scroll into view, the pause after a jump, the wait for a
+ * bounding box that stops moving, the travel of the pointer and the span the
+ * button stays down — happens here, because the page sees a completed click
+ * only on the release and the release is what the caller runs under the
+ * navigation expectation.
  *
  * The approach stays with `Locator.hover`, so the locator's viewport and
  * stability conditions still run; only the press and the release are taken
@@ -172,7 +175,7 @@ async function pressPaced(
   handle: ElementHandle<Element>,
   mouse: Mouse,
   clickCount: number,
-): Promise<() => Promise<void>> {
+): Promise<void> {
   await approachInViewport(handle, async () => {
     await handle.asLocator().hover();
   });
@@ -184,9 +187,6 @@ async function pressPaced(
   }
   await mouse.down(pressOptions(clickCount));
   await sleepMs(drawMouseHoldMs());
-  return async () => {
-    await mouse.up(pressOptions(clickCount));
-  };
 }
 
 /**
@@ -521,6 +521,12 @@ export const click = definePageTool({
       !request.params.dblClick && aXNode?.role === 'option';
     const mouse = request.page.pptrPage.mouse;
     const clickCount = request.params.dblClick ? 2 : 1;
+    const releaseButton = async () => {
+      await mouse.up(pressOptions(clickCount));
+    };
+    // Set before the first press, not after the last one: a `mouse.up` that
+    // throws between the two clicks of a double click would otherwise leave the
+    // button logically down for every later interaction with the page.
     let release: (() => Promise<void>) | undefined;
     try {
       const result = await request.page.waitForEventsAfterTrigger(async () => {
@@ -536,15 +542,17 @@ export const click = definePageTool({
             if (await selectNativeSelectOption(handle)) {
               return;
             }
-            const fallbackRelease = await pressPaced(handle, mouse, clickCount);
-            await fallbackRelease();
+            release = releaseButton;
+            await pressPaced(handle, mouse, clickCount);
+            release = undefined;
+            await releaseButton();
           };
         }
-        release = await pressPaced(handle, mouse, clickCount);
+        release = releaseButton;
+        await pressPaced(handle, mouse, clickCount);
         return async () => {
-          const pressed = release;
           release = undefined;
-          await pressed?.();
+          await releaseButton();
         };
       });
       response.appendResponseLine(
@@ -727,8 +735,11 @@ async function buildFillAction(
     };
   }
 
-  const field = await readTypeableField(handle, value);
-  if (!field.typeable || currentPace().fillsInOneShot) {
+  // Only which route the field takes is decided here. What it currently holds
+  // is read further down, directly before the first keystroke, because the
+  // waits in between give the page time to change it.
+  const {typeable} = await readTypeableField(handle, value);
+  if (!typeable || currentPace().fillsInOneShot) {
     // Two cases take the one-shot route: a field that has no keystroke stream
     // to pace — a `<select>`, a date, a colour, a range — and every field at
     // full speed. `typingThreshold: 0` is what keeps `Locator.fill` from typing
@@ -752,7 +763,12 @@ async function buildFillAction(
 
   const keyboard = page.pptrPage.keyboard;
   await waitUntilReadyForTyping(handle);
-  if (field.alreadyEqual) {
+  // What the field holds is read again, immediately before the first keystroke.
+  // The waits above take over a second on a field the page had to jump to, and
+  // a field the page filled in during that time would otherwise be continued or
+  // left alone against content that is no longer there.
+  const content = await readTypeableField(handle, value);
+  if (content.alreadyEqual) {
     // The field already reads as it is meant to read. Typing it again would
     // clear a filled-out form field and rebuild it keystroke by keystroke in
     // front of anyone watching, for no change at all.
@@ -760,14 +776,23 @@ async function buildFillAction(
   }
   await handle.focus();
   let text = value;
-  if (field.keptPrefixLength > 0) {
+  if (content.keptPrefixLength > 0) {
     // What stands there is the beginning of what is wanted, so it stays and
     // only the rest is typed. Cutting by the length of the field's own content
     // cannot fall inside a surrogate pair: the value continues that content.
     await placeCaretAtEnd(handle);
-    text = value.slice(field.keptPrefixLength);
-  } else if (field.hasContent) {
+    text = value.slice(content.keptPrefixLength);
+  } else if (content.hasContent) {
     await selectAllPaced(keyboard);
+    if (text === '') {
+      // Emptying a field: no keystroke follows that could type over the
+      // selection, so the selection is removed by the key a hand would reach
+      // for. Without it the field would keep its old content while the call
+      // reports the fill as done.
+      return async () => {
+        await keyboard.press('Backspace', {delay: drawKeyHoldMs()});
+      };
+    }
   }
   const {lead, last} = splitLastKeystroke(text);
   await typePaced(keyboard, lead);
@@ -1041,8 +1066,11 @@ export const pressKey = definePageTool({
         for (const modifier of modifiers) {
           await page.pptrPage.keyboard.down(modifier);
           heldModifiers.push(modifier);
+          // A hand reaches for one modifier after the other and then for the
+          // key, so a gap separates every press from the next.
+          await sleepKeyIntervalMs();
         }
-        await page.pptrPage.keyboard.press(key);
+        await page.pptrPage.keyboard.press(key, {delay: drawKeyHoldMs()});
       } finally {
         // Release every modifier that was successfully pressed, even if a
         // later key event throws. Otherwise a failed press leaves modifiers

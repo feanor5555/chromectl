@@ -2,6 +2,8 @@
  * @license
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Modified by the chromectl fork.
  */
 
 import {DisposableStack} from './third_party/index.js';

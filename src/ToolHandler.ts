@@ -2,6 +2,8 @@
  * @license
  * Copyright 2026 Google LLC
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Modified by the chromectl fork.
  */
 
 import type {parseArguments} from './bin/chrome-devtools-mcp-cli-options.js';
@@ -280,7 +282,12 @@ export class ToolHandler {
     // The wait for the browser has its own ceiling, and the work budget the
     // outer layers grant starts only here, once the mutex is held. A call that
     // never got that far says so, so the caller can tell the two apart.
-    const guard = await acquireWithinCeiling(this.toolMutex);
+    //
+    // The guard is held with `using`, so no path out of this method releases
+    // the browser late: a throw on the way to the work below would otherwise
+    // leave the process-wide mutex held and every later call would wait out
+    // `MUTEX_WAIT_CEILING_MS` and fail.
+    using guard = await acquireWithinCeiling(this.toolMutex);
     if (!guard) {
       return {
         content: [
@@ -299,18 +306,21 @@ export class ToolHandler {
     // them, so a switch that only reached the input category would leave a
     // paced value standing at full speed.
     const fullSpeed = isFullSpeedRequest(meta);
-    const restorePace = selectPace(fullSpeed);
     const navigates = NAVIGATING_TOOLS.has(this.tool.name);
-    if (navigates && !fullSpeed) {
-      // Held under the mutex, like every other paced wait: a gap the next call
-      // could walk through is no gap.
-      await holdNavigationGap(lastNavigationEndedAtMs);
-    }
     const startTime = Date.now();
     let success = false;
     let devToolsData: DevToolsData | undefined;
     let pageUrl: string | undefined;
+    let restorePace: (() => void) | undefined;
     try {
+      // Inside the `try`, so the profile of this call is restored on every way
+      // out — the gap waited out below is an `await` between the two.
+      restorePace = selectPace(fullSpeed);
+      if (navigates && !fullSpeed) {
+        // Held under the mutex, like every other paced wait: a gap the next
+        // call could walk through is no gap.
+        await holdNavigationGap(lastNavigationEndedAtMs);
+      }
       logger?.(
         `${this.tool.name} request: ${JSON.stringify(params, null, '  ')}`,
       );
@@ -425,8 +435,7 @@ export class ToolHandler {
         // still the one the next braked navigation has to keep its gap from.
         lastNavigationEndedAtMs = Date.now();
       }
-      restorePace();
-      guard[Symbol.dispose]();
+      restorePace?.();
     }
   }
 }

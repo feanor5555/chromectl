@@ -39,8 +39,10 @@ import {
   SCROLL_PAUSE_MAX_MS,
   SCROLL_PAUSE_MIN_MS,
   selectPace,
+  SETTLE_MAX_MS,
   sleepKeyIntervalMs,
   sleepMs,
+  WAIT_FOR_HELPER_MAX_MS,
 } from '../src/pacing.js';
 
 const SAMPLE_COUNT = 20_000;
@@ -243,14 +245,18 @@ describe('pacing', () => {
     it('covers a form of many short fields that each make the page jump', () => {
       const value = 'a'.repeat(5);
       const elements = Array.from({length: 20}, () => ({value}));
-      // Every element pays the pause before it, the pause after the page jumped
-      // to it, the select-all that clears it and its own characters.
+      // Every element enters the wrapper of its own, so it pays the pause
+      // before it, the pause after the page jumped to it, the helper's windows
+      // around it and the settle window behind it, plus the select-all that
+      // clears it and its own characters.
       const selectAllMs = KEY_HOLD_MAX_MS + 2 * KEY_INTERVAL_MAX_MS;
       const worstCaseMs =
         CALL_OVERHEAD_MS +
         elements.length *
           (PRE_ACTION_PAUSE_MAX_MS +
             SCROLL_PAUSE_MAX_MS +
+            SETTLE_MAX_MS +
+            WAIT_FOR_HELPER_MAX_MS +
             selectAllMs +
             value.length * CHARACTER_MAX_MS);
 

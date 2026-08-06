@@ -18,9 +18,11 @@
  * next press is 15–80 ms, and every paced action is preceded by a 250–700 ms
  * pause. A target the page had to jump to costs a further 1000–1200 ms before
  * the action follows. The 400–900 ms settle window after an action waits for the
- * page rather than imitating a person and is part of the fixed overhead. Every
- * one of those intervals is drawn afresh through `drawPacingMs`, which is the
- * single place the brake takes a value from.
+ * page rather than imitating a person; it is charged per action like the pauses,
+ * because the wrapper that waits it out is entered once per action and a form of
+ * many short fields is one call of many actions. Every one of those intervals is
+ * drawn afresh through `drawPacingMs`, which is the single place the brake takes
+ * a value from.
  *
  * A call passes two ceilings, not one, because it can stand in line before it
  * does anything: the wait for the process-wide tool mutex is capped by
@@ -105,8 +107,8 @@ export const MOUSE_CLICK_GAP_MAX_MS = 180;
  * Shortest and longest settle window after an action has run, drawn like every
  * other interval. It is the one interval that imitates nobody: it waits for the
  * page instead of for a person, which is why it is not part of a pace profile
- * and is never shortened — a call at full speed waits it out as well, and the
- * fixed overhead of every call carries it.
+ * and is never shortened — a call at full speed waits it out as well, and every
+ * action of a call carries one.
  */
 export const SETTLE_MIN_MS = 400;
 export const SETTLE_MAX_MS = 900;
@@ -121,9 +123,22 @@ export const NAVIGATION_GAP_MAX_MS = 2_000;
  */
 export const WAIT_FOR_HELPER_MAX_MS = 3_000 + 3_000 + 100;
 
-/** Fixed overhead of any call, whatever it does and whatever it types. */
-export const CALL_OVERHEAD_MS =
-  SETTLE_MAX_MS + NAVIGATION_GAP_MAX_MS + WAIT_FOR_HELPER_MAX_MS;
+/**
+ * Fixed overhead of any call, whatever it does and whatever it types. Only the
+ * navigation gap is paid per call: it is held once, in front of the call.
+ */
+export const CALL_OVERHEAD_MS = NAVIGATION_GAP_MAX_MS;
+
+/**
+ * Worst case of one paced action, all of it paid per action rather than per
+ * call: `fill_form` enters the wrapper once per element, so a form of many
+ * short fields pays every one of these as often as it has elements.
+ */
+export const ACTION_OVERHEAD_MS =
+  PRE_ACTION_PAUSE_MAX_MS +
+  SCROLL_PAUSE_MAX_MS +
+  SETTLE_MAX_MS +
+  WAIT_FOR_HELPER_MAX_MS;
 
 /** Margin on top of the worst case, for everything not counted here. */
 export const BUDGET_SAFETY_FACTOR = 1.5;
@@ -386,8 +401,9 @@ interface PacedWork {
   /** Characters typed one by one. */
   characters: number;
   /**
-   * Paced actions, each paying its own pre-action pause and, if the page has to
-   * jump to reach its target, the pause after that jump.
+   * Paced actions, each paying its own pre-action pause, the pause after the
+   * jump that brings its target into view, the settle window behind it and the
+   * helper's own windows around it.
    */
   actions: number;
 }
@@ -441,7 +457,7 @@ export function callBudgetMs(
   const {characters, actions} = pacedWork(tool, args ?? {});
   const work =
     CALL_OVERHEAD_MS +
-    actions * (PRE_ACTION_PAUSE_MAX_MS + SCROLL_PAUSE_MAX_MS) +
+    actions * ACTION_OVERHEAD_MS +
     characters * CHARACTER_MAX_MS;
   return Math.max(MIN_CALL_BUDGET_MS, Math.ceil(work * BUDGET_SAFETY_FACTOR));
 }

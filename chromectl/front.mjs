@@ -19,11 +19,15 @@
  *   node /home/wu/chromectl/chromectl/front.mjs
  *
  * A screenshot is written to the network drive and the answer names its
- * location instead of carrying the image bytes.
+ * location instead of carrying the image bytes. A snapshot may be written there
+ * too, under a file name the caller picks; no file a call writes leaves that
+ * one directory.
  *
  * Endpoints:
  *   GET  /health          liveness plus the registered target names and commands
  *   GET  /screenshots/<f> the PNG of an earlier take_screenshot call
+ *   POST /budget          the same body as /call, answered with the deadline
+ *                         that call is granted and the timeout a caller sets
  *   POST /call            {"target": "<name>", "command": "<tool>", "args": {…},
  *                          "full_speed": false}
  */
@@ -101,11 +105,14 @@ const COMMAND_SCHEMAS = new Map(
 );
 
 /**
- * Where a screenshot lands: `/home/wu/share/screenshots` on the host the front
- * runs on, a directory of the house network drive that is served over Samba and
- * exported over NFS, so every machine reaches the file the front only names.
+ * Where every file a call writes lands: `/home/wu/share/screenshots` on the
+ * host the front runs on (`CHROMECTL_SCREENSHOT_DIR`), a directory of the house
+ * network drive that is served over Samba and exported over NFS, so every
+ * machine reaches the file the front only names. It is the single directory the
+ * front lets a call write into, and every path the front hands the daemon
+ * points inside it.
  */
-const SCREENSHOT_DIR =
+const OUTPUT_DIR =
   process.env['CHROMECTL_SCREENSHOT_DIR'] ?? '/home/wu/share/screenshots';
 
 /** Root of the network drive, used to name the file share-relative. */
@@ -119,8 +126,18 @@ const SCREENSHOT_ROUTE = '/screenshots/';
  * umask. Both are widened afterwards: an NFS client arrives under its own uid
  * and would otherwise be handed a file it cannot read.
  */
-const SCREENSHOT_DIR_MODE = 0o775;
-const SCREENSHOT_FILE_MODE = 0o644;
+const OUTPUT_DIR_MODE = 0o775;
+const OUTPUT_FILE_MODE = 0o644;
+
+/**
+ * The only file name a caller may ask for. It carries no directory separator
+ * and does not start with a dot, so such a name can neither leave `OUTPUT_DIR`
+ * nor address one of its parents, and `..` cannot be written at all. The `.txt`
+ * ending is what the daemon saves a snapshot as in any case
+ * (`McpContext.saveFile`), so demanding it keeps the path in the answer the
+ * path that lands on disk.
+ */
+const OUTPUT_FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\.txt$/;
 
 /** File names the front hands out, and the only ones it serves back. */
 const SCREENSHOT_NAME_PATTERN =
@@ -134,6 +151,16 @@ const CONTENT_TYPE_BY_FORMAT = {
 
 /** Upper bound for the CDP reachability probe. */
 const PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * What a caller has to grant on top of the deadline the front sets itself, so
+ * that the front's timer is the one that fires and the caller learns the
+ * outcome instead of guessing it: the reachability probe, a daemon start or
+ * replacement and the writing of the answer all sit outside that deadline. A
+ * caller whose own timeout fired first would report a call as failed while it
+ * is still typing into the page, and a retry would type the text twice.
+ */
+const CLIENT_TIMEOUT_HEADROOM_MS = 30_000;
 
 /** Upper bound for one step of taking a daemon down before it is signalled. */
 const DAEMON_STOP_TIMEOUT_MS = 2_000;
@@ -157,11 +184,13 @@ const BROWSER_LINK_GONE = /^(Not connected|MCP client not initialized)$/;
  * register the full tool set, `experimentalStructuredContent` is what makes a
  * result come back as a JSON object rather than rendered text, and
  * `categoryExtensions` is what keeps extension service workers in the page
- * listing, and `allowUnrestrictedPaths` is what lets a screenshot leave the OS
- * temp directory: the daemon's own MCP client negotiates no roots capability,
- * so without the flag every file-writing tool is confined to `/tmp`. The
- * widening is safe here because no caller supplies a path — the front alone
- * decides where a file goes.
+ * listing, and `allowUnrestrictedPaths` is what lets a written file leave the
+ * OS temp directory: the daemon's own MCP client negotiates no roots
+ * capability, so without the flag every file-writing tool is confined to
+ * `/tmp`. The widening is safe here because the front is the layer that
+ * confines the path: no path a caller sends is forwarded, the front fills
+ * `filePath` in itself and every file it lets a call write stays in
+ * `OUTPUT_DIR`.
  */
 const DAEMON_ARGS = [
   '--viaCli',
@@ -407,7 +436,10 @@ async function replaceDaemon(resolved, generation) {
  * shortest of them, so a timeout is reported here rather than by a socket
  * further in. Which of the two ceilings was hit stays legible: the wait ends at
  * its own ceiling inside the daemon and comes back as a failed call, so a
- * timeout reported here is the work.
+ * timeout reported here is the work. The caller's own timeout is the same
+ * figure again, asked for through `/budget` and widened by
+ * `CLIENT_TIMEOUT_HEADROOM_MS`, so it can only fire after this one and a caller
+ * gets a reported failure instead of a silence.
  */
 async function invokeTool(resolved, command, args, fullSpeed) {
   const message = {method: 'invoke_tool', tool: command, args, fullSpeed};
@@ -537,6 +569,16 @@ function validateFullSpeed(value) {
   return coerceArgument('call', FULL_SPEED_DEFINITION, value);
 }
 
+/** A command the front does not offer never reaches the daemon. */
+function assertKnownCommand(command) {
+  if (typeof command !== 'string' || !COMMAND_SCHEMAS.has(command)) {
+    throw new CallError(
+      'usage',
+      `unknown command: ${JSON.stringify(command)} (allowed: ${ALLOWED_COMMANDS.join(', ')})`,
+    );
+  }
+}
+
 /**
  * Checks the caller's arguments against the command's schema and returns them
  * typed. Unknown names and missing required ones are rejected here, before the
@@ -595,56 +637,115 @@ function screenshotFileName(target, format) {
   return `chromectl-${slug}-${stamp}-${randomBytes(4).toString('hex')}.${format}`;
 }
 
+/** Makes sure the output directory exists and this process can write into it. */
+async function ensureOutputDir() {
+  try {
+    const created = await fs.mkdir(OUTPUT_DIR, {
+      recursive: true,
+      mode: OUTPUT_DIR_MODE,
+    });
+    if (created !== undefined) {
+      await fs.chmod(OUTPUT_DIR, OUTPUT_DIR_MODE);
+    }
+    await fs.access(OUTPUT_DIR, fs.constants.W_OK | fs.constants.X_OK);
+  } catch (error) {
+    throw new CallError(
+      'storage',
+      `output directory ${OUTPUT_DIR} is not writable`,
+      error.message,
+    );
+  }
+}
+
 /**
- * Makes sure the screenshot directory exists and takes the caller's own path
- * out of the picture.
+ * Plans the screenshot file and takes the caller's own path out of the picture.
  *
- * The location is the front's business, not the caller's: the front runs
- * without authentication, and a caller-chosen path would both write anywhere on
- * the host the front runs on and hand back a location the caller may not be
- * able to reach. A `filePath` argument is therefore rejected as a usage error
- * instead of being silently overwritten, so nobody believes their path was
- * honoured.
+ * The whole location is the front's business here, not the caller's: a
+ * caller-chosen path would hand back a location the caller may not be able to
+ * reach, and the name is what the fetch route recognises. A `filePath` argument
+ * is therefore rejected as a usage error instead of being silently overwritten,
+ * so nobody believes their path was honoured.
  */
 async function planScreenshot(target, toolArgs) {
   if (toolArgs.filePath !== undefined) {
     throw new CallError(
       'usage',
       'take_screenshot: filePath is not a caller argument — the front writes ' +
-        `the file to ${SCREENSHOT_DIR} and returns its location`,
+        `the file to ${OUTPUT_DIR} and returns its location`,
     );
   }
 
   const format = toolArgs.format ?? 'png';
   const fileName = screenshotFileName(target, format);
-  const filePath = path.join(SCREENSHOT_DIR, fileName);
-
-  try {
-    const created = await fs.mkdir(SCREENSHOT_DIR, {
-      recursive: true,
-      mode: SCREENSHOT_DIR_MODE,
-    });
-    if (created !== undefined) {
-      await fs.chmod(SCREENSHOT_DIR, SCREENSHOT_DIR_MODE);
-    }
-    await fs.access(SCREENSHOT_DIR, fs.constants.W_OK | fs.constants.X_OK);
-  } catch (error) {
-    throw new CallError(
-      'storage',
-      `screenshot directory ${SCREENSHOT_DIR} is not writable`,
-      error.message,
-    );
-  }
-
-  return {fileName, filePath, format};
+  await ensureOutputDir();
+  return {
+    kind: 'screenshot',
+    fileName,
+    filePath: path.join(OUTPUT_DIR, fileName),
+    format,
+  };
 }
 
 /**
- * Turns a failed screenshot call into a storage failure when the daemon choked
- * on the file rather than on the page. A write that fails is an outage of the
- * network drive and must not read as a browser that could not take the picture.
+ * Plans the file a caller asked a snapshot to be written to.
+ *
+ * The front runs without authentication, so a path taken from the caller would
+ * write anywhere the front's user can write, with page-controlled content. The
+ * directory is therefore the front's decision and the caller names at most the
+ * file: a name that is not a plain `*.txt` file name is refused rather than
+ * bent into one, so nobody believes their path was honoured.
+ *
+ * An entry of that name that already exists is only accepted when it is a
+ * regular file. The drive is writable over Samba and NFS, so a symlink placed
+ * in the directory would otherwise carry the write straight out of it again.
  */
-function reclassifyScreenshotFailure(error, plan) {
+async function planSnapshotFile(command, toolArgs) {
+  const requested = toolArgs.filePath;
+  if (!OUTPUT_FILE_NAME_PATTERN.test(requested)) {
+    throw new CallError(
+      'usage',
+      `${command}: filePath must be a plain file name ending in .txt — the ` +
+        `front writes it to ${OUTPUT_DIR} and no path leaves that directory`,
+    );
+  }
+
+  await ensureOutputDir();
+  const filePath = path.join(OUTPUT_DIR, requested);
+  let existing;
+  try {
+    existing = await fs.lstat(filePath);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw new CallError('storage', `cannot write ${filePath}`, error.message);
+    }
+  }
+  if (existing !== undefined && !existing.isFile()) {
+    throw new CallError(
+      'usage',
+      `${command}: ${requested} exists in ${OUTPUT_DIR} and is not a regular file`,
+    );
+  }
+
+  return {kind: 'snapshot', fileName: requested, filePath};
+}
+
+/** The file one call writes, or nothing when it writes none. */
+async function planWrittenFile(command, target, toolArgs) {
+  if (command === 'take_screenshot') {
+    return await planScreenshot(target, toolArgs);
+  }
+  if (command === 'take_snapshot' && toolArgs.filePath !== undefined) {
+    return await planSnapshotFile(command, toolArgs);
+  }
+  return undefined;
+}
+
+/**
+ * Turns a failed call into a storage failure when the daemon choked on the file
+ * rather than on the page. A write that fails is an outage of the network drive
+ * and must not read as a browser that could not carry the command out.
+ */
+function reclassifyFileFailure(error, plan) {
   if (!(error instanceof CallError) || error.kind !== 'tool') {
     return error;
   }
@@ -652,30 +753,30 @@ function reclassifyScreenshotFailure(error, plan) {
     typeof error.detail === 'string'
       ? error.detail
       : JSON.stringify(error.detail ?? '');
-  if (!detail.includes(plan.filePath) && !detail.includes(SCREENSHOT_DIR)) {
+  if (!detail.includes(plan.filePath) && !detail.includes(OUTPUT_DIR)) {
     return error;
   }
   return new CallError(
     'storage',
-    `screenshot could not be written to ${plan.filePath}`,
+    `${plan.kind} could not be written to ${plan.filePath}`,
     error.detail,
   );
 }
 
 /**
- * Widens a screenshot a failed call left behind. A call that hits its deadline
- * or fails after the picture was written still leaves the daemon's 0600 file on
- * the drive, and a file only the front's uid can read is of no use to an NFS
- * client arriving under its own. It is therefore made readable exactly like the
- * file of a successful call.
+ * Widens a file a failed call left behind. A call that hits its deadline or
+ * fails after the write still leaves the daemon's 0600 file on the drive, and a
+ * file only the front's uid can read is of no use to an NFS client arriving
+ * under its own. It is therefore made readable exactly like the file of a
+ * successful call.
  *
  * Best effort by design: a call that failed before the write leaves nothing to
  * widen, and a chmod that fails here must not displace the failure being
  * reported to the caller.
  */
-async function widenLeftoverScreenshot(plan) {
+async function widenLeftoverFile(plan) {
   try {
-    await fs.chmod(plan.filePath, SCREENSHOT_FILE_MODE);
+    await fs.chmod(plan.filePath, OUTPUT_FILE_MODE);
   } catch {
     // No file written, or one this process cannot chmod: the call's own
     // failure is what the caller gets.
@@ -686,19 +787,20 @@ async function widenLeftoverScreenshot(plan) {
  * Confirms the file the daemon was told to write really is there and makes it
  * readable for everyone reaching the drive, then describes it. A tool call that
  * reports success without a file on disk is a storage failure, not a result.
+ * Only a screenshot carries a fetch URL: it is the one the front serves back.
  */
-async function describeScreenshot(plan, publicBase) {
+async function describeWrittenFile(plan, publicBase) {
   let stats;
   try {
     stats = await fs.stat(plan.filePath);
     if (!stats.isFile() || stats.size === 0) {
       throw new Error(`${stats.size} bytes`);
     }
-    await fs.chmod(plan.filePath, SCREENSHOT_FILE_MODE);
+    await fs.chmod(plan.filePath, OUTPUT_FILE_MODE);
   } catch (error) {
     throw new CallError(
       'storage',
-      `screenshot was not written to ${plan.filePath}`,
+      `${plan.kind} was not written to ${plan.filePath}`,
       error.message,
     );
   }
@@ -707,7 +809,9 @@ async function describeScreenshot(plan, publicBase) {
     file: plan.fileName,
     path: plan.filePath,
     share_path: path.relative(SHARE_ROOT, plan.filePath),
-    url: `${publicBase}${SCREENSHOT_ROUTE}${plan.fileName}`,
+    ...(plan.kind === 'screenshot'
+      ? {url: `${publicBase}${SCREENSHOT_ROUTE}${plan.fileName}`}
+      : {}),
     bytes: stats.size,
   };
 }
@@ -735,12 +839,7 @@ async function runCommand(resolved, command, toolArgs, fullSpeed) {
 }
 
 async function invoke(target, command, args, fullSpeed, publicBase) {
-  if (typeof command !== 'string' || !COMMAND_SCHEMAS.has(command)) {
-    throw new CallError(
-      'usage',
-      `unknown command: ${JSON.stringify(command)} (allowed: ${ALLOWED_COMMANDS.join(', ')})`,
-    );
-  }
+  assertKnownCommand(command);
   const toolArgs = validateArgs(command, args);
   const atFullSpeed = validateFullSpeed(fullSpeed);
 
@@ -757,12 +856,10 @@ async function invoke(target, command, args, fullSpeed, publicBase) {
     throw error;
   }
 
-  // The written file takes the place of the image data upstream would attach,
-  // so the answer stays small enough for a caller's shell.
-  const plan =
-    command === 'take_screenshot'
-      ? await planScreenshot(resolved.target, toolArgs)
-      : undefined;
+  // The written file takes the place of the payload upstream would attach, so
+  // the answer stays small enough for a caller's shell. Where it lands is the
+  // front's decision in either case.
+  const plan = await planWrittenFile(command, resolved.target, toolArgs);
   if (plan) {
     toolArgs.filePath = plan.filePath;
   }
@@ -778,8 +875,8 @@ async function invoke(target, command, args, fullSpeed, publicBase) {
     if (!plan) {
       throw error;
     }
-    await widenLeftoverScreenshot(plan);
-    throw reclassifyScreenshotFailure(error, plan);
+    await widenLeftoverFile(plan);
+    throw reclassifyFileFailure(error, plan);
   }
   const {parsed, elapsedMs} = outcome;
 
@@ -794,8 +891,32 @@ async function invoke(target, command, args, fullSpeed, publicBase) {
     pace: atFullSpeed ? 'full' : 'human',
     elapsed_ms: elapsedMs,
     title: parsed.pages?.find(page => page.selected)?.title,
-    ...(plan ? {screenshot: await describeScreenshot(plan, publicBase)} : {}),
+    ...(plan ? {[plan.kind]: await describeWrittenFile(plan, publicBase)} : {}),
     result: parsed,
+  };
+}
+
+/**
+ * How long one call may take, without carrying it out.
+ *
+ * A caller asks for this before it sends the call, so its own timeout can be
+ * set from the same source the front's deadline comes from (`src/pacing.ts`)
+ * instead of from a constant that knows nothing about the text being typed.
+ * `client_timeout_ms` is the figure to use: the front's deadline plus the
+ * headroom that keeps the front's timer the first one to fire.
+ */
+function budgetFor(body) {
+  assertKnownCommand(body.command);
+  const budgetMs = queuedCallBudgetMs(
+    body.command,
+    validateArgs(body.command, body.args),
+    validateFullSpeed(body.full_speed),
+  );
+  return {
+    ok: true,
+    command: body.command,
+    budget_ms: budgetMs,
+    client_timeout_ms: budgetMs + CLIENT_TIMEOUT_HEADROOM_MS,
   };
 }
 
@@ -823,7 +944,7 @@ async function sendScreenshot(response, url) {
   }
   let data;
   try {
-    data = await fs.readFile(path.join(SCREENSHOT_DIR, fileName));
+    data = await fs.readFile(path.join(OUTPUT_DIR, fileName));
   } catch (error) {
     throw new CallError('storage', `no screenshot ${fileName}`, error.message);
   }
@@ -866,7 +987,10 @@ const server = http.createServer(async (request, response) => {
       await sendScreenshot(response, request.url);
       return;
     }
-    if (request.method !== 'POST' || request.url !== '/call') {
+    if (
+      request.method !== 'POST' ||
+      (request.url !== '/call' && request.url !== '/budget')
+    ) {
       throw new CallError(
         'usage',
         `no route for ${request.method} ${request.url}`,
@@ -882,6 +1006,12 @@ const server = http.createServer(async (request, response) => {
     }
     if (body === null || typeof body !== 'object' || Array.isArray(body)) {
       throw new CallError('usage', 'request body is not a JSON object');
+    }
+    // The budget of a call is asked for with the body of that call, so the
+    // figure covers the very text the following request types.
+    if (request.url === '/budget') {
+      send(response, 200, budgetFor(body));
+      return;
     }
     // The fetch URL is built from the address the caller just reached, so it is
     // by construction one the caller can come back to.
