@@ -40,7 +40,8 @@
  * up in that same directory, which is how a caller on another machine hands one
  * in. A result that outgrows `SPILL_BYTES` is written there as well instead of
  * being answered inline; a spilled result is the one file nobody asked for, so
- * it is also the one that expires: after `SPILL_RETENTION_MS` it is pruned.
+ * it is also the one that expires: after `SPILL_RETENTION_MS` it is pruned,
+ * together with any staging directory a killed front left behind.
  *
  * Endpoints:
  *   GET  /health          liveness plus the registered target names and commands
@@ -185,6 +186,12 @@ const SERVED_FILE_NAME_PATTERN = new RegExp(
 const GENERATED_FILE_NAME_PATTERN = new RegExp(
   `^${GENERATED_NAME_STEM}\\.(?:${EXTENSION_ALTERNATION})$`,
 );
+
+/**
+ * The directory names the front builds itself: the same stem without an ending,
+ * which is what a call's staging directory carries and no file of the front does.
+ */
+const GENERATED_DIRECTORY_NAME_PATTERN = new RegExp(`^${GENERATED_NAME_STEM}$`);
 
 const CONTENT_TYPE_BY_EXTENSION = {
   png: 'image/png',
@@ -971,24 +978,33 @@ function fileUrl(publicBase, fileName) {
 }
 
 /**
- * Removes the spilled results that have outlived `SPILL_RETENTION_MS`.
+ * Removes what the front left behind and has outlived `SPILL_RETENTION_MS`:
+ * spilled results and staging directories.
  *
- * Only spilled files are touched: the name has to be one the front built itself
- * and to carry the `spill.json` ending only a spill gets, so a screenshot, a
+ * Only those two are touched, and both have to carry a name the front built
+ * itself — a spill additionally the `spill.json` ending only a spill gets, a
+ * staging directory the bare stem no file of the front carries. A screenshot, a
  * trace, a caller-named file and anything else lying in the directory are left
- * where they are. `unlink` follows nothing, so an entry of that shape planted in
- * the guest-writable share is merely removed, never followed out of the
- * directory.
+ * where they are. The entry has to be of the kind its name claims: a file for
+ * the one, a directory for the other, decided on an `lstat` that follows
+ * nothing, so a symlink planted under either shape in the guest-writable share
+ * matches neither and stays.
+ *
+ * Every path that creates a staging directory removes it again, so this catches
+ * the one case none of them can: a front killed between the creation and the
+ * removal. The retention is a day and a call lasts at most minutes, so a
+ * directory old enough to be swept here belongs to no call that is still
+ * running.
  *
  * Best effort throughout: this runs beside a caller's call, and neither an
- * unreadable directory nor a file that vanished between the listing and the
+ * unreadable directory nor an entry that vanished between the listing and the
  * `lstat` is that caller's business.
  *
  * The residual is accepted rather than solved with a scheduler: a front nobody
  * calls again prunes nothing and keeps its last spills, because the prune hangs
  * off the next call rather than off a timer of its own.
  */
-async function pruneSpilledFiles() {
+async function pruneExpiredEntries() {
   const deadline = Date.now() - SPILL_RETENTION_MS;
   let names;
   try {
@@ -997,17 +1013,23 @@ async function pruneSpilledFiles() {
     return;
   }
   for (const name of names) {
-    if (
-      !GENERATED_FILE_NAME_PATTERN.test(name) ||
-      !name.endsWith(`.${SPILL_EXTENSION}`)
-    ) {
+    const isSpill =
+      GENERATED_FILE_NAME_PATTERN.test(name) &&
+      name.endsWith(`.${SPILL_EXTENSION}`);
+    const isStaging = GENERATED_DIRECTORY_NAME_PATTERN.test(name);
+    if (!isSpill && !isStaging) {
       continue;
     }
-    const filePath = path.join(OUTPUT_DIR, name);
+    const entryPath = path.join(OUTPUT_DIR, name);
     try {
-      const stats = await fs.lstat(filePath);
-      if (stats.mtimeMs < deadline) {
-        await fs.unlink(filePath);
+      const stats = await fs.lstat(entryPath);
+      if (stats.mtimeMs >= deadline) {
+        continue;
+      }
+      if (isSpill && stats.isFile()) {
+        await fs.unlink(entryPath);
+      } else if (isStaging && stats.isDirectory()) {
+        await fs.rm(entryPath, {recursive: true, force: true});
       }
     } catch {
       // Gone already, or not this process's to remove.
@@ -1035,7 +1057,7 @@ async function ensureOutputDir() {
   }
   // Every write passes here, which is the only moment the front is awake for
   // sure: the expiry rides along with it instead of on a timer.
-  await pruneSpilledFiles();
+  await pruneExpiredEntries();
 }
 
 /** The heap snapshot a reader tool is pointed at: written by an earlier call. */
