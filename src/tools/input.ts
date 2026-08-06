@@ -37,6 +37,7 @@ import {logger} from '../utils/logger.js';
 import type {WaitForEventsResult} from '../WaitForHelper.js';
 
 import {ToolCategory} from './categories.js';
+import {fillDecisionNote, type FillDecision} from './fillDecision.js';
 import type {ContextPage} from './ToolDefinition.js';
 import {definePageTool} from './ToolDefinition.js';
 
@@ -274,6 +275,14 @@ interface TypeableField {
    * length of the current content when the value continues it, otherwise 0.
    */
   keptPrefixLength: number;
+  /**
+   * Whether what was read is the rendered text rather than a value. It is, for
+   * an editable element: the whole paced path works in the rendered domain, the
+   * keystrokes produce rendered text and a typed newline is a block boundary no
+   * value carries. Two contents that render alike therefore count as equal,
+   * which is what the caller is told when nothing is typed.
+   */
+  readsRenderedText: boolean;
 }
 
 /**
@@ -290,7 +299,11 @@ async function readTypeableField(
   value: string,
 ): Promise<TypeableField> {
   return await handle.evaluate((element, target): TypeableField => {
-    const classify = (typeable: boolean, current: string): TypeableField => {
+    const classify = (
+      typeable: boolean,
+      current: string,
+      readsRenderedText = false,
+    ): TypeableField => {
       const alreadyEqual = current === target;
       const continues =
         !alreadyEqual && current.length > 0 && target.startsWith(current);
@@ -299,6 +312,7 @@ async function readTypeableField(
         hasContent: current.length > 0,
         alreadyEqual,
         keptPrefixLength: continues ? current.length : 0,
+        readsRenderedText,
       };
     };
     if (element instanceof HTMLInputElement) {
@@ -317,13 +331,14 @@ async function readTypeableField(
       return classify(true, element.value);
     }
     if (element instanceof HTMLElement && element.isContentEditable) {
-      return classify(true, element.innerText);
+      return classify(true, element.innerText, true);
     }
     return {
       typeable: false,
       hasContent: false,
       alreadyEqual: false,
       keptPrefixLength: 0,
+      readsRenderedText: false,
     };
   }, value);
 }
@@ -804,20 +819,27 @@ async function changeNothing(): Promise<void> {
   return;
 }
 
+/** One prepared fill: what it decided, and the interaction that carries it out. */
+interface PreparedFill {
+  decision: FillDecision;
+  action: () => Promise<void>;
+}
+
 /**
  * Decides how the element takes its value and runs everything that leads up to
  * the change: the focus, whatever has to happen to what the field already holds
  * and every keystroke but the last. What comes back is the interaction that
  * changes the element — the last keystroke, the one-shot set for a field that
  * takes no keystrokes at all, or nothing when the field already holds the
- * value.
+ * value — together with the decision behind it, so a fill that writes nothing
+ * says so instead of reporting a success that changed no page.
  */
 async function buildFillAction(
   handle: ElementHandle<Element>,
   uid: string,
   requestedValue: string,
   page: ContextPage,
-): Promise<() => Promise<void>> {
+): Promise<PreparedFill> {
   // The pause at the transition to this field — reaching it, looking at it —
   // is taken by the wrapper this runs inside. `fill_form` enters that wrapper
   // once per element, so every field pays it once, before anything of its own
@@ -830,7 +852,7 @@ async function buildFillAction(
     const optionValue = await resolveOptionValue(aXNode, requestedValue);
     if (optionValue === undefined) {
       // The option is there but carries no value of its own. Nothing to set.
-      return changeNothing;
+      return {decision: 'option-without-value', action: changeNothing};
     }
     value = optionValue;
   }
@@ -859,13 +881,16 @@ async function buildFillAction(
     if (state === (value === 'true')) {
       // It already reads as it is meant to read. Clicking it would turn it off
       // and on again in front of anyone watching, for no change at all.
-      return changeNothing;
+      return {decision: 'toggle-already-set', action: changeNothing};
     }
     // Everything the click needs runs here; the release is what the page sees
     // as the click and is the only part left for the navigation expectation.
     await pressPaced(handle, mouse, 1);
-    return async () => {
-      await mouse.up(pressOptions(1));
+    return {
+      decision: 'typed',
+      action: async () => {
+        await mouse.up(pressOptions(1));
+      },
     };
   }
 
@@ -887,11 +912,14 @@ async function buildFillAction(
     const timeoutPerChar = 10; // ms
     const fillTimeout =
       page.pptrPage.getDefaultTimeout() + value.length * timeoutPerChar;
-    return async () => {
-      await handle
-        .asLocator()
-        .setTimeout(fillTimeout)
-        .fill(value, {typingThreshold: 0});
+    return {
+      decision: 'one-shot',
+      action: async () => {
+        await handle
+          .asLocator()
+          .setTimeout(fillTimeout)
+          .fill(value, {typingThreshold: 0});
+      },
     };
   }
 
@@ -906,7 +934,12 @@ async function buildFillAction(
     // The field already reads as it is meant to read. Typing it again would
     // clear a filled-out form field and rebuild it keystroke by keystroke in
     // front of anyone watching, for no change at all.
-    return changeNothing;
+    return {
+      decision: content.readsRenderedText
+        ? 'already-equal-rendered'
+        : 'already-equal',
+      action: changeNothing,
+    };
   }
   await handle.focus();
   let text = value;
@@ -923,15 +956,21 @@ async function buildFillAction(
       // selection, so the selection is removed by the key a hand would reach
       // for. Without it the field would keep its old content while the call
       // reports the fill as done.
-      return async () => {
-        await keyboard.press('Backspace', {delay: drawKeyHoldMs()});
+      return {
+        decision: 'typed',
+        action: async () => {
+          await keyboard.press('Backspace', {delay: drawKeyHoldMs()});
+        },
       };
     }
   }
   const {lead, last} = splitLastKeystroke(text);
   await typePaced(keyboard, lead);
-  return async () => {
-    await typePaced(keyboard, last, {continuesStream: lead.length > 0});
+  return {
+    decision: 'typed',
+    action: async () => {
+      await typePaced(keyboard, last, {continuesStream: lead.length > 0});
+    },
   };
 }
 
@@ -945,19 +984,22 @@ async function fillFormElement(
   uid: string,
   value: string,
   page: ContextPage,
-): Promise<() => Promise<void>> {
-  let action: () => Promise<void>;
+): Promise<PreparedFill> {
+  let prepared: PreparedFill;
   try {
-    action = await buildFillAction(handle, uid, value, page);
+    prepared = await buildFillAction(handle, uid, value, page);
   } catch (error) {
     handleActionError(error, uid);
   }
-  return async () => {
-    try {
-      await action();
-    } catch (error) {
-      handleActionError(error, uid);
-    }
+  return {
+    decision: prepared.decision,
+    action: async () => {
+      try {
+        await prepared.action();
+      } catch (error) {
+        handleActionError(error, uid);
+      }
+    },
   };
 }
 
@@ -987,10 +1029,20 @@ export const fill = definePageTool({
     const page = request.page;
     const uid = request.params.uid;
     using handle = await page.getElementByUid(uid);
-    const result = await page.waitForEventsAfterTrigger(() =>
-      fillFormElement(handle, uid, request.params.value, page),
+    let decision: FillDecision = 'typed';
+    const result = await page.waitForEventsAfterTrigger(async () => {
+      const prepared = await fillFormElement(
+        handle,
+        uid,
+        request.params.value,
+        page,
+      );
+      decision = prepared.decision;
+      return prepared.action;
+    });
+    response.appendResponseLine(
+      fillDecisionNote(decision) ?? `Successfully filled out the element`,
     );
-    response.appendResponseLine(`Successfully filled out the element`);
     response.attachWaitForResult(result);
     if (request.params.includeSnapshot) {
       response.includeSnapshot();
@@ -1124,13 +1176,31 @@ export const fillForm = definePageTool({
   handler: async (request, response) => {
     const page = request.page;
     let lastResult: WaitForEventsResult = {};
+    const notes: string[] = [];
     for (const element of request.params.elements) {
       using handle = await page.getElementByUid(element.uid);
-      lastResult = await page.waitForEventsAfterTrigger(() =>
-        fillFormElement(handle, element.uid, element.value, page),
-      );
+      let decision: FillDecision = 'typed';
+      lastResult = await page.waitForEventsAfterTrigger(async () => {
+        const prepared = await fillFormElement(
+          handle,
+          element.uid,
+          element.value,
+          page,
+        );
+        decision = prepared.decision;
+        return prepared.action;
+      });
+      const note = fillDecisionNote(decision);
+      if (note) {
+        notes.push(`${element.uid}: ${note}`);
+      }
     }
     response.appendResponseLine(`Successfully filled out the form`);
+    // Only the elements that took nothing are named: a form of many fields
+    // would otherwise repeat a success line per field that says nothing.
+    for (const note of notes) {
+      response.appendResponseLine(note);
+    }
     response.attachWaitForResult(lastResult);
     if (request.params.includeSnapshot) {
       response.includeSnapshot();
