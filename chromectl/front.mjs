@@ -88,6 +88,26 @@ const HOST = process.env['CHROMECTL_HOST'] ?? '0.0.0.0';
 const PORT = Number(process.env['CHROMECTL_PORT'] ?? 8091);
 
 /**
+ * The address the front is reached under when `CHROMECTL_PUBLIC_URL` says
+ * nothing. It is built from the configured bind address; the wildcard binds
+ * name no single address, so the loopback stands in for them, which is the one
+ * address that certainly reaches this process.
+ */
+function boundPublicBase() {
+  const host = HOST === '0.0.0.0' || HOST === '::' ? '127.0.0.1' : HOST;
+  return `http://${host.includes(':') ? `[${host}]` : host}:${PORT}`;
+}
+
+/**
+ * The base every file URL in an answer is built on. This is configuration, not
+ * something a request may decide: taken from the caller's `Host` header, the
+ * answer would send its reader to whatever address that header named.
+ */
+const PUBLIC_BASE = (
+  process.env['CHROMECTL_PUBLIC_URL'] ?? boundPublicBase()
+).replace(/\/+$/, '');
+
+/**
  * Every command the front offers and the argument schema of each, taken whole
  * from upstream's generated command table (`chrome-devtools-cli-options.js`)
  * rather than kept as an own copy. The table is what the daemon registers its
@@ -2489,11 +2509,6 @@ const server = http.createServer(async (request, response) => {
       send(response, 200, budgetFor(body));
       return;
     }
-    // The fetch URL is built from the address the caller just reached, so it is
-    // by construction one the caller can come back to.
-    const publicBase =
-      process.env['CHROMECTL_PUBLIC_URL'] ??
-      `http://${request.headers.host ?? `${HOST}:${PORT}`}`;
     send(
       response,
       200,
@@ -2502,7 +2517,7 @@ const server = http.createServer(async (request, response) => {
         body.command,
         body.args,
         body.full_speed,
-        publicBase,
+        PUBLIC_BASE,
         client,
       ),
     );
