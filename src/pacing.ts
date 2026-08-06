@@ -30,6 +30,12 @@
  * once the mutex is held. Both are hard maximums, and neither can be spent by
  * the other.
  *
+ * A single CDP command is bounded twice as well, and the two are not the same
+ * bound: `DISPATCH_DEADLINE_MS` is what a tool waits for a command it
+ * dispatched, and `PROTOCOL_TIMEOUT_MS` is what the connection allows any
+ * command at all. The second is the wider of the two on purpose — a tool that
+ * grants one command a long window has to be the one whose timeout fires.
+ *
  * Every layer one call passes through takes its deadline from here — the front,
  * the daemon socket and the MCP request inside the daemon — so the three cannot
  * drift apart. None of them sees the moment the mutex is acquired, so each of
@@ -145,23 +151,6 @@ export const ACTION_OVERHEAD_MS =
 export const BUDGET_SAFETY_FACTOR = 1.5;
 
 /**
- * Longest a single CDP command may stay unanswered before the connection gives
- * up on it. Puppeteer's own default is 180 s, which is the whole ceiling a call
- * queued behind this one may wait — so a command that never comes back holds
- * the browser for three minutes and the caller is told nothing about why.
- *
- * The bound is the worst case of one paced action with the same margin the
- * budget grants, not the per-call budget: a call may legitimately last as long
- * as the text it types, a single CDP command may not. It sits above the 10 s a
- * navigation is given and below the 60 s floor of a call, so a tool's own
- * timeout still fires first and this one is left for what no timeout covers —
- * a renderer paused by a dialog, which answers nothing at all.
- */
-export const PROTOCOL_TIMEOUT_MS = Math.ceil(
-  ACTION_OVERHEAD_MS * BUDGET_SAFETY_FACTOR,
-);
-
-/**
  * No call is granted less than this. A call that types nothing keeps the
  * ceiling it has always had, and a daemon that hangs still ends.
  */
@@ -182,6 +171,50 @@ export const MUTEX_WAIT_CEILING_MS = 180_000;
  * caller is told about that instead of about the deadline it set.
  */
 export const INNER_BUDGET_SLACK_MS = 10_000;
+
+/**
+ * The widest window any single tool grants one command: the helper's stable-DOM
+ * window of 3 s (`WaitForHelper`), stretched by the CPU throttling rate the
+ * emulation tool allows up to 20×. The navigation window is stretched by the
+ * network multiplier instead, whose slowest profile is 10×, so 60 s is the
+ * maximum of the two.
+ */
+export const WIDEST_TOOL_WINDOW_MS = 3_000 * 20;
+
+/**
+ * Longest a single CDP command may stay unanswered before the connection gives
+ * up on it. Puppeteer's own default is 180 s, which is the whole ceiling a call
+ * queued behind this one may wait — so a command that never comes back would
+ * hold the browser for three minutes and the caller be told nothing about why.
+ *
+ * This is the connection's backstop, not the deadline a dispatch works to. It
+ * has to be wider than the widest window a tool grants one command, otherwise
+ * it cuts a legitimate wait off from underneath the tool that set it: an
+ * `evaluate` under 20× CPU throttling is given 60 s by the stable-DOM window,
+ * and a connection that gave up at 13 s ended that wait without anyone hearing
+ * of it. It therefore keeps the "inner is wider" invariant of this file — the
+ * widest tool window plus the same slack every inner layer adds — so the tool's
+ * own timeout is always the one that fires first and reports.
+ */
+export const PROTOCOL_TIMEOUT_MS =
+  WIDEST_TOOL_WINDOW_MS + INNER_BUDGET_SLACK_MS;
+
+/**
+ * Longest one dispatched command is waited for before the call gives up on it.
+ * This is the narrow bound the connection used to carry for everybody: it is
+ * raced per command in `abandonIfBlocked` and `answerOrAbandon`, where the tool
+ * knows it is dispatching an interaction rather than waiting one out.
+ *
+ * It covers what the dialog signal does not — a renderer in a loop, a native
+ * chooser holding the page, a crashed process: nothing raises a `dialog` event
+ * there, so without this deadline the call would sit on the command until the
+ * connection's backstop ends it. The value is the worst case of one paced action
+ * with the same margin the budget grants, well under `MUTEX_WAIT_CEILING_MS`, so
+ * a call queued behind the hung one still gets its turn instead of running out.
+ */
+export const DISPATCH_DEADLINE_MS = Math.ceil(
+  ACTION_OVERHEAD_MS * BUDGET_SAFETY_FACTOR,
+);
 
 /**
  * The timing one call works to. Every value the brake waits out is drawn from

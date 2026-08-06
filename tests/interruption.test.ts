@@ -4,14 +4,19 @@
  */
 
 import assert from 'node:assert';
-import {describe, it} from 'node:test';
+import {afterEach, describe, it} from 'node:test';
+
+import sinon from 'sinon';
 
 import {
   abandonIfBlocked,
+  answerOrAbandon,
   currentInterruption,
+  InteractionInterruptedError,
   observeInterruptions,
   observeRendererBlock,
 } from '../src/interruption.js';
+import {DISPATCH_DEADLINE_MS} from '../src/pacing.js';
 
 describe('the interruption check of a paced stream', () => {
   it('reports nothing while nobody is watching', () => {
@@ -122,6 +127,121 @@ describe('the interruption check of a paced stream', () => {
       assert.strictEqual(currentInterruption(), 'navigation');
     } finally {
       restoreOuter();
+    }
+  });
+});
+
+describe('the deadline on one dispatch', () => {
+  afterEach(() => {
+    sinon.restore();
+  });
+
+  /** A command nobody ever answers. */
+  function neverAnswered<T>(): Promise<T> {
+    return new Promise<T>(() => {
+      return;
+    });
+  }
+
+  /** A block signal that never arrives, so only the deadline can end a wait. */
+  function nothingBlocks(): () => void {
+    return observeRendererBlock(
+      new Promise<void>(() => {
+        return;
+      }),
+    );
+  }
+
+  /** Runs one dispatch and lets the deadline pass. */
+  async function exhaustTheDeadline(pending: Promise<unknown>) {
+    const clock = sinon.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    try {
+      const outcome = assert.rejects(pending, InteractionInterruptedError);
+      await clock.tickAsync(DISPATCH_DEADLINE_MS);
+      await outcome;
+    } finally {
+      clock.restore();
+    }
+  }
+
+  it('ends a dispatch nobody answers, with nothing watching', async () => {
+    await exhaustTheDeadline(abandonIfBlocked(neverAnswered()));
+  });
+
+  it('ends a dispatch nobody answers while a signal is installed', async () => {
+    const restore = nothingBlocks();
+    try {
+      await exhaustTheDeadline(abandonIfBlocked(neverAnswered()));
+    } finally {
+      restore();
+    }
+  });
+
+  it('ends a round trip nobody answers, with nothing watching', async () => {
+    await exhaustTheDeadline(answerOrAbandon(neverAnswered()));
+  });
+
+  it('ends a round trip nobody answers while a signal is installed', async () => {
+    const restore = nothingBlocks();
+    try {
+      await exhaustTheDeadline(answerOrAbandon(neverAnswered()));
+    } finally {
+      restore();
+    }
+  });
+
+  it('says what happened rather than blaming the element', async () => {
+    const clock = sinon.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    try {
+      const outcome = assert.rejects(abandonIfBlocked(neverAnswered()), {
+        message: new RegExp(
+          `did not answer a command within ${DISPATCH_DEADLINE_MS} ms`,
+        ),
+      });
+      await clock.tickAsync(DISPATCH_DEADLINE_MS);
+      await outcome;
+    } finally {
+      clock.restore();
+    }
+  });
+
+  it('hands back the answer of a round trip that came in time', async () => {
+    assert.strictEqual(
+      await answerOrAbandon(Promise.resolve('the value')),
+      'the value',
+    );
+  });
+
+  it('leaves no timer behind once the command was answered', async () => {
+    const clock = sinon.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    try {
+      await abandonIfBlocked(Promise.resolve());
+      await answerOrAbandon(Promise.resolve('the value'));
+
+      assert.strictEqual(clock.countTimers(), 0);
+    } finally {
+      clock.restore();
+    }
+  });
+
+  it('lets the dialog signal end the wait before the deadline does', async () => {
+    let blocked!: () => void;
+    const restore = observeRendererBlock(
+      new Promise<void>(resolve => {
+        blocked = resolve;
+      }),
+    );
+    const clock = sinon.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    try {
+      const dispatch = abandonIfBlocked(neverAnswered());
+      blocked();
+      await dispatch;
+
+      // The deadline was taken down with the wait it was raced against.
+      assert.strictEqual(clock.countTimers(), 0);
+    } finally {
+      clock.restore();
+      restore();
     }
   });
 });
