@@ -2322,9 +2322,15 @@ async function sendFile(response, pathname) {
     await handle?.close();
   }
 
+  // The directory is writable over a password-less share, so a file served here
+  // may be one nobody of this service wrote. It is handed over as a download
+  // with the ending it carries taken at face value, so nothing planted there is
+  // ever rendered as a page in the fetching browser.
   response.writeHead(200, {
     'content-type': contentTypeFor(fileName),
     'content-length': data.length,
+    'x-content-type-options': 'nosniff',
+    'content-disposition': `attachment; filename="${fileName}"`,
   });
   response.end(data);
 }
