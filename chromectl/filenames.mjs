@@ -215,6 +215,16 @@ export function generatedFileName(target, extension) {
 }
 
 /**
+ * One name of the front's own and where that file lies: the two travel together
+ * everywhere, since the name is what the fetch route serves and the path is
+ * what a write goes to, and `OUTPUT_DIR` is the only directory either can name.
+ */
+export function generatedFilePath(target, extension) {
+  const fileName = generatedFileName(target, extension);
+  return {fileName, filePath: path.join(OUTPUT_DIR, fileName)};
+}
+
+/**
  * The address a written file is fetched under. Every name the front hands out
  * is made of letters, digits, dot, underscore and hyphen, so the encoding
  * changes nothing; it is applied so that the answer stays a URL whatever a name

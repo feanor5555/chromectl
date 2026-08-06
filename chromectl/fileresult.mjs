@@ -29,18 +29,17 @@ import {CallError} from './errors.mjs';
 import {reportExtension} from './filearguments.mjs';
 import {
   fileLocation,
-  generatedFileName,
+  generatedFilePath,
   OUTPUT_DIR,
   OUTPUT_FILE_MODE,
   SPILL_EXTENSION,
 } from './filenames.mjs';
+import {detachPlanFile, releaseOutputName} from './fileplan.mjs';
 import {
-  detachPlanFile,
   ensureOutputDir,
-  releaseOutputName,
   removeStagingDirectory,
   settleLeftoverFile,
-} from './fileplan.mjs';
+} from './filestore.mjs';
 
 /**
  * From how many bytes of rendered result on the answer names a file instead of
@@ -275,8 +274,10 @@ async function collectDirectoryFiles(directory, publicBase) {
   const collected = [];
   for (const [name, kind] of Object.entries(directory.reports)) {
     const source = path.join(directory.path, name);
-    const fileName = generatedFileName(directory.target, reportExtension(name));
-    const filePath = path.join(OUTPUT_DIR, fileName);
+    const {fileName, filePath} = generatedFilePath(
+      directory.target,
+      reportExtension(name),
+    );
     let descriptor;
     try {
       descriptor = await promoteFile(
@@ -400,8 +401,7 @@ function spillHead(rendered) {
  */
 async function spillResult(target, rendered, publicBase) {
   await ensureOutputDir();
-  const fileName = generatedFileName(target, SPILL_EXTENSION);
-  const filePath = path.join(OUTPUT_DIR, fileName);
+  const {fileName, filePath} = generatedFilePath(target, SPILL_EXTENSION);
   try {
     await fs.writeFile(filePath, rendered, {
       flag: 'wx',

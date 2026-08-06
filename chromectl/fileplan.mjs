@@ -11,8 +11,8 @@
  * every path argument of the command table in itself, and `daemonPathArguments`
  * is the only thing that produces what the daemon is handed. Around those two
  * sits everything that keeps the ownership true over the life of a call — the
- * directory it all happens in, the caller-chosen names in flight, the staging
- * copies, and what a call that failed left behind.
+ * caller-chosen names in flight, the staging copies, and what a call that failed
+ * left behind. The chores each of those ends in are `filestore.mjs`'s.
  *
  * The table of path arguments is read here and declared in
  * `filearguments.mjs`; importing that module is what holds the table against
@@ -28,102 +28,19 @@ import {pipeline} from 'node:stream/promises';
 import {CallError} from './errors.mjs';
 import {extensionsOf, FILE_ARGUMENTS} from './filearguments.mjs';
 import {
-  generatedFileName,
+  generatedFilePath,
   generatedName,
-  GENERATED_DIRECTORY_NAME_PATTERN,
-  GENERATED_FILE_NAME_PATTERN,
   MAX_FILE_NAME_LENGTH,
   OUTPUT_DIR,
-  OUTPUT_DIR_MODE,
   OUTPUT_FILE_MODE,
   PLAIN_FILE_NAME_PATTERN,
-  SPILL_EXTENSION,
-  SPILL_RETENTION_MS,
   STAGING_DIR_MODE,
 } from './filenames.mjs';
-
-/**
- * Removes what the front left behind and has outlived `SPILL_RETENTION_MS`:
- * spilled results and staging directories.
- *
- * Only those two are touched, and both have to carry a name the front built
- * itself — a spill additionally the `spill.json` ending only a spill gets, a
- * staging directory the bare stem no file of the front carries. A screenshot, a
- * trace, a caller-named file and anything else lying in the directory are left
- * where they are. The entry has to be of the kind its name claims: a file for
- * the one, a directory for the other, decided on an `lstat` that follows
- * nothing, so a symlink planted under either shape in the guest-writable share
- * matches neither and stays.
- *
- * Every path that creates a staging directory removes it again, so this catches
- * the one case none of them can: a front killed between the creation and the
- * removal. The retention is a day and a call lasts at most minutes, so a
- * directory old enough to be swept here belongs to no call that is still
- * running.
- *
- * Best effort throughout: this runs beside a caller's call, and neither an
- * unreadable directory nor an entry that vanished between the listing and the
- * `lstat` is that caller's business.
- *
- * The residual is accepted rather than solved with a scheduler: a front nobody
- * calls again prunes nothing and keeps its last spills, because the prune hangs
- * off the next call rather than off a timer of its own.
- */
-async function pruneExpiredEntries() {
-  const deadline = Date.now() - SPILL_RETENTION_MS;
-  let names;
-  try {
-    names = await fs.readdir(OUTPUT_DIR);
-  } catch {
-    return;
-  }
-  for (const name of names) {
-    const isSpill =
-      GENERATED_FILE_NAME_PATTERN.test(name) &&
-      name.endsWith(`.${SPILL_EXTENSION}`);
-    const isStaging = GENERATED_DIRECTORY_NAME_PATTERN.test(name);
-    if (!isSpill && !isStaging) {
-      continue;
-    }
-    const entryPath = path.join(OUTPUT_DIR, name);
-    try {
-      const stats = await fs.lstat(entryPath);
-      if (stats.mtimeMs >= deadline) {
-        continue;
-      }
-      if (isSpill && stats.isFile()) {
-        await fs.unlink(entryPath);
-      } else if (isStaging && stats.isDirectory()) {
-        await fs.rm(entryPath, {recursive: true, force: true});
-      }
-    } catch {
-      // Gone already, or not this process's to remove.
-    }
-  }
-}
-
-/** Makes sure the output directory exists and this process can write into it. */
-export async function ensureOutputDir() {
-  try {
-    const created = await fs.mkdir(OUTPUT_DIR, {
-      recursive: true,
-      mode: OUTPUT_DIR_MODE,
-    });
-    if (created !== undefined) {
-      await fs.chmod(OUTPUT_DIR, OUTPUT_DIR_MODE);
-    }
-    await fs.access(OUTPUT_DIR, fs.constants.W_OK | fs.constants.X_OK);
-  } catch (error) {
-    throw new CallError(
-      'storage',
-      `output directory ${OUTPUT_DIR} is not writable`,
-      error.message,
-    );
-  }
-  // Every write passes here, which is the only moment the front is awake for
-  // sure: the expiry rides along with it instead of on a timer.
-  await pruneExpiredEntries();
-}
+import {
+  ensureOutputDir,
+  removeStagingDirectory,
+  settleLeftoverFile,
+} from './filestore.mjs';
 
 /**
  * The caller-chosen output names in flight, each with the browser that took it
@@ -238,8 +155,10 @@ async function planOutputFile(command, argument, spec, resolved, toolArgs) {
   const requested = toolArgs[argument];
 
   if (requested === undefined) {
-    const fileName = generatedFileName(resolved.target, extensions[0]);
-    const filePath = path.join(OUTPUT_DIR, fileName);
+    const {fileName, filePath} = generatedFilePath(
+      resolved.target,
+      extensions[0],
+    );
     return {
       ...spec,
       argument,
@@ -285,16 +204,14 @@ async function planOutputFile(command, argument, spec, resolved, toolArgs) {
   }
   claimOutputName(command, argument, requested, resolved);
 
+  const staging = generatedFilePath(resolved.target, extension);
   return {
     ...spec,
     argument,
     fileName: requested,
     filePath,
     claimed: true,
-    writePath: path.join(
-      OUTPUT_DIR,
-      generatedFileName(resolved.target, extension),
-    ),
+    writePath: staging.filePath,
   };
 }
 
@@ -447,15 +364,6 @@ async function stageInputFile(command, argument, target, fileName, filePath) {
   return {argument, filePath, readPath, directoryPath};
 }
 
-/** Removes a staging directory and everything left in it; best effort. */
-export async function removeStagingDirectory(directoryPath) {
-  try {
-    await fs.rm(directoryPath, {recursive: true, force: true});
-  } catch {
-    // Not this process's to remove: the call's own outcome is what counts.
-  }
-}
-
 /** What one call writes and reads, from its arguments and `FILE_ARGUMENTS`. */
 export async function planCall(command, resolved, toolArgs) {
   const specs = FILE_ARGUMENTS[command];
@@ -529,34 +437,10 @@ export function daemonPathArguments(plan) {
 }
 
 /**
- * Deals with what a failed call left behind. A call that hits its deadline or
- * fails after a write still leaves the daemon's 0600 file on the drive.
- *
- * A file the front named itself is written straight under the name the answer
- * would have carried, so a partial one stays and is only made readable: a file
- * only the front's uid can read is of no use to an NFS client arriving under its
- * own. A caller-named file is written under a name of the front's own that is
- * renamed onto the caller's only on success; a failed one therefore sits under a
- * name no answer mentioned and no route serves, and is removed instead of left
- * on the drive for good. A directory of a call is removed with what is in it,
- * since none of it was ever named in an answer.
- *
- * Best effort by design: a call that failed before the write leaves nothing
- * here, and neither a chmod nor an unlink that fails must displace the failure
- * being reported to the caller.
+ * Deals with what a failed call left behind: every file of its plan, and its
+ * own directory with what is in it, since none of that was ever named in an
+ * answer.
  */
-export async function settleLeftoverFile(file) {
-  try {
-    if (file.writePath === file.filePath) {
-      await fs.chmod(file.writePath, OUTPUT_FILE_MODE);
-    } else {
-      await fs.unlink(file.writePath);
-    }
-  } catch {
-    // No file written, or one this process cannot touch.
-  }
-}
-
 export async function settleLeftoverFiles(plan) {
   for (const file of plan.files) {
     await settleLeftoverFile(file);
