@@ -845,9 +845,17 @@ function validateArgs(command, args) {
  * running at the same time therefore cannot land on the same file even within
  * one millisecond. The name carries no colons, so a Windows client reaching the
  * drive over Samba can open it.
+ *
+ * A target name without a single letter or digit slugs to nothing, and a name
+ * with an empty slug is not one `GENERATED_FILE_NAME_PATTERN` matches: the file
+ * would sit on the drive while the URL in the answer came back a 400. The
+ * registry lets no such name through today (`TARGET_PATTERN` demands a letter or
+ * digit first), so the fixed slug is what keeps the two patterns tied to each
+ * other rather than to that rule.
  */
 function generatedFileName(target, extension) {
-  const slug = target.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const slug =
+    target.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'target';
   const stamp = new Date().toISOString().replace(/[-:.]/g, '');
   return `chromectl-${slug}-${stamp}-${randomBytes(4).toString('hex')}.${extension}`;
 }
@@ -903,12 +911,11 @@ async function planScreenshot(target, toolArgs) {
   const format = toolArgs.format ?? 'png';
   const fileName = generatedFileName(target, format);
   await ensureOutputDir();
-  return {
-    kind: 'screenshot',
-    fileName,
-    filePath: path.join(OUTPUT_DIR, fileName),
-    format,
-  };
+  const filePath = path.join(OUTPUT_DIR, fileName);
+  // The name is the front's own and carries eight random characters, so there is
+  // nothing to write past: the daemon writes where the answer points, and
+  // `writePath` is that same path rather than a stage it is renamed from.
+  return {kind: 'screenshot', fileName, filePath, writePath: filePath, format};
 }
 
 /**
@@ -920,11 +927,23 @@ async function planScreenshot(target, toolArgs) {
  * file: a name that is not a plain `*.txt` file name is refused rather than
  * bent into one, so nobody believes their path was honoured.
  *
- * An entry of that name that already exists is only accepted when it is a
- * regular file. The drive is writable over Samba and NFS, so a symlink placed
- * in the directory would otherwise carry the write straight out of it again.
+ * The caller's name never reaches the daemon. The daemon writes to `writePath`,
+ * a name the front builds itself with eight random characters, and the written
+ * file is renamed onto the caller's name afterwards. That is what keeps the
+ * write inside the directory: the drive is writable over Samba and NFS, so
+ * anyone reaching it can put a symlink or a hardlink under a name a caller
+ * announced, and a check the front makes here says nothing about the entry the
+ * daemon meets a moment later, in another process. Against the random name there
+ * is nothing to plant, and `rename` replaces the name rather than writing
+ * through what sits under it, so no interleaving reaches an inode outside
+ * `OUTPUT_DIR`.
+ *
+ * The checks below are pre-flight only: they turn the ordinary mistake — a name
+ * that is a directory today, a name someone hardlinked — into a clear 400 before
+ * the browser is driven at all. They are no longer the boundary, and an entry
+ * planted after them is replaced by the rename rather than refused.
  */
-async function planSnapshotFile(command, toolArgs) {
+async function planSnapshotFile(command, target, toolArgs) {
   const requested = toolArgs.filePath;
   if (!OUTPUT_FILE_NAME_PATTERN.test(requested)) {
     throw new CallError(
@@ -950,8 +969,19 @@ async function planSnapshotFile(command, toolArgs) {
       `${command}: ${requested} exists in ${OUTPUT_DIR} and is not a regular file`,
     );
   }
+  if (existing !== undefined && existing.nlink !== 1) {
+    throw new CallError(
+      'usage',
+      `${command}: ${requested} exists in ${OUTPUT_DIR} under more than one name`,
+    );
+  }
 
-  return {kind: 'snapshot', fileName: requested, filePath};
+  return {
+    kind: 'snapshot',
+    fileName: requested,
+    filePath,
+    writePath: path.join(OUTPUT_DIR, generatedFileName(target, 'txt')),
+  };
 }
 
 /** The file one call writes, or nothing when it writes none. */
@@ -960,7 +990,7 @@ async function planWrittenFile(command, target, toolArgs) {
     return await planScreenshot(target, toolArgs);
   }
   if (command === 'take_snapshot' && toolArgs.filePath !== undefined) {
-    return await planSnapshotFile(command, toolArgs);
+    return await planSnapshotFile(command, target, toolArgs);
   }
   return undefined;
 }
@@ -978,7 +1008,9 @@ function reclassifyFileFailure(error, plan) {
     typeof error.detail === 'string'
       ? error.detail
       : JSON.stringify(error.detail ?? '');
-  if (!detail.includes(plan.filePath) && !detail.includes(OUTPUT_DIR)) {
+  // The daemon only ever saw `writePath`, so that is the path its message can
+  // name.
+  if (!detail.includes(plan.writePath) && !detail.includes(OUTPUT_DIR)) {
     return error;
   }
   return new CallError(
@@ -989,41 +1021,58 @@ function reclassifyFileFailure(error, plan) {
 }
 
 /**
- * Widens a file a failed call left behind. A call that hits its deadline or
- * fails after the write still leaves the daemon's 0600 file on the drive, and a
- * file only the front's uid can read is of no use to an NFS client arriving
- * under its own. It is therefore made readable exactly like the file of a
- * successful call.
+ * Deals with the file a failed call left at `writePath`. A call that hits its
+ * deadline or fails after the write still leaves the daemon's 0600 file on the
+ * drive.
  *
- * Best effort by design: a call that failed before the write leaves nothing to
- * widen, and a chmod that fails here must not displace the failure being
- * reported to the caller.
+ * A screenshot is written straight under the name the answer would have carried,
+ * so a partial one stays and is only made readable: a file only the front's uid
+ * can read is of no use to an NFS client arriving under its own. A snapshot is
+ * written under a name of the front's own that is renamed onto the caller's only
+ * on success; a failed one therefore sits under a name no answer mentioned and
+ * no route serves, and is removed instead of left on the drive for good.
+ *
+ * Best effort by design: a call that failed before the write leaves nothing
+ * here, and neither a chmod nor an unlink that fails must displace the failure
+ * being reported to the caller.
  */
-async function widenLeftoverFile(plan) {
+async function settleLeftoverFile(plan) {
   try {
-    await fs.chmod(plan.filePath, OUTPUT_FILE_MODE);
+    if (plan.writePath === plan.filePath) {
+      await fs.chmod(plan.writePath, OUTPUT_FILE_MODE);
+    } else {
+      await fs.unlink(plan.writePath);
+    }
   } catch {
-    // No file written, or one this process cannot chmod: the call's own
+    // No file written, or one this process cannot touch: the call's own
     // failure is what the caller gets.
   }
 }
 
 /**
  * Confirms the file the daemon was told to write really is there and makes it
- * readable for everyone reaching the drive, then describes it. A tool call that
- * reports success without a file on disk is a storage failure, not a result.
- * Every file carries a fetch URL: the client is bash and curl, so the share
- * path presumes a mount it may not have while the URL is reachable wherever the
- * call itself was sent from.
+ * readable for everyone reaching the drive, puts it under the name the answer
+ * carries and describes it. A tool call that reports success without a file on
+ * disk is a storage failure, not a result. Every file carries a fetch URL: the
+ * client is bash and curl, so the share path presumes a mount it may not have
+ * while the URL is reachable wherever the call itself was sent from.
+ *
+ * The rename is what a caller-named snapshot arrives through, and it is the last
+ * step: an entry someone put under that name meanwhile is replaced, since
+ * `rename` acts on the name and not on what it points at. A screenshot names its
+ * own file and is already where it belongs.
  */
 async function describeWrittenFile(plan, publicBase) {
   let stats;
   try {
-    stats = await fs.stat(plan.filePath);
+    stats = await fs.stat(plan.writePath);
     if (!stats.isFile() || stats.size === 0) {
       throw new Error(`${stats.size} bytes`);
     }
-    await fs.chmod(plan.filePath, OUTPUT_FILE_MODE);
+    await fs.chmod(plan.writePath, OUTPUT_FILE_MODE);
+    if (plan.writePath !== plan.filePath) {
+      await fs.rename(plan.writePath, plan.filePath);
+    }
   } catch (error) {
     throw new CallError(
       'storage',
@@ -1057,7 +1106,11 @@ async function runCommand(resolved, command, toolArgs, fullSpeed) {
       response.success ? response.result : String(response.error),
     );
   }
-  if (Array.isArray(parsed)) {
+  // A success renders as the structured object. A tool-level failure renders as
+  // the raw content array, and anything else that is not a plain object is no
+  // result either: the answer reads properties off it, and `null` would pass an
+  // array check only to throw at the first one.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new CallError('tool', `${command} failed`, parsed);
   }
   return {parsed, elapsedMs};
@@ -1163,7 +1216,8 @@ async function carryOutCall(
 ) {
   // The written file takes the place of the payload upstream would attach, so
   // the answer stays small enough for a caller's shell. Where it lands is the
-  // front's decision in either case.
+  // front's decision in either case. The echoed argument is the path the caller
+  // ends up with; what the daemon is handed is `plan.writePath`.
   const plan = await planWrittenFile(command, resolved.target, toolArgs);
   if (plan) {
     toolArgs.filePath = plan.filePath;
@@ -1175,15 +1229,27 @@ async function carryOutCall(
 
   let outcome;
   try {
-    outcome = await runCommand(resolved, command, toolArgs, atFullSpeed);
+    outcome = await runCommand(
+      resolved,
+      command,
+      plan ? {...toolArgs, filePath: plan.writePath} : toolArgs,
+      atFullSpeed,
+    );
   } catch (error) {
     if (!plan) {
       throw error;
     }
-    await widenLeftoverFile(plan);
+    await settleLeftoverFile(plan);
     throw reclassifyFileFailure(error, plan);
   }
   const {parsed, elapsedMs} = outcome;
+
+  // The tool reports back the path it was handed, which is the front's staging
+  // name and is gone a moment later. Every path in the answer names the file the
+  // caller can actually fetch.
+  if (plan && parsed.snapshotFilePath === plan.writePath) {
+    parsed.snapshotFilePath = plan.filePath;
+  }
 
   // What the answer would carry, measured before it is sent: a result past the
   // cap is written out and named instead, so no call can put hundreds of
@@ -1255,17 +1321,27 @@ function send(response, status, body) {
  * a caller on another machine actually reaches the file through.
  *
  * The front is unauthenticated, so this is a read path into `OUTPUT_DIR` and
- * must be nothing beyond it. Three things hold that, and the last two hold it
+ * must be nothing beyond it. Four things hold that, and the last three hold it
  * without relying on the first: the name has to be one the front hands out or
  * one it accepted as a snapshot file name, both of which are made of letters,
  * digits, dot, underscore and hyphen and can therefore carry neither a
  * directory separator nor a leading dot nor a `..`; the path built from it must
- * still lie directly in `OUTPUT_DIR`; and the file is opened `O_NOFOLLOW`, so a
+ * still lie directly in `OUTPUT_DIR`; the file is opened `O_NOFOLLOW`, so a
  * symlink placed in the guest-writable share cannot carry the read out of the
- * directory. Only a regular file is answered.
+ * directory; and it must be the only name its inode has, because a hardlink is a
+ * regular file with nothing to follow and would otherwise serve whatever the
+ * front's uid can read. Only a regular file is answered.
  */
-async function sendFile(response, url) {
-  const fileName = decodeURIComponent(url.slice(FILE_ROUTE.length));
+async function sendFile(response, pathname) {
+  const requested = pathname.slice(FILE_ROUTE.length);
+  let fileName;
+  try {
+    fileName = decodeURIComponent(requested);
+  } catch {
+    // A stray `%` is the caller's mistake, not the tool's: decoded here so the
+    // `URIError` cannot travel out as a 422 with a JavaScript message.
+    throw new CallError('usage', `not a usable file name: ${requested}`);
+  }
   if (
     !GENERATED_FILE_NAME_PATTERN.test(fileName) &&
     !OUTPUT_FILE_NAME_PATTERN.test(fileName)
@@ -1288,6 +1364,9 @@ async function sendFile(response, url) {
     if (!stats.isFile()) {
       throw new Error('not a regular file');
     }
+    if (stats.nlink !== 1) {
+      throw new Error('a hardlink, not a file of this directory');
+    }
     data = await handle.readFile();
   } catch (error) {
     throw new CallError('storage', `no file ${fileName}`, error.message);
@@ -1302,6 +1381,19 @@ async function sendFile(response, url) {
     'content-length': data.length,
   });
   response.end(data);
+}
+
+/**
+ * The path one request addresses, without what follows it. `request.url` carries
+ * the query string, and a file name with `?v=1` appended is not a file name the
+ * front hands out — the route is decided on the path alone.
+ */
+function requestPathname(url) {
+  try {
+    return new URL(url, 'http://chromectl.invalid').pathname;
+  } catch {
+    throw new CallError('usage', `not a usable request path: ${url}`);
+  }
 }
 
 function readBody(request) {
@@ -1330,7 +1422,8 @@ const server = http.createServer(async (request, response) => {
   });
 
   try {
-    if (request.method === 'GET' && request.url === '/health') {
+    const pathname = requestPathname(request.url);
+    if (request.method === 'GET' && pathname === '/health') {
       send(response, 200, {
         ok: true,
         service: 'chromectl',
@@ -1339,13 +1432,13 @@ const server = http.createServer(async (request, response) => {
       });
       return;
     }
-    if (request.method === 'GET' && request.url.startsWith(FILE_ROUTE)) {
-      await sendFile(response, request.url);
+    if (request.method === 'GET' && pathname.startsWith(FILE_ROUTE)) {
+      await sendFile(response, pathname);
       return;
     }
     if (
       request.method !== 'POST' ||
-      (request.url !== '/call' && request.url !== '/budget')
+      (pathname !== '/call' && pathname !== '/budget')
     ) {
       throw new CallError(
         'usage',
@@ -1365,7 +1458,7 @@ const server = http.createServer(async (request, response) => {
     }
     // The budget of a call is asked for with the body of that call, so the
     // figure covers the very text the following request types.
-    if (request.url === '/budget') {
+    if (pathname === '/budget') {
       send(response, 200, budgetFor(body));
       return;
     }
