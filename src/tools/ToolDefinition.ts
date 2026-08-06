@@ -325,6 +325,8 @@ export type ContextPage = Readonly<{
       timeout?: number;
       handleDialog?:
         DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
+      /** How a `beforeunload` dialog raised by the action is answered. */
+      answerBeforeUnload?: 'accept' | 'dismiss';
     },
   ): Promise<WaitForEventsResult>;
   waitForEventsAfterTrigger(

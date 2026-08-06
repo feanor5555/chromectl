@@ -4,7 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {pauseBeforeAction, settleAfterAction} from '../pacing.js';
+import {
+  dialogReadCeilingMs,
+  pauseBeforeAction,
+  settleAfterAction,
+} from '../pacing.js';
 import type {CdpPage} from '../third_party/index.js';
 import {zod} from '../third_party/index.js';
 import {logger} from '../utils/logger.js';
@@ -196,8 +200,14 @@ export const navigatePage = definePageTool(() => {
     verifyFilesSchema: [],
     handler: async (request, response) => {
       const page = request.page;
+      // A guard that asks before the page is left is answered by this call, and
+      // the moment spent reading it is our brake: it is added to the wait the
+      // navigation is granted rather than taken out of it.
       const options = {
-        timeout: request.params.timeout,
+        timeout:
+          (request.params.timeout ??
+            page.pptrPage.getDefaultNavigationTimeout()) +
+          dialogReadCeilingMs(),
       };
 
       if (!request.params.type && !request.params.url) {
@@ -281,7 +291,7 @@ export const navigatePage = definePageTool(() => {
           },
           {
             timeout: request.params.timeout,
-            handleDialog: {beforeunload: action},
+            answerBeforeUnload: action,
           },
         );
         if (result.dialogHandled) {

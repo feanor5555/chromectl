@@ -12,6 +12,7 @@ import type {Dialog} from 'puppeteer-core';
 import sinon from 'sinon';
 
 import type {ParsedArguments} from '../../src/bin/chrome-devtools-mcp-cli-options.js';
+import {DIALOG_READ_MAX_MS, DIALOG_READ_MIN_MS} from '../../src/pacing.js';
 import {
   listPages,
   newPage,
@@ -812,6 +813,7 @@ describe('pages', () => {
           </script>`,
         );
 
+        const before = Date.now();
         await navigatePage().handler(
           {params: {type: 'reload'}, page: context.getSelectedMcpPage()},
           response,
@@ -823,6 +825,12 @@ describe('pages', () => {
         assert.strictEqual(
           response.responseLines.join('\n'),
           'Successfully reloaded the page.\nAccepted a beforeunload dialog.',
+        );
+        // The prompt was read before it was answered, so the page cannot
+        // measure an answer nobody could have given.
+        assert.ok(
+          Date.now() - before >= DIALOG_READ_MIN_MS,
+          'the dialog was answered without being read',
         );
       });
     });
@@ -854,9 +862,11 @@ describe('pages', () => {
 
         assert.strictEqual(context.getSelectedMcpPage().getDialog(), undefined);
         assert.ok(response.includePages);
+        // The reading pause is added to the wait the caller asked for, so what
+        // ran out is the caller's 500 ms and not a part of it.
         assert.strictEqual(
           response.responseLines.join('\n'),
-          'Unable to reload the selected page: Navigation timeout of 500 ms exceeded.\nDismissed a beforeunload dialog.',
+          `Unable to reload the selected page: Navigation timeout of ${500 + DIALOG_READ_MAX_MS} ms exceeded.\nDismissed a beforeunload dialog.`,
         );
       });
     });

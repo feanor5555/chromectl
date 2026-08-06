@@ -15,6 +15,9 @@ import {
   callBudgetMs,
   CHARACTER_MAX_MS,
   currentPace,
+  DIALOG_READ_MAX_MS,
+  DIALOG_READ_MIN_MS,
+  dialogReadCeilingMs,
   drawKeyHoldMs,
   drawMouseHoldMs,
   drawPacingMs,
@@ -38,6 +41,7 @@ import {
   pacedSleep,
   pauseAfterScroll,
   pauseBeforeAction,
+  pauseForDialogRead,
   POINTER_CURVATURE_MAX,
   POINTER_PATH_MAX_MS,
   POINTER_POINTS_MAX,
@@ -482,6 +486,35 @@ describe('pacing', () => {
       } finally {
         restore();
       }
+    });
+  });
+
+  describe('the dialog reading pause', () => {
+    it('is drawn from the human interval', async () => {
+      const waited = await pauseForDialogRead();
+
+      assert.ok(
+        waited >= DIALOG_READ_MIN_MS && waited <= DIALOG_READ_MAX_MS,
+        `${waited} outside ${DIALOG_READ_MIN_MS}..${DIALOG_READ_MAX_MS}`,
+      );
+      assert.strictEqual(dialogReadCeilingMs(), DIALOG_READ_MAX_MS);
+    });
+
+    it('waits nothing at full speed', async () => {
+      const restore = selectPace(true);
+      try {
+        const before = Date.now();
+        assert.strictEqual(await pauseForDialogRead(), 0);
+        assert.strictEqual(dialogReadCeilingMs(), 0);
+        assert.ok(Date.now() - before < 50);
+      } finally {
+        restore();
+      }
+      assert.deepStrictEqual(PACE_FULL.dialogReadMs, [0, 0]);
+      assert.deepStrictEqual(PACE_HUMAN.dialogReadMs, [
+        DIALOG_READ_MIN_MS,
+        DIALOG_READ_MAX_MS,
+      ]);
     });
   });
 

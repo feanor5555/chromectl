@@ -72,6 +72,7 @@ import {
 import {
   drawPreActionPauseMs,
   pauseBeforeAction,
+  pauseForDialogRead,
   settleAfterAction,
   travelsPointer,
   type PointerPoint,
@@ -507,10 +508,62 @@ export class McpPage implements ContextPage {
       timeout?: number;
       handleDialog?:
         DialogAction | Partial<Record<Protocol.Page.DialogType, DialogAction>>;
+      /**
+       * How a `beforeunload` dialog raised by this action is answered. The
+       * answer is the mechanical completion of a request to leave the page, and
+       * it is given here rather than by the helper so that it is read first.
+       */
+      answerBeforeUnload?: 'accept' | 'dismiss';
     },
   ): Promise<WaitForEventsResult> {
     await pauseBeforeAction();
-    return await this.#waitForEvents(action, options);
+    const answer = options?.answerBeforeUnload;
+    if (!answer) {
+      return await this.#waitForEvents(action, options);
+    }
+    return await this.#answeringBeforeUnload(answer, () =>
+      this.#waitForEvents(action, options),
+    );
+  }
+
+  /**
+   * Answers the `beforeunload` dialog of one action, after the span a person
+   * spends reading what the page is asking. A guard answered in no time at all
+   * is measurable from the page — a `pagehide` handler reads the difference off
+   * `performance.now()` against a stamp taken in the `beforeunload` handler —
+   * so the answer waits.
+   *
+   * Anything else the action raises is left standing: every other dialog type
+   * is the caller's to handle, and the tools report it as an open dialog.
+   */
+  async #answeringBeforeUnload(
+    answer: 'accept' | 'dismiss',
+    run: () => Promise<WaitForEventsResult>,
+  ): Promise<WaitForEventsResult> {
+    const answers: Array<Promise<void>> = [];
+    const onDialog = (dialog: Dialog): void => {
+      if (dialog.type() !== 'beforeunload') {
+        return;
+      }
+      answers.push(
+        (async () => {
+          await pauseForDialogRead();
+          try {
+            await (answer === 'dismiss' ? dialog.dismiss() : dialog.accept());
+          } catch (error) {
+            logger?.('the beforeunload dialog could not be answered', error);
+          }
+        })(),
+      );
+    };
+    this.pptrPage.on('dialog', onDialog);
+    try {
+      const result = await run();
+      await Promise.all(answers);
+      return answers.length > 0 ? {...result, dialogHandled: true} : result;
+    } finally {
+      this.pptrPage.off('dialog', onDialog);
+    }
   }
 
   /** The helper's own wait, with the settle window behind it. */

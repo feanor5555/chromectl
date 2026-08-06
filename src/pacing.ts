@@ -23,9 +23,10 @@
  * pays for it: what is left of it once the path's own duration is known is what
  * is waited out. A 400–900 ms settle window follows the action, charged per
  * action like the pauses, because the wrapper that waits it out is entered once
- * per action and a form of many short fields is one call of many actions. Every
- * one of those intervals is drawn afresh through `drawSkewed`, which is the
- * single place the brake takes a value from.
+ * per action and a form of many short fields is one call of many actions. A
+ * dialog answered automatically is read for 800–2000 ms first. Every one of
+ * those intervals is drawn afresh through `drawSkewed`, which is the single
+ * place the brake takes a value from.
  *
  * A call passes two ceilings, not one, because it can stand in line before it
  * does anything: the wait for the process-wide tool mutex is capped by
@@ -158,6 +159,15 @@ export const POINTER_STEP_GAP_MAX_MS = 45;
 /** Worst case of one pointer path: every point of the longest one at the longest gap. */
 export const POINTER_PATH_MAX_MS = POINTER_POINTS_MAX * POINTER_STEP_GAP_MAX_MS;
 
+/**
+ * Shortest and longest a dialog the call answers itself is left standing
+ * before the answer goes out — the moment a person spends reading what the page
+ * is asking. It is short enough beside the pre-action pause that the budget
+ * covers it out of its safety margin rather than counting it.
+ */
+export const DIALOG_READ_MIN_MS = 800;
+export const DIALOG_READ_MAX_MS = 2_000;
+
 /** Longest gap held open before a call is allowed to navigate. */
 export const NAVIGATION_GAP_MAX_MS = 2_000;
 
@@ -288,6 +298,8 @@ export interface PaceProfile {
    * not, the only move dispatched is the one that puts it on the target.
    */
   readonly travelsPointer: boolean;
+  /** How long a dialog the call answers itself is read before it is answered. */
+  readonly dialogReadMs: readonly [number, number];
   /** The window waited out after an action has run. */
   readonly settleMs: readonly [number, number];
   /**
@@ -309,6 +321,7 @@ export const PACE_HUMAN: PaceProfile = {
   mouseClickGapMs: [MOUSE_CLICK_GAP_MIN_MS, MOUSE_CLICK_GAP_MAX_MS],
   pointerStepGapMs: [POINTER_STEP_GAP_MIN_MS, POINTER_STEP_GAP_MAX_MS],
   travelsPointer: true,
+  dialogReadMs: [DIALOG_READ_MIN_MS, DIALOG_READ_MAX_MS],
   settleMs: [SETTLE_MIN_MS, SETTLE_MAX_MS],
   fillsInOneShot: false,
 };
@@ -324,6 +337,7 @@ export const PACE_FULL: PaceProfile = {
   mouseClickGapMs: [0, 0],
   pointerStepGapMs: [0, 0],
   travelsPointer: false,
+  dialogReadMs: [0, 0],
   settleMs: [0, 0],
   fillsInOneShot: true,
 };
@@ -465,6 +479,23 @@ export function pauseBeforeAction(): Promise<number> {
  */
 export function drawPreActionPauseMs(): number {
   return drawFromPace(activePace.preActionPauseMs);
+}
+
+/**
+ * The moment a dialog the call answers itself is left standing: a page whose
+ * "Leave site?" prompt is answered in no time at all has been answered by
+ * nobody who read it.
+ */
+export function pauseForDialogRead(): Promise<number> {
+  return sleepAtPace(activePace.dialogReadMs);
+}
+
+/**
+ * Longest that reading can take, which is what a navigation waiting for the
+ * answer is granted on top of the wait the caller asked for.
+ */
+export function dialogReadCeilingMs(): number {
+  return activePace.dialogReadMs[1];
 }
 
 /** Whether the pointer reaches its target along a path at this pace. */
