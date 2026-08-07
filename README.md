@@ -8,17 +8,22 @@ behind that name and answers in one JSON envelope, so every agent on the private
 network controls a browser over plain HTTP, with no Node runtime and no MCP
 client of its own.
 
-Upstream's tools, its `chrome-devtools` CLI and its daemon are used as they
-stand; the front speaks to a daemon through upstream's own daemon client. The
-MCP stdio server is still in the tree as upstream ships it, but nothing here
-runs it and it is installed into no client.
+The front speaks to a target's daemon through upstream's own daemon client.
+Upstream's tool modules are used as they stand but for the input, page,
+screenshot and screencast ones, which carry the pacing; the daemon's client, its
+server and its message types carry the per-call timeout budget and the
+full-speed switch. The `chrome-devtools` CLI is not run here, only its generated
+command table is read. The MCP stdio server is still in the tree as upstream
+ships it, but nothing here runs it and it is installed into no client.
 
 ## What this fork adds
 
 - **The HTTP front** (`chromectl/front.mjs`): one process for all targets, one
   daemon and one mutex per target, so calls against different browsers run at
-  the same time. It is a proxy, not a filter — every tool upstream declares is
-  callable, with the arguments upstream declares for it. Command list and
+  the same time. Every tool upstream declares is callable with the arguments
+  upstream declares for it, save the five extension commands the front withholds
+  (`DENIED_COMMANDS` in `chromectl/commands.mjs`): a withheld name is missing
+  from `/health` and a call to it is refused. Command list and
   argument schemas are read out of upstream's generated command table
   (`src/bin/chrome-devtools-cli-options.ts`), so an upstream bump brings its new
   tools along by itself.
