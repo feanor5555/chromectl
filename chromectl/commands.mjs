@@ -7,10 +7,11 @@
  * The command surface of the chromectl front.
  *
  * What the front offers and how a caller's arguments are checked against it, in
- * one place and with no list of its own: the surface is taken whole from
- * upstream's generated command table, which is what the daemon registers its
- * tools from, so the front is a proxy and not a filter. An upstream bump brings
- * its new tools and arguments along by itself.
+ * one place and with no list of its own: the surface is upstream's generated
+ * command table, which is what the daemon registers its tools from, minus the
+ * names of `DENIED_COMMANDS`. Apart from that one list the front is a proxy and
+ * not a filter, and an upstream bump brings its new tools and arguments along by
+ * itself.
  *
  * The check and the table sit together on purpose. `validateArgs` reads the
  * schemas on every call, and a table in one module with the loop that reads it
@@ -23,18 +24,45 @@ import {commands as upstreamCommands} from '../build/src/bin/chrome-devtools-cli
 import {CallError} from './errors.mjs';
 
 /**
- * Every command the front offers and the argument schema of each, taken whole
- * from upstream's generated command table (`chrome-devtools-cli-options.js`)
- * rather than kept as an own copy. The table is what the daemon registers its
- * tools from, so the front's surface is the daemon's surface, and an upstream
- * change — a new tool, a new argument on an existing one — arrives with the
- * merge instead of being dropped behind a list kept by hand.
+ * The commands the front withholds: extension handling is none of its business,
+ * so upstream's five extension tools are neither reported by `/health` nor
+ * accepted on a call. This is the whole of the front's filtering — no other name
+ * is held back and no argument of any offered command is.
+ *
+ * A name upstream drops or renames stops the front at startup rather than
+ * leaving a list entry that matches nothing while the tool it was meant for is
+ * offered again under its new name.
+ */
+export const DENIED_COMMANDS = new Set([
+  'install_extension',
+  'list_extensions',
+  'reload_extension',
+  'trigger_extension_action',
+  'uninstall_extension',
+]);
+
+const unknownDenied = [...DENIED_COMMANDS].filter(
+  command => !Object.hasOwn(upstreamCommands, command),
+);
+if (unknownDenied.length > 0) {
+  throw new Error(
+    `chromectl: DENIED_COMMANDS names commands the command table does not ` +
+      `carry, so they are held back from nothing: ${unknownDenied.join(', ')}`,
+  );
+}
+
+/**
+ * Every command the front offers and the argument schema of each, taken from
+ * upstream's generated command table (`chrome-devtools-cli-options.js`) rather
+ * than kept as an own copy. The table is what the daemon registers its tools
+ * from, so the front's surface is the daemon's surface less `DENIED_COMMANDS`,
+ * and an upstream change — a new tool, a new argument on an existing one —
+ * arrives with the merge instead of being dropped behind a list kept by hand.
  */
 export const COMMAND_SCHEMAS = new Map(
-  Object.entries(upstreamCommands).map(([command, definition]) => [
-    command,
-    definition.args ?? {},
-  ]),
+  Object.entries(upstreamCommands)
+    .filter(([command]) => !DENIED_COMMANDS.has(command))
+    .map(([command, definition]) => [command, definition.args ?? {}]),
 );
 
 /** The command names, sorted, as `/health` reports them. */
@@ -150,8 +178,19 @@ export function validateFullSpeed(value) {
   return coerceArgument('call', FULL_SPEED_DEFINITION, value);
 }
 
-/** A name upstream does not know never reaches the daemon. */
+/**
+ * A name the front does not offer never reaches the daemon — one upstream does
+ * not know at all, and one the front withholds, which is named as withheld so a
+ * caller reading a tool list of upstream's is not left looking for a typo.
+ */
 export function assertKnownCommand(command) {
+  if (typeof command === 'string' && DENIED_COMMANDS.has(command)) {
+    throw new CallError(
+      'usage',
+      `${command} is not offered by this front — GET /health names the ` +
+        `${COMMANDS.length} commands it does offer`,
+    );
+  }
   if (typeof command !== 'string' || !COMMAND_SCHEMAS.has(command)) {
     throw new CallError(
       'usage',

@@ -68,14 +68,16 @@ const BROWSER_LINK_GONE = /^(Not connected|MCP client not initialized)$/;
  * `viaCli` is what makes the daemon register the full tool set, and the flags
  * beside it are what makes the registered tools answer: a tool whose category
  * or whose experimental condition is off is registered under `viaCli` but
- * refuses every call with the flag it wants named. The front offers the whole
- * table, so it starts the daemon with all of them —
- * `categoryExtensions`, `categoryExperimentalThirdParty` and
- * `categoryExperimentalWebmcp` for the three categories that are off by
- * default, `memoryDebugging` for the heap snapshot readers,
- * `experimentalVision` for the coordinate-based click and
+ * refuses every call with the flag it wants named. The front offers every tool
+ * of the table but the withheld ones (`DENIED_COMMANDS` in `commands.mjs`), so
+ * it starts the daemon with all of them — `categoryExtensions`,
+ * `categoryExperimentalThirdParty` and `categoryExperimentalWebmcp` for the
+ * three categories that are off by default, `memoryDebugging` for the heap
+ * snapshot readers, `experimentalVision` for the coordinate-based click and
  * `experimentalScreencast` for the video recording. `categoryExtensions` is
- * also what keeps extension service workers in the page listing.
+ * carried for the page listing alone: the extension tools of that category are
+ * withheld, and the flag is what keeps extension pages and service workers among
+ * the pages a listing shows.
  *
  * `experimentalStructuredContent` is what makes a result come back as a JSON
  * object rather than rendered text.

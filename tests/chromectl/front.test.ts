@@ -80,6 +80,19 @@ const LARGE_FILE_BYTES = 256 * 1024 * 1024;
  */
 const STREAMING_HEADROOM_KB = 128 * 1024;
 
+/**
+ * The commands the front keeps back from the surface it reports and accepts.
+ * Written out here rather than read from the front's own list, so the test says
+ * what the surface has to be instead of repeating what the front decided.
+ */
+const WITHHELD_COMMANDS = [
+  'install_extension',
+  'list_extensions',
+  'reload_extension',
+  'trigger_extension_action',
+  'uninstall_extension',
+];
+
 interface Answer {
   status: number;
   headers: http.IncomingHttpHeaders;
@@ -786,14 +799,38 @@ describe('chromectl front output names', () => {
 });
 
 describe('chromectl front command surface', () => {
-  it('offers exactly the commands of the upstream table', async () => {
+  it('offers the upstream table but the withheld commands', async () => {
     const answer = await send('/health');
 
     assert.strictEqual(answer.status, 200);
     assert.deepStrictEqual(
       payload(answer)['commands'],
-      Object.keys(commands).sort(),
+      Object.keys(commands)
+        .filter(command => !WITHHELD_COMMANDS.includes(command))
+        .sort(),
     );
+  });
+
+  it('refuses a withheld command itself', async () => {
+    daemonCalls = [];
+    for (const command of WITHHELD_COMMANDS) {
+      // Every one of them is a command upstream carries, so what the front
+      // answers here is a refusal of its own and not a name nobody knows.
+      assert.ok(
+        Object.hasOwn(commands, command),
+        `${command} is not in the upstream table`,
+      );
+
+      const answer = await budget({command, args: {}});
+
+      assertUsage(answer, command);
+      assert.match(
+        String(payload(answer)['error']),
+        new RegExp(`${command} is not offered`),
+      );
+      // The refusal is the front's: no daemon was asked to carry the call out.
+      assert.deepStrictEqual(daemonCalls, []);
+    }
   });
 
   it('brings a caller argument to the declared type', async () => {

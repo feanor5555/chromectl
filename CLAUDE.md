@@ -8,13 +8,13 @@ This repository is a pinned fork of `chrome-devtools-mcp`. The MCP transport is 
 
 ## Scope
 
-- The front is a proxy, not a filter. Every function of the MCP template is usable through it: no tool-surface allow list, no argument filtering, no restrictions.
+- The front is a proxy, not a filter, with one named exception. Every function of the MCP template is usable through it: no tool-surface allow list, no argument filtering, no restrictions. The exception is a deny list of whole commands, `DENIED_COMMANDS` in `chromectl/commands.mjs`: a name on it is absent from what `/health` reports and a call to it is refused by the front. It holds the five extension commands — `install_extension`, `uninstall_extension`, `list_extensions`, `reload_extension`, `trigger_extension_action`. The daemon still runs with `--categoryExtensions`, which is what keeps extension pages and service workers in the page listings.
 - Exactly three things extend the template:
   1. The MCP transport is removed and replaced by the HTTP front (`chromectl/front.mjs` on lukas, port 8091, unauthenticated, reachable over netbird and the LAN), with one daemon per target and a mutex per target only, so several Claude instances on different machines drive the same tool set concurrently without blocking each other. The client is `chromectl.sh` on all eight machines.
   2. The operation must not be traceable to a machine — human-pace pacing and the rest of the camouflage.
   3. `full_speed`, the per-call opt-in for when bot detection does not matter and only speed does.
 - Bugs found in the template are fixed as a matter of course.
-- Nothing else is added and nothing is taken away.
+- Nothing else is added and nothing else is taken away.
 
 ## Development Status
 
