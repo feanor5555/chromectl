@@ -114,6 +114,18 @@ describe('chromectl target probe', () => {
     assert.ok(on.includes(`--browserUrl=${browserUrl}`));
   });
 
+  it('starts every daemon with the CrUX call switched off', () => {
+    const args = daemon.daemonStartArgs({browserUrl: 'http://127.0.0.1:9222'});
+
+    // Upstream fetches field data by default, which sends the URLs of a trace
+    // to Google as soon as a trace is stopped. The flag is the only thing that
+    // holds them back, so it belongs to every daemon this front starts.
+    assert.ok(
+      args.includes('--performanceCrux=false'),
+      `${args.join(' ')} does not switch CrUX off`,
+    );
+  });
+
   it('takes a target that answers its version', async () => {
     const serving = http.createServer((_request, response) => {
       response.writeHead(200, {'content-type': 'application/json'});

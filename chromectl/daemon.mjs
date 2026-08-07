@@ -82,6 +82,11 @@ const BROWSER_LINK_GONE = /^(Not connected|MCP client not initialized)$/;
  * `experimentalStructuredContent` is what makes a result come back as a JSON
  * object rather than rendered text.
  *
+ * `usageStatistics` and `performanceCrux` are the two flags under which the
+ * daemon would speak to Google, and both are off: no usage report, and no URL
+ * out of a performance trace to the CrUX API, which the daemon would otherwise
+ * ask for field data on every `performance_stop_trace`.
+ *
  * `allowUnrestrictedPaths` is what lets a file leave the OS temp directory: the
  * daemon's own MCP client negotiates no roots capability, so without the flag
  * every file-writing tool is confined to `/tmp`. The widening is safe here
@@ -102,6 +107,7 @@ const DAEMON_ARGS = [
   '--experimentalVision',
   '--experimentalScreencast',
   '--usageStatistics=false',
+  '--performanceCrux=false',
   '--allowUnrestrictedPaths',
 ];
 
